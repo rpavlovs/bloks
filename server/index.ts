@@ -602,9 +602,12 @@ function patchChangesCard(record: CheckpointRecord, extra: Partial<NonNullable<M
   if (!record.card) return;
   const current = store.messagesFor(record.card.threadId).find((msg) => msg.id === record.card!.messageId);
   if (!current?.changes) return;
-  const patched = store.patchMessage(record.card.threadId, record.card.messageId, {
-    changes: { ...current.changes, ...checkpoints.summary(record), ...extra },
-  });
+  const summary = checkpoints.summary(record);
+  // A retained all-shared card keeps its old line; rewind deletes it below.
+  if (!record.rehearsal && !summary.total) return;
+  const changes = { ...current.changes, ...summary, ...extra };
+  delete changes.shared;
+  const patched = store.patchMessage(record.card.threadId, record.card.messageId, { changes });
   if (patched) broadcast({ kind: "message.patch", threadId: record.card.threadId, message: patched });
 }
 
@@ -2107,7 +2110,9 @@ bus.subscribe((event: RuntimeEvent) => {
             return;
           }
           if (!record) return;
-          const card = pushMessage({ role: "bot", kind: "changes", changes: checkpoints.summary(record) });
+          const changes = checkpoints.summary(record);
+          if (!changes.total) return;
+          const card = pushMessage({ role: "bot", kind: "changes", changes });
           checkpoints.attachCard(record.id, roomId, card.id);
         })
         .catch(() => {});
