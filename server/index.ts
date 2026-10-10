@@ -8422,6 +8422,7 @@ function deliverQueued(threadId: string, messageIds: readonly string[]) {
   const deliveredAt = Date.now();
   const moved = store.moveToEnd(threadId, messageIds, (m) => ({
     queued: false,
+    waitsFor: undefined,
     deliveredAt,
     at: deliveredAt,
     queuedAt: m.queuedAt ?? m.at,
@@ -8500,6 +8501,7 @@ function queueOnLane(
     routine?: Message["routine"];
     telegramReply?: TelegramReply;
     personal?: boolean;
+    waitsFor?: Message["waitsFor"];
     /** An agent sent it: the place in a chain of agents' messages the
      * turn that takes it would have (agentChain). */
     chain?: number;
@@ -8512,6 +8514,7 @@ function queueOnLane(
   const commandInstance = accepting && (options.personal !== false || (options.routine && registry.get(accepting)?.driverKind === "claudeAgent")) ? accepting : null;
   const message = store.appendMessage(laneId, {
     role: "user", kind: "text", text, queued: true, queuedAt: Date.now(),
+    ...(options.waitsFor ? { waitsFor: options.waitsFor } : {}),
     namedSkills: !options.from && !options.via && !options.routine && options.personal !== false,
     ...(options.replyTo ? { replyTo: options.replyTo } : {}),
     ...(options.from ? { agent: { dir: "in" as const, peerId: options.from.botId, peerName: options.from.name } } : {}),
@@ -8798,7 +8801,10 @@ async function sendUserMessage(
       }
       notJoined = ` It did not join that turn: ${why ?? `${bot.name}'s turn could not take words mid-turn just then`}.`;
     }
-    queueOnLane(bot.id, lane.id, text, { replyTo: options.replyTo, from: options.from, personal: options.personal, chain: options.chain?.depth });
+    queueOnLane(bot.id, lane.id, text, {
+      replyTo: options.replyTo, from: options.from, personal: options.personal, chain: options.chain?.depth,
+      ...(drain.on && yours ? { waitsFor: "restart" as const } : {}),
+    });
     // Asking the engine took a moment, and the turn may have ended in it,
     // with nothing coming along after to take what now waits.
     if ((yours && options.steer) || askedEngine) drainSteer(lane.id);
