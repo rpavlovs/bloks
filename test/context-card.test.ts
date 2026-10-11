@@ -22,13 +22,13 @@ import {
 const codex: LaneContext = { used: 141_000, limit: 258_400, fraction: 141_000 / 258_400, measured: true, window: "engine", summarised: false };
 
 test("the card says how full, in tokens and as a share", () => {
-  assert.deepEqual(contextCard(codex), { share: "55% full", tokens: "141k of 258k tokens", summarised: null });
+  assert.deepEqual(contextCard(codex), { share: "55% full", tokens: "141k of 258k tokens", summarised: null, compaction: null });
   assert.equal(ringLabel(codex), "Context window 55% full");
 });
 
 test("a window that is the table's guess is said to be about that", () => {
   const guessed = { ...codex, window: "table" as const, limit: 272_000, fraction: 141_000 / 272_000 };
-  assert.deepEqual(contextCard(guessed), { share: "About 52% full", tokens: "141k of about 272k tokens", summarised: null });
+  assert.deepEqual(contextCard(guessed), { share: "About 52% full", tokens: "141k of about 272k tokens", summarised: null, compaction: null });
   assert.equal(ringLabel(guessed), "Context window about 52% full");
   assert.equal(contextTitle(guessed), "About 52% of what this model will take");
 });

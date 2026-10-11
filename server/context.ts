@@ -116,18 +116,29 @@ export function readingFor(
  * counts as nothing measured. Old per-turn sums and the default fold
  * margin are not measurements. Keep numeric zeroes on the wire for
  * older clients, with an explicit flag for clients that know the difference.
+ * With before-turn compaction on, its lower line is the display limit;
+ * keep the full model window alongside it for the card.
  */
 export function laneFill(
   reading: Reading | null | undefined,
   selection: { instanceId: string; model?: string | null },
-): Pressure & { measured: boolean; window: "engine" | "table" } {
+  beforeTurn: Pick<TurnStartLane, "at" | "ceiling"> = { ceiling: 0 },
+): Pressure & { measured: boolean; window: "engine" | "table"; modelLimit?: number } {
   const own = readingFor(reading, selection);
   const window = own?.window && Number.isInteger(own.window) && own.window > 0 ? own.window : null;
   const limit = window ?? knownLimitFor(selection.model);
   if (!own || !Number.isFinite(own.used) || own.used <= 0 || limit === null) {
     return { used: 0, limit: 0, fraction: 0, measured: false, window: "table" };
   }
-  return { ...pressure(own.used, limit), measured: true, window: window ? "engine" : "table" };
+  const line = beforeTurn.ceiling > 0 ? beforeTurnLine({ window: limit, ...beforeTurn }) : limit;
+  const budget = line > 0 && line < limit;
+  return {
+    ...pressure(own.used, budget ? line : limit),
+    // A turn can grow past the line; only the drawn ring is capped then.
+    ...(budget ? { fraction: own.used / line, modelLimit: limit } : {}),
+    measured: true,
+    window: window ? "engine" : "table",
+  };
 }
 
 // ── compacting before a turn ───────────────────────────────────────────
@@ -279,7 +290,7 @@ export function transcriptTokens(turns: Turn[]): number {
 export interface Pressure {
   used: number;
   limit: number;
-  /** Zero to one. */
+  /** Zero to one; a displayed before-turn line can be over one. */
   fraction: number;
 }
 

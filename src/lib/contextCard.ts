@@ -3,8 +3,9 @@
 // sidebar rows and Activity (GitHub 224).
 //
 // Kept apart from the components so the wording and the arithmetic can
-// be tested without a DOM. Every number here is the engine's own, sent
-// by the server (server/context.ts, server/plan-usage.ts); this only
+// be tested without a DOM. The engine's readings and window, and the
+// person's compaction line, come from the server (server/context.ts,
+// server/plan-usage.ts); this only
 // decides how to say it, and when there is nothing honest to say.
 
 /** How full a lane is, as the server sends it with each lane and with
@@ -19,6 +20,8 @@ export interface Fill {
   /** "engine" when the window is the engine's own word, "table" when it
    * is Bloks' guess from the model's name. */
   window?: "engine" | "table";
+  /** The full model window when limit is the lower before-turn line. */
+  modelLimit?: number;
 }
 
 /** A lane's fill, and whether Bloks has summarised its earlier part. */
@@ -84,24 +87,27 @@ const SUMMARISED = "Bloks summarised the earlier part of this conversation.";
 
 /** What the card says about the window: how full, in what, and whether
  * the earlier part was summarised. "About" when the window is a guess. */
-export function contextCard(context: LaneContext): { share: string; tokens: string; summarised: string | null } {
+export function contextCard(context: LaneContext): { share: string; tokens: string; summarised: string | null; compaction: string | null } {
   const about = context.window === "table";
   return {
     share: `${about ? "About " : ""}${percent(context.fraction)} full`,
     tokens: `${shortTokens(context.used)} of ${about ? "about " : ""}${shortTokens(context.limit)} tokens`,
     summarised: context.summarised ? SUMMARISED : null,
+    compaction: context.modelLimit !== undefined
+      ? `Compacts before the next turn at ${about ? "about " : ""}${shortTokens(context.limit)}; the model's window is ${about ? "about " : ""}${shortTokens(context.modelLimit)}`
+      : null,
   };
 }
 
 /** The ring's name for a screen reader, which cannot see the ring. */
 export function ringLabel(context: LaneContext): string {
-  return `Context window ${context.window === "table" ? "about " : ""}${percent(context.fraction)} full`;
+  return `${context.modelLimit !== undefined ? "Before-turn compaction" : "Context window"} ${context.window === "table" ? "about " : ""}${percent(context.fraction)} full`;
 }
 
 /** What a chip or a sidebar row says on hover. */
 export function contextTitle(context: LaneContext): string {
   if (!measuredContext(context)) return "The earlier part has been summarised";
-  return `${context.window === "table" ? "About " : ""}${percent(context.fraction)} of what this model will take` +
+  return `${context.window === "table" ? "About " : ""}${percent(context.fraction)} of ${context.modelLimit !== undefined ? "the before-turn compaction line" : "what this model will take"}` +
     (context.summarised ? ", and the earlier part has been summarised" : "");
 }
 
@@ -109,7 +115,7 @@ export function contextTitle(context: LaneContext): string {
  * null when it is not, or nothing measured it. */
 export function activityContext(context: Fill | null | undefined): string | null {
   if (!context || !measuredContext(context) || context.fraction < 0.5) return null;
-  return `${context.window === "table" ? "about " : ""}${percent(context.fraction)} of the window`;
+  return `${context.window === "table" ? "about " : ""}${percent(context.fraction)} of ${context.modelLimit !== undefined ? "the before-turn compaction line" : "the window"}`;
 }
 
 // ── the plan ───────────────────────────────────────────────────────────
