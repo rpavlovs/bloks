@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { createServer as createTcpServer } from 'node:net';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline';
-import { mkdtemp, mkdir, readFile, writeFile, rm, access } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, access, rename, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -24,8 +24,10 @@ for(const[name,digest,binary]of assets){
   const archive=join(binaries,name);await writeFile(archive,bytes);
   const entries=execFileSync('tar',['-tzf',archive],{encoding:'utf8'}).trim().split('\n').filter(Boolean);
   assert.equal(entries.length,1);
-  const executable=execFileSync('tar',['-xOzf',archive,entries[0]],{maxBuffer:256*1024*1024});
-  await writeFile(join(binaries,binary),executable,{mode:0o755});await rm(archive);
+  assert.match(entries[0],/^[a-z0-9._-]+$/);
+  execFileSync('tar',['-xzf',archive,'-C',binaries,entries[0]]);
+  await rename(join(binaries,entries[0]),join(binaries,binary));
+  await chmod(join(binaries,binary),0o755);await rm(archive);
 }
 process.env.PATH=binaries+':'+process.env.PATH;
 
