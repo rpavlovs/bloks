@@ -25,7 +25,7 @@ const profile=join(unpacked,'usr/share/apparmor/extra-profiles/bwrap-userns-rest
 assert.equal(createHash('sha256').update(await readFile(profile)).digest('hex'),'11d39094f044f0cda0febb3ad517b830301da6b2ce929664af09ee9e4dd264f9');
 systemRun('sudo',['-n','install','-m','0644',profile,'/etc/apparmor.d/bwrap-userns-restrict']);
 systemRun('sudo',['-n','apparmor_parser','-r','/etc/apparmor.d/bwrap-userns-restrict']);
-systemRun('unshare',['-Urn','true']);
+console.log('DISPOSABLE_SANDBOX_PREREQUISITES: distribution bwrap and its pinned profile loaded; global namespace restriction retained');
 const assets=[
   ['codex-x86_64-unknown-linux-musl.tar.gz','306865417d4ee7a927785852910a527f41e1e159add390ac5ae3accb67d44a13','codex'],
   ['codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz','ac6cd6288f0e39f46a33eba1cfd37711651f14f33dbc73d6a1b82eb45e038cac','codex-code-mode-host'],
