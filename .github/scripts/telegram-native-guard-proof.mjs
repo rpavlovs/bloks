@@ -8,13 +8,14 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, access, rename, chmod } from '
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const resultPath = process.env.NATIVE_GUARD_RESULT ?? new URL('./native-guard-result.json', import.meta.url).pathname;
+const resultPath = join(process.env.RUNNER_TEMP ?? tmpdir(),'native-guard-result.json');
 
 if(process.env.GITHUB_ACTIONS!=='true')throw new Error('This diagnostic runs only in a disposable CI runner');
 const binaries=await mkdtemp(join(tmpdir(),'bloks-native-codex-'));
 const assets=[
   ['codex-x86_64-unknown-linux-musl.tar.gz','306865417d4ee7a927785852910a527f41e1e159add390ac5ae3accb67d44a13','codex'],
   ['codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz','ac6cd6288f0e39f46a33eba1cfd37711651f14f33dbc73d6a1b82eb45e038cac','codex-code-mode-host'],
+  ['bwrap-x86_64-unknown-linux-musl.tar.gz','1844535ea16d5454a6b5ee5df541c068ea8ddf1028ad3520255b16e05de3183d','bwrap'],
 ];
 for(const[name,digest,binary]of assets){
   const response=await fetch('https://github.com/openai/codex/releases/download/rust-v0.160.0/'+name);
@@ -177,6 +178,8 @@ try {
   check('sandbox cannot connect to loopback',()=>{const c=by['isolated-network'];assert.equal(c.error,undefined);assert.match(output(c),/NETWORK_BLOCKED/);assert.doesNotMatch(output(c),/NETWORK_CONNECTED/);assert.equal(networkConnections,0);});
   const report={version:'0.160.0',codexVersion,localInferenceFixture:true,authenticatedInference:false,results,checks,networkConnections};
   await writeFile(resultPath,JSON.stringify(report,null,2)+'\n');
+  for(const c of results)console.log('NATIVE_GUARD_CASE '+JSON.stringify({label:c.label,guard:c.guard,approvals:c.approvals,markerPresentAfter:c.markerPresentAfter,markerText:c.markerText,toolOutputs:c.toolOutputs,error:c.error,stderr:c.stderr}));
+  console.log('NATIVE_GUARD_CHECKS '+JSON.stringify({checks,networkConnections}));
   console.log(JSON.stringify({checks,networkConnections}));
   console.log('NATIVE_GUARD_REPORT '+JSON.stringify(report));
   if(checks.some(c=>!c.passed))process.exitCode=1;
