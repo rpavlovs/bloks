@@ -19,6 +19,7 @@ import { useMcpServers, type McpServerRow } from "./McpServers";
 import { useTheme } from "@/lib/theme";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
+import { plural } from "@/lib/plural";
 
 interface McpApp {
   uri: string;
@@ -74,7 +75,7 @@ export function McpAppsCard() {
       </div>
       {servers.length === 0 ? (
         <div className="mt-3 rounded-xl border border-dashed px-3 py-4 text-center text-[12px] text-muted-foreground">
-          No MCP servers yet. Add one under Settings, Apps.
+          No MCP servers yet. Add one under Settings, Apps and keys.
         </div>
       ) : (
         <div className="mt-3 flex flex-col gap-2">
@@ -120,7 +121,7 @@ function ServerApps({
             {apps === null
               ? server.target
               : apps.length === 0
-                ? `${tools} tools, no interface`
+                ? `${plural(tools, "tool")}, no interface`
                 : `${apps.length} app${apps.length === 1 ? "" : "s"}, ${tools} tools`}
           </span>
         </span>

@@ -38,6 +38,47 @@ Underneath, every agent is a real provider session. Agents stream their
 replies, show you the tools they are running, and stop to ask before
 doing anything that needs your say-so.
 
+## 📣 New in 2.6
+
+**Agents that keep going.** Type `/goal` and say what done looks like, and
+the agent keeps working turn after turn until it is done, stuck, or out of
+turns, without you typing "keep going". Add a check like `pnpm test` and it
+only counts as done when the check passes. A chip above the composer shows
+the turn it is on, with Pause and Clear.
+
+**Check-ins that stay quiet.** A routine can run every 30 minutes or every
+few hours, only within the hours and days you choose. When nothing needs
+you, the agent answers quietly: no badge, no notification, and a run of
+quiet check-ins folds into one line. Each run remembers what the last real
+one reported.
+
+**Memory that carries across conversations.** Before your turn, an agent
+looks through its other conversations and its memory files for what is
+relevant and brings up a few short notes. "Recalled 2 notes" under your
+message shows exactly what it was given, and search across your
+conversations is ranked the same way.
+
+**Backups.** Your whole workspace is backed up every day. Back up any time,
+seal a backup with a passphrase, check it, and restore it from Settings or
+`bloks-server restore`. A restore takes a fresh backup first and never
+deletes what it replaces, and keys only ever go into a sealed backup.
+
+**Bring your setup.** Already using Claude Code, Codex, OpenClaw or Hermes?
+Bring their instructions, skills and tool servers into Bloks, reviewing each
+item first. Nothing leaves your Mac and no keys or passwords are copied.
+
+**Telegram that feels native.** Approve or answer a card with a tap, get the
+files a turn made sent back to the chat, and see what a long turn is
+working on.
+
+**A security checkup.** One page in Settings shows what can reach your keys,
+your screen and your agents, with a fix for each, and a turn that keeps
+making the same call is flagged so a stuck agent is easy to spot.
+
+Plus dozens of reliability fixes, from Undo and rehearsals to the desktop
+app restarting its own server if it ever stops. The full list is in the
+[release notes](https://github.com/hamedgitty/bloks/releases).
+
 ## What makes it different
 
 **Agents work together, with a chain of command.** Put several in a room
@@ -60,6 +101,26 @@ OpenAI-compatible host takes a base URL and one or more keys. OpenRouter has a
 proper browser sign-in; the rest take a key or ride along with a CLI you
 already signed in to.
 
+**Every conversation in view.** An agent keeps up to twenty
+conversations, one topic each. Turn on **Show conversations** and they
+are listed under their agent in the sidebar, each with its own unread
+dot and whether it is working or waiting on you. Opening an agent goes
+to the conversation that pinged you, and a row at the top of the
+sidebar says when anything at all is waiting on you. With the list in
+the sidebar the tabs above the chat step aside; right-click a
+conversation to rename it, mark it unread, copy its ID or close it.
+Close the last one and a fresh one takes its place until you start the
+next.
+
+<p align="center">
+  <img alt="The sidebar with each agent's conversations listed under it, one of them unread" src="docs/screenshots/conversations.png" width="720">
+</p>
+
+**Settings you can find.** Settings is a page of its own, grouped by
+you, your agents, what they connect to and what they leave behind, with
+a search that goes straight to the page a word lives on. So does
+Cmd+K: type "voice" or "telegram" and press Enter.
+
 **Skills are files you can read.** A skill is markdown that gets folded
 into an agent's prompt. Bloks ships a starter library and shows you the
 full body of anything before it is installed, because a skill is closer
@@ -72,6 +133,12 @@ agent's skills by name, including the ones installed for Claude Code.
 **Rules you write in a sentence.** "Refuse when the command contains
 `rm -rf`." Rules are decided before an agent acts, not after, and only
 what they do not cover reaches you. A deny always beats an allow.
+
+**As careful as you want.** Choose once, during setup or in Settings,
+how much agents ask: **Ask first**, **Accept edits**, **Auto** (only
+your rules refuse), or **Full access**, which takes the engines' own
+guards off too, with no prompts and no sandbox. Every new agent starts
+there, any agent can be set differently, and shared rooms always ask.
 
 **Take the wheel.** Driving something yourself for a minute stops the
 agent: no turns start, routines skip, the job board looks elsewhere, and
@@ -134,7 +201,7 @@ request, decrypted on the phone, with Allow and Deny behind Face ID;
 anything in the share sheet can be sent to an agent; and Siri, Shortcuts
 or the Action Button can ask one without opening the app. With Bloks Cloud, the same app you
 use on your Mac also opens at [bloks.dev/web](https://bloks.dev/web) on
-any computer: Settings, Devices, **Use in a browser** makes a one-time
+any computer: Settings, Phone and devices, **Use in a browser** makes a one-time
 link. Every request is sealed in the browser for your Mac alone, so the
 site that serves the page never sees what it carries.
 
@@ -202,7 +269,7 @@ day. ElevenLabs and OpenAI voices are there when you add a key.
 **From your other AI apps.** Bloks is an MCP server: Claude Desktop,
 Claude Code or Cursor can ask your agents for work, read their
 conversations and see what is waiting on you. It cannot answer
-approvals, delete anything or change settings. Settings, Apps shows what
+approvals, delete anything or change settings. Settings, Apps and keys shows what
 to paste.
 
 **Always on.** Agents run where Bloks runs, and a laptop sleeps. Bloks
@@ -237,14 +304,30 @@ dev:desktop` in a third terminal.
 **Requirements:** Node 22+, pnpm, and at least one engine. macOS for the
 desktop shell and computer use; the browser app runs anywhere Node does.
 
+**Ports:** the app listens on 8799 on this machine. If something else has
+it, the desktop app moves to 18799, 28799, or any free port, and remembers
+the one that worked so a paired phone keeps finding it. To choose one
+yourself, add `"port": 9123` to `~/.bloks/config.json`, or set
+`BLOKS_PORT=9123` when starting `bloks-server` or the app from a terminal.
+When no port works, the app says which ports it tried and what is holding
+each.
+
 ## Getting an engine
 
 You need one of these before an agent can reply. Any of them works.
 
+The first-run check, and Settings, Engines, install Claude Code, Codex,
+Pi, Antigravity and the Grok CLI with one button. They go into your own
+`~/.local`, so no admin password and no npm permission errors, and an
+engine that is installed but not signed in says so, with a button that
+opens Terminal at its sign-in. An agent whose engine is not ready says
+so above its composer before you send anything, with the same buttons and
+a one-click switch to an engine that is. To do it by hand instead:
+
 | Engine | How you connect | Runs tools |
 | --- | --- | --- |
-| Claude Code | `npm i -g @anthropic-ai/claude-code`, then `claude` | yes |
-| Codex | `npm i -g @openai/codex`, then `codex login` | yes |
+| Claude Code | `curl -fsSL https://claude.ai/install.sh \| bash`, then `claude` | yes |
+| Codex | `npm i -g --prefix ~/.local @openai/codex`, then `codex login` | yes |
 | Gemini CLI | `npm i -g @google/gemini-cli`, then a Google sign-in or a Gemini key | yes |
 | Pi | `npm i -g --ignore-scripts @earendil-works/pi-coding-agent && npm i -g pi-acp`, then `pi` (or `pi-acp --terminal-login`) | yes |
 | OpenRouter | Sign in from Settings, in your browser | no |
@@ -275,9 +358,9 @@ Mac, a Windows PC or Linux; the iPhone app calls it "your Mac" either way.
 
 ### On your computer
 
-**1. Open Settings at the bottom of the sidebar and choose Devices.**
+**1. Open Settings at the bottom of the sidebar and choose Phone and devices.**
 
-<img src="docs/screenshots/pairing/desktop-settings.png" alt="Bloks Settings open on the Devices tab" width="720">
+<img src="docs/screenshots/pairing/desktop-settings.png" alt="Bloks Settings open on the Phone and devices page" width="720">
 
 **2. Switch on Phones and devices, then press Restart now.** Bloks only
 starts listening on your network when it starts, so this is needed once. If
@@ -352,6 +435,7 @@ Everything is under `~/.bloks`:
 | --- | --- |
 | `bots.json` | Agents, their roles, models and resume cursors |
 | `bloks.json` | Rooms and their members |
+| `sidebar.json` | The order of the sidebar's sections |
 | `messages-<id>.json` | One transcript per agent or room |
 | `config.json` | Connected engines and keys, `0600` in a `0700` directory |
 | `skills/` | Installed skills, one markdown file each |

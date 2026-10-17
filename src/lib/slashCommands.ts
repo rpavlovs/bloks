@@ -6,7 +6,36 @@ export interface Command {
   id: string;
   name: string;
   description: string;
-  source: "library" | "engine";
+  /** "bloks" is Bloks' own: the server answers it, and no engine hears it. */
+  source: "library" | "engine" | "bloks";
+  kind?: "skill" | "command";
+  prefix?: "$";
+}
+
+/** Bloks' own commands, offered in every agent conversation that takes
+ * them. A command, so only at the start of a message, which is the only
+ * place the server reads one (isGoalCommand in server/goals.ts). */
+export const BLOKS_COMMANDS: Command[] = [
+  {
+    id: "goal",
+    name: "goal",
+    description: "Keep working until this is done",
+    source: "bloks",
+    kind: "command",
+  },
+];
+
+/**
+ * The list for one conversation: Bloks' own first, then what the agent
+ * and its engine offer. An engine command or skill of the same name gives
+ * way, because typing it reaches Bloks, never the engine. A conversation
+ * that takes no goal (a rehearsal, a shared room's, the unlisted mail
+ * one) is offered none.
+ */
+export function withBloksCommands(commands: Command[], lane: { noGoals?: boolean } | undefined): Command[] {
+  const own = lane?.noGoals ? [] : BLOKS_COMMANDS;
+  const taken = new Set(own.map((c) => c.id));
+  return [...own, ...commands.filter((c) => c.prefix || !taken.has(c.id))];
 }
 
 /**
@@ -51,22 +80,25 @@ function inOrder(field: string, q: string): boolean {
   return at === q.length;
 }
 
-/** Matching commands, best first, library skills ahead of engine ones on a tie. */
-export function matches(commands: Command[], query: string, limit = 8): Command[] {
+/** Matching commands, best first: on a tie Bloks' own lead, then library
+ * skills, then the engine's. */
+export function matches(commands: Command[], query: string, limit = 8, atStart = true): Command[] {
+  const rank = { bloks: 0, library: 1, engine: 2 } as const;
   return commands
+    .filter((c) => atStart || c.kind !== "command")
     .map((c) => ({ c, s: score(c, query) }))
     .filter((x) => x.s >= 0)
-    .sort((a, b) => b.s - a.s || (a.c.source === b.c.source ? 0 : a.c.source === "library" ? -1 : 1) || a.c.id.localeCompare(b.c.id))
+    .sort((a, b) => b.s - a.s || rank[a.c.source] - rank[b.c.source] || a.c.id.localeCompare(b.c.id))
     .slice(0, limit)
     .map((x) => x.c);
 }
 
 /** The text with the half-typed `/word` replaced by the chosen command,
  * and where the caret goes after it. */
-export function insert(text: string, start: number, caret: number, id: string): { text: string; caret: number } {
+export function insert(text: string, start: number, caret: number, id: string, prefix = "/"): { text: string; caret: number } {
   const after = text.slice(caret);
   const spaced = after.startsWith(" ") ? "" : " ";
-  const next = `${text.slice(0, start)}/${id}${spaced}${after}`;
+  const next = `${text.slice(0, start)}${prefix}${id}${spaced}${after}`;
   // after the space either way, ready for the next word
   return { text: next, caret: start + id.length + 2 };
 }
@@ -77,15 +109,21 @@ export function insert(text: string, start: number, caret: number, id: string): 
  * exactly one run, in order, so the runs laid over the textarea line up
  * with what is typed.
  */
-export function segments(text: string, ids: Set<string>): Array<{ text: string; skill: boolean }> {
+export function segments(text: string, ids: Set<string>, dollarIds: Set<string> = new Set()): Array<{ text: string; skill: boolean }> {
   const out: Array<{ text: string; skill: boolean }> = [];
-  // dots only between word characters, so "/tldr." ends at the r
-  const pattern = /(^|\s)(\/[A-Za-z0-9][\w-]*(?:\.[\w-]+)*)(?=$|[\s,.;:!?)])/g;
+  if (!ids.size && !dollarIds.size) return text ? [{ text, skill: false }] : [];
+  // Match the actual invocation IDs, including plugin and MCP namespaces.
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const tokens = [...ids].map((id) => "/" + id).concat([...dollarIds].map((id) => "$" + id)).sort((a, b) => b.length - a.length).map(escape);
+  const pattern = new RegExp(`(^|[\\s\x22\x27<]|\\p{Ps}|\\p{Pi})(${tokens.join("|")})(?=$|[^A-Za-z0-9_-])`, "gu");
   let last = 0;
   for (const m of text.matchAll(pattern)) {
     const token = m[2];
     const at = (m.index ?? 0) + m[1].length;
-    if (!ids.has(token.slice(1))) continue;
+    if (!(token.startsWith("$") ? dollarIds : ids).has(token.slice(1))) continue;
+    if (token.startsWith("$") && /[A-Za-z0-9_:-]/.test(text[at + token.length] ?? "")) continue;
+    if (token.startsWith("/") && m[1] && !/\s/.test(m[1])) continue;
+    if (token.startsWith("/") && text[at + token.length] && !/[\s,.;:!?)\]]/.test(text[at + token.length])) continue;
     if (at > last) out.push({ text: text.slice(last, at), skill: false });
     out.push({ text: token, skill: true });
     last = at + token.length;

@@ -76,7 +76,7 @@ export interface RuntimeEventBase {
 /**
  * Everything that can happen during a turn.
  *
- * Worth knowing about three of these:
+ * Worth knowing about four of these:
  *
  *   `content.delta` is text as it is produced. Some providers stream token
  *   by token and some hand over a whole paragraph at once; both emit this,
@@ -88,10 +88,14 @@ export interface RuntimeEventBase {
  *
  *   `request.opened` means the turn is now blocked on a human. Nothing
  *   proceeds until a matching `request.resolved` arrives.
+ *
+ *   `context.compacted` is the engine summarising its own session, which
+ *   Bloks did not ask for unless it sent the turn that did it.
  */
 export type RuntimeEvent = RuntimeEventBase &
   (
     | { type: "session.started"; sessionId: string | null; model?: string | null }
+    | { type: "commands.updated"; cwd: string | null; catalog: import("./agent-commands.ts").ClaudeCatalog }
     | { type: "session.exited"; reason?: string }
     | { type: "turn.started" }
     | {
@@ -101,10 +105,35 @@ export type RuntimeEvent = RuntimeEventBase &
         cost?: number | null;
         denials?: string[];
       }
-    | { type: "item.started"; itemType: "tool" | "reasoning"; title?: string }
+    | {
+        type: "item.started";
+        itemType: "tool" | "reasoning";
+        title?: string;
+        /** Command display detail. The bus redacts and bounds it before
+         * logging or publishing; title stays the tool's counted kind. */
+        command?: string;
+        /** The files this call writes, when the engine says: what a change
+         * card can be sure was this turn's own work (server/checkpoints.ts). */
+        paths?: string[];
+        /** This call may write files it does not name: a shell command, or
+         * any call on an engine that never says which files it wrote. */
+        mayWrite?: boolean;
+        /** The tool and its arguments, normalised and hashed
+         * (callSignature in server/repeats.ts), when the engine reports
+         * the arguments. Two calls with one signature asked for the same
+         * thing, which is how a turn going round in circles is noticed.
+         * A hash rather than the arguments, which can carry a key. */
+        signature?: string;
+      }
     | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null }
     | { type: "item.completed"; itemType: "tool"; ok: boolean }
-    | { type: "item.completed"; itemType: "assistant_text"; text: string }
+    | {
+        type: "item.completed"; itemType: "assistant_text"; text: string;
+        /** Reliable native phase, for notification selection only. */
+        replyPhase?: import("./reply-notifications.ts").ReplyPhase;
+        /** Adapter-generated chat placeholder, not provider-supplied text. */
+        syntheticText?: true;
+      }
     | { type: "content.delta"; streamKind: "assistant_text" | "reasoning_text"; delta: string }
     | {
         type: "request.opened";
@@ -117,7 +146,35 @@ export type RuntimeEvent = RuntimeEventBase &
         choices?: string[];
       }
     | { type: "request.resolved"; behavior: string; source: string }
-    | { type: "thread.token-usage.updated"; input: number; output: number }
+    | {
+        type: "thread.token-usage.updated";
+        input: number;
+        output: number;
+        /** The whole prompt this request carried, cache writes included,
+         * which `input` leaves out. How full the session is right now. */
+        context?: number;
+        /** How long the provider keeps this prompt cached, when the
+         * request wrote to the cache and said which lifetime it used. */
+        cacheTtl?: "5m" | "1h";
+      }
+    | {
+        /** How full the session is, in the engine's own numbers: the
+         * size of the latest request, and the window it is measured
+         * against. Either may be missing, and a missing one leaves the
+         * last known value as it was. Kept apart from the token counts
+         * above, which are what a turn spent, not how full it is. */
+        type: "context.reading";
+        used: number | null;
+        window: number | null;
+      }
+    | {
+        /** The engine summarised its own session. Token counts are what
+         * the engine reported, either of which may be missing. */
+        type: "context.compacted";
+        trigger: string | null;
+        before: number | null;
+        after: number | null;
+      }
     | { type: "runtime.error"; message: string }
   );
 
@@ -129,6 +186,9 @@ export interface SendTurnInput {
   threadId: ThreadId;
   text: string;
   model?: string;
+  /** Run without the engine's hooks (Claude Code: plugins and settings
+   * hooks). Engines without hooks ignore it. */
+  noHooks?: boolean;
   /** Reasoning effort, for engines with the dial. Others ignore it. */
   effort?: "low" | "medium" | "high";
   /** The provider's own idea of where this conversation was, from the last
@@ -138,6 +198,9 @@ export interface SendTurnInput {
   transcript?: Array<{ role: "user" | "assistant"; text: string }>;
   /** Who this agent is, as a system prompt. */
   system?: string;
+  /** How long a tool call may go without a word from the engine before
+   * the turn is stopped; 0 is never. Drivers that cannot tell ignore it. */
+  stallMs?: number;
   /** Capabilities to hand the agent as tools, decided per turn because
    * they depend on the agent's settings and on what is provisioned. */
   integrations?: {
@@ -156,8 +219,9 @@ export interface SendTurnInput {
     sandbox?: { runtime: string; name: string };
     /** A real browser, driven through its debugging protocol rather than
      * through pixels. Separate from `computer` on purpose: the web will
-     * describe itself if asked, and a native app will not. */
-    browser?: { profileDir: string; port: number };
+     * describe itself if asked, and a native app will not. Its port is
+     * the profile's own browser's, found from the profile (cdp.ts). */
+    browser?: { profileDir: string };
     /** User-registered MCP servers this agent may use, already resolved
      * to their full spawn/connect shape by the harness. */
     mcpServers?: Array<{
@@ -167,6 +231,9 @@ export interface SendTurnInput {
       args?: string[];
       url?: string;
       headers?: Record<string, string>;
+      /** A stdio server's own environment. Empty values are names still
+       * waiting for the person, and a driver leaves them out. */
+      env?: Record<string, string>;
     }>;
   };
   /**
@@ -184,6 +251,16 @@ export interface SendTurnInput {
    * with that (ownerToolsSafe in server/index.ts).
    */
   shared?: { tools: "conversation" | "desk" };
+  /** The agent is in full access: the engine's own guards come off too
+   * (no permission prompts, no sandbox), so nothing asks and nothing is
+   * routed through the approval gate. Never set on a shared turn. */
+  fullAccess?: boolean;
+  /** Somebody the owner has not vouched for asked for this turn (an
+   * email when anyone may write), and its approvals go to the owner as
+   * cards. No driver skips its engine's guards for it, however its
+   * instance is set, and one that pre-allows tools or edits of its own
+   * accord (Claude Code) does not. Never with `fullAccess`. */
+  untrusted?: boolean;
   cwd?: string;
   /** Folders the agent may edit without asking, beyond its cwd. The
    * harness grants its own workspace (memory lives there) so an agent
@@ -196,6 +273,25 @@ export interface SendTurnInput {
    * ignores it, which is the honest outcome rather than a missing
    * feature. */
   env?: Record<string, string>;
+  /**
+   * The whole message to send instead of `text` when the session behind
+   * `resumeCursor` turns out to be gone and the driver opens a new one:
+   * the bounded story so far, then the words. Without it, a session the
+   * engine has forgotten costs the agent everything said before.
+   */
+  handoff?: string;
+  /**
+   * The resumed session has grown past the lane's line (compactBeforeTurn
+   * in server/context.ts). A driver that says it can (`compactsFirst`)
+   * compacts it by the engine's own means before the words go, and
+   * reports `context.compacted`; if the engine cannot, it opens a new
+   * session and sends `handoff` instead. Never set on a fresh session.
+   */
+  compactFirst?: boolean;
+  /** An explicit Codex command: compact this session and stop there. */
+  compactOnly?: boolean;
+  /** Names found only in this segment's personal messages, before notes. */
+  skillNames?: string[];
 }
 
 export interface TurnStartResult {
@@ -217,8 +313,21 @@ export interface ProviderAdapter {
      * turn (API engines); false for session-cursor engines, which need
      * the harness to replay history after an engine switch. */
     replaysNatively?: boolean;
+    /** Takes `compactFirst` on a turn (see SendTurnInput). */
+    compactsFirst?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
+  /**
+   * More words from the person for the turn running on this thread, read
+   * by the engine after the step it is on, without interrupting it.
+   * True once the running turn has them; false when it cannot take them
+   * (no turn running, the turn is ending, the engine refused), and the
+   * harness then keeps them for the next turn instead. A driver must
+   * never answer false for words the engine may still act on, or they
+   * would be said twice. Optional: an engine that cannot take input
+   * mid-turn leaves it out and everything waits for the next turn.
+   */
+  steerTurn?(threadId: ThreadId, text: string, options?: { skillNames?: string[] }): Promise<boolean>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
   respondToRequest(
     threadId: ThreadId,
@@ -242,11 +351,42 @@ export interface ProviderSnapshot {
   version?: string | null;
 }
 
+// ── what a plan has left ───────────────────────────────────────────────
+
+/** One limit of the subscription an engine is signed in with, as the
+ * engine reported it (server/plan-usage.ts). */
+export interface PlanWindow {
+  /** The engine's own name for it: five_hour, seven_day, primary. */
+  id: string;
+  /** How long the window is, when the engine says or its name does. */
+  minutes: number | null;
+  /** The share used, from 0. Past 1 when usage ran over the cap. */
+  used: number;
+  /** When it starts again, in epoch milliseconds, when known. */
+  resetsAt: number | null;
+  /** The engine's own word that this one is near its limit, or at it. */
+  status?: "warning" | "rejected";
+}
+
+export interface PlanUsage {
+  windows: PlanWindow[];
+  /** The plan's name, when the engine says (Codex does). */
+  plan: string | null;
+  /** When the engine last said, in epoch milliseconds. */
+  at: number;
+}
+
 // ── defining a driver ──────────────────────────────────────────────────
 
 export interface ModelCatalog {
   default: string;
   options: Array<{ id: string; label: string }>;
+  /** Where the list came from, said in the picker, when it is not the
+   * engine reporting it live (a list built into Bloks, for one). */
+  note?: string;
+  /** The engine takes any model id it is given, so the picker offers to
+   * use one typed in that the list does not have yet. */
+  acceptsAnyId?: boolean;
 }
 
 export interface DriverCreateInput<Config> {
@@ -267,10 +407,17 @@ export interface ProviderInstance {
   /** Resolves when a deferred catalog probe has finished, if this engine
    * has one. The picker loads before that, so the harness refetches. */
   catalogReady?: Promise<void>;
+  /** Read-only native skill discovery. Paths are server-only. */
+  skills?(cwd: string): Promise<import("./codex-skills.ts").CodexSkill[] | null>;
   snapshot(): Promise<ProviderSnapshot>;
   /** A cheap one-shot completion, for naming and summarising. Optional:
    * not every engine has something small enough to be worth using. */
   generateText?(prompt: string): Promise<string>;
+  /** The latest the engine said about its plan's limits, kept in memory
+   * on the instance and null until it says anything. Optional: only an
+   * engine signed in to a subscription has limits to report. For the
+   * person to read; never part of a prompt. */
+  planUsage?(): PlanUsage | null;
   dispose(): Promise<void>;
 }
 

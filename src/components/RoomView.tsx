@@ -1,6 +1,6 @@
 // A room: several agents and you, in one transcript. Unlike a solo chat,
 // every line is attributed, because who said it is half the meaning.
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import AlertTriangle from "lucide-react/dist/esm/icons/alert-triangle.mjs";
 import ArrowUp from "lucide-react/dist/esm/icons/arrow-up.mjs";
 import BookmarkPlus from "lucide-react/dist/esm/icons/bookmark-plus.mjs";
@@ -17,11 +17,13 @@ import Users from "lucide-react/dist/esm/icons/users.mjs";
 import UserPlus from "lucide-react/dist/esm/icons/user-plus.mjs";
 import type { RoomPerson } from "@/state/reducer";
 import { SharePanel } from "./SharePanel";
-import { api, useStore, formatTime, type Blok, type Bot, type Message } from "@/state/store";
+import { api, useStore, workingInRoom, type Blok, type Bot, type Message } from "@/state/store";
+import { CarryOn } from "@/components/CarryOn";
 import { AgentAvatar } from "./Avatar";
 import { RoutinesDialog } from "./RoutinesDialog";
 import { GroupCallButton } from "./Voice";
-import { windowStart, TRANSCRIPT_WINDOW } from "@/lib/transcript";
+import { shouldLoadEarlier, splitWaiting, windowStart, TRANSCRIPT_WINDOW } from "@/lib/transcript";
+import { useEarlier } from "@/lib/useEarlier";
 import { ArtifactCard } from "./Artifacts";
 import {
   ForwardDialog,
@@ -29,14 +31,18 @@ import {
   Reactions,
   ReplyChip,
   ReplyContext,
+  useTapToShow,
   type ReplyDraft,
 } from "./MessageActions";
 import { OptionCard } from "./OptionCard";
+import { Markdownish } from "./Markdown";
 import { ChangesCard } from "./ChangesCard";
 import { ToolRun } from "./ToolRun";
+import { TurnFoldLine } from "./TurnFold";
 import { Button } from "@/components/ui/button";
 import { BrowseFolderButton } from "@/components/ui/browse-folder";
 import { ForumLens } from "./ForumLens";
+import { WaitingStrip } from "./WaitingStrip";
 import { MessageComponent } from "./Gallery";
 import MoreHorizontal from "lucide-react/dist/esm/icons/more-horizontal.mjs";
 import {
@@ -47,7 +53,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { replyCounts, replyLabel } from "@/lib/threads";
+import { boxFor, carryFocus, keepDraft, readDraft, showBox, takeBack, takeFocus, type Draft } from "@/lib/drafts";
+import { queuedLine, stamp } from "@/lib/when";
 import { cn } from "@/lib/cn";
+import { useStickToBottom } from "@/lib/useStickToBottom";
+import { useHoldPlace } from "@/lib/useHoldPlace";
+import { foldHolding, foldRoom, lastFoldKey, rowsFrom } from "@/lib/turnFold";
 
 /** A reaction in a room is the cheapest thing anyone can say, and often
  * the right thing: agreeing with a plan should not wake six agents. */
@@ -62,41 +73,17 @@ function reactTo(roomId: string, messageId: string, emoji: string) {
   }).catch(() => {});
 }
 
+/** Where a room message said in a linked chat came from, for the strip. */
+const CHANNEL_NAMES: Partial<Record<NonNullable<Message["via"]>, string>> = {
+  slack: "Slack",
+  discord: "Discord",
+  whatsapp: "WhatsApp",
+};
+
 function seniorityOf(bot: Bot) {
   return bot.seniority ?? 1;
 }
 
-/** One line of a room message: a quote reads as a quote, everything
- * else keeps its @mention highlighting. Agents answering each other
- * quote what they are answering, and a bare ">" in the middle of a
- * sentence is the least useful way to show that. */
-function RoomLine({ line, names }: { line: string; names: string[] }) {
-  const quoted = line.match(/^\s*>\s?(.*)$/);
-  if (quoted) {
-    return (
-      <div className="my-0.5 border-l-2 border-border pl-2.5 text-muted-foreground">
-        {quoted[1] ? withMentions(quoted[1], names) : null}
-      </div>
-    );
-  }
-  if (!line.trim()) return <div className="h-2" />;
-  return <div>{withMentions(line, names)}</div>;
-}
-
-/** Highlight @mentions so it's obvious who a line was aimed at. */
-function withMentions(text: string, names: string[]): React.ReactNode[] {
-  if (!names.length) return [text];
-  const pattern = new RegExp(`(@(?:${names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")}))`, "gi");
-  return text.split(pattern).map((part, i) =>
-    part.startsWith("@") ? (
-      <span key={i} className="font-medium text-brand-ink">
-        {part}
-      </span>
-    ) : (
-      part
-    ),
-  );
-}
 
 /** A person in a shared room: their initial, never an agent's avatar, so
  * who is a person and who is an agent is never in doubt. */
@@ -135,9 +122,16 @@ function RoomMessage({
   const speaker = message.from ? members.find((m) => m.id === message.from) : null;
   const nameOfReactor = (id: string) =>
     id === "user" ? "You" : (members.find((m) => m.id === id)?.name ?? "An agent");
+  // where nothing hovers, a tap on the words shows the bar
+  const tap = useTapToShow();
 
-  const verbs = (author: string) => (
+  // Floating is for the agents' side: there the text fills the row, and
+  // an invisible bar beside it used to hold 150px of every line empty,
+  // which on a phone halved the width a message could use.
+  const verbs = (author: string, floating = false) => (
     <MessageActionBar
+      className={floating ? "absolute -top-3.5 right-0 z-10" : undefined}
+      open={tap.open}
       message={message}
       author={author}
       onReply={onReply}
@@ -167,17 +161,18 @@ function RoomMessage({
           {showSpeaker && (
             <div className="mb-0.5 flex items-baseline gap-1.5">
               <span className="text-[13px] font-semibold text-foreground">{who}</span>
-              <span className="text-[11px] text-muted-foreground">{formatTime(message.at)}</span>
+              <span className="text-[11px] tabular-nums text-muted-foreground">{stamp(message.at)}</span>
             </div>
           )}
-          <div className="group flex items-center gap-1.5">
-            <div className="min-w-0 rounded-2xl rounded-tl-md bg-muted px-3.5 py-2 text-[14.5px] leading-relaxed text-foreground">
+          <div ref={tap.row} className="group relative flex items-center gap-1.5">
+            <div
+              onPointerUp={tap.onPointerUp}
+              className="min-w-0 rounded-2xl rounded-tl-md bg-muted px-3.5 py-2 text-[14.5px] leading-relaxed text-foreground"
+            >
               {message.replyTo && <ReplyContext replyTo={message.replyTo} />}
-              {(message.text ?? "").split("\n").map((line, i) => (
-                <RoomLine key={i} line={line} names={names} />
-              ))}
+              <Markdownish text={message.text ?? ""} mentions={names} />
             </div>
-            {verbs(who)}
+            {verbs(who, true)}
           </div>
         </div>
       </div>
@@ -186,30 +181,32 @@ function RoomMessage({
 
   if (message.role === "user") {
     return (
-      <div className="group flex items-center justify-end gap-1.5">
+      <div ref={tap.row} className="group flex items-center justify-end gap-1.5">
         {verbs("You")}
         <div className="flex max-w-[76%] flex-col items-end">
-          <div className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-[14.5px] leading-relaxed text-primary-foreground">
+          <div
+            onPointerUp={tap.onPointerUp}
+            className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-[14.5px] leading-relaxed text-primary-foreground"
+          >
             {message.replyTo && <ReplyContext replyTo={message.replyTo} onDark />}
             {message.text}
-            {message.queued && (
-              <div className="mt-1 flex items-center gap-1 text-[10.5px] font-medium opacity-70" role="status">
-                <span className="inline-block size-1.5 animate-pulse rounded-full bg-current" />
-                Queued, sends when this turn finishes
-              </div>
-            )}
           </div>
           <Reactions
             reactions={message.reactions}
             onToggle={(emoji: string) => reactTo(roomId, message.id, emoji)}
             nameOf={nameOfReactor}
           />
+          {message.deliveredAt && (
+            <div className="mt-0.5 px-1 text-[11px] leading-4 tabular-nums text-muted-foreground">
+              {queuedLine(message.queuedAt ?? message.at, message.deliveredAt)}
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
-  if (message.kind === "notice" && message.event) {
+  if (message.kind === "notice" && (message.event || message.compaction)) {
     return <div className="py-1 text-center text-[12px] text-muted-foreground">{message.text}</div>;
   }
 
@@ -220,6 +217,7 @@ function RoomMessage({
           <AlertTriangle size={14} className="mt-0.5 shrink-0 text-warning" />
           <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground">
             {message.text}
+            <CarryOn message={message} />
           </div>
         </div>
       </div>
@@ -253,7 +251,7 @@ function RoomMessage({
         {showSpeaker && (
           <div className="mb-0.5 flex items-baseline gap-1.5">
             <span className="text-[13px] font-semibold text-foreground">{speaker.name}</span>
-            <span className="text-[11px] text-muted-foreground">{formatTime(message.at)}</span>
+            <span className="text-[11px] tabular-nums text-muted-foreground">{stamp(message.at)}</span>
           </div>
         )}
         {message.kind === "component" && message.component ? (
@@ -264,19 +262,17 @@ function RoomMessage({
           // an agent can need you mid-room; the ask has to be answerable here
           <OptionCard botId={speaker.id} roomId={roomId} message={message} />
         ) : (
-          <div className="group flex items-center gap-1.5">
-            <div className="min-w-0 text-[14.5px] leading-relaxed text-foreground">
+          <div ref={tap.row} className="group relative flex items-center gap-1.5">
+            <div onPointerUp={tap.onPointerUp} className="min-w-0 flex-1 text-[14.5px] leading-relaxed text-foreground">
               {message.replyTo && <ReplyContext replyTo={message.replyTo} />}
-              {(message.text ?? "").split("\n").map((line, i) => (
-                <RoomLine key={i} line={line} names={names} />
-              ))}
+              <Markdownish text={message.text ?? ""} mentions={names} />
               <Reactions
                 reactions={message.reactions}
                 onToggle={(emoji: string) => reactTo(roomId, message.id, emoji)}
                 nameOf={nameOfReactor}
               />
             </div>
-            {verbs(speaker.name)}
+            {verbs(speaker.name, true)}
           </div>
         )}
       </div>
@@ -286,7 +282,31 @@ function RoomMessage({
 
 export function RoomView({ blok }: { blok: Blok }) {
   const { state, dispatch } = useStore();
-  const [text, setText] = useState("");
+  // One view per room (App keys it), so a half-written line and a reply
+  // quote stay with the room they were written in. The line is kept when
+  // the room goes, and found again when it comes back.
+  const draftKey = `room:${blok.id}`;
+  const [text, setText] = useState(() => readDraft(draftKey).text);
+  const latestText = useRef(text);
+  latestText.current = text;
+  const mounted = useRef(true);
+  // a line a failed send hands back, into this box when it is the one on
+  // screen for this room (see showBox in lib/drafts)
+  const receive = (sent: Draft) => {
+    const back = takeBack({ text: latestText.current, attachments: [] }, sent);
+    if (back) setText(back.text);
+  };
+  const receiveRef = useRef(receive);
+  receiveRef.current = receive;
+  useEffect(() => {
+    mounted.current = true;
+    const hide = showBox(draftKey, (sent) => receiveRef.current(sent));
+    return () => {
+      mounted.current = false;
+      hide();
+      keepDraft(draftKey, { text: latestText.current, attachments: [] });
+    };
+  }, [draftKey]);
   // Typing @ opens a list of the people in this room. Naming somebody is
   // how a room decides who answers, so guessing the spelling should
   // never be part of it: the list filters as you type, Tab or Enter
@@ -311,6 +331,12 @@ export function RoomView({ blok }: { blok: Blok }) {
   const [highlightId, setHighlightId] = useState<string | null>(null);
 
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // the keyboard follows from the box this one replaced (lib/drafts)
+  useLayoutEffect(() => {
+    if (takeFocus()) inputRef.current?.focus();
+    const input = inputRef.current;
+    return () => carryFocus(Boolean(input) && document.activeElement === input);
+  }, [draftKey]);
   const [sharingOpen, setSharingOpen] = useState(false);
   const [ownerName, setOwnerName] = useState<string | undefined>(undefined);
   const roomPeople = state.roomPeople[blok.id] ?? [];
@@ -381,7 +407,9 @@ export function RoomView({ blok }: { blok: Blok }) {
     (best, m) => (!best || seniorityOf(m) > seniorityOf(best) ? m : best),
     null,
   );
-  const working = members.filter((m) => m.busy);
+  // thinking here, not just busy: a member at work in another
+  // conversation is not about to answer this room
+  const working = members.filter((m) => workingInRoom(m, blok.id));
 
   const [boundary, setBoundary] = useState<number | null>(null);
   const preExpand = useRef<number | null>(null);
@@ -390,16 +418,41 @@ export function RoomView({ blok }: { blok: Blok }) {
     lastRoomKey.current = blok.id;
     setBoundary(null);
   }
-  const start = windowStart(blok.messages.length, boundary);
+  // The room's conversation, and what waits behind the round it is in,
+  // above the composer until it goes (GitHub 170).
+  const { said, waiting } = useMemo(() => splitWaiting(blok.messages), [blok.messages]);
+  const start = windowStart(said.length, boundary);
   // which messages have answers hanging off them, for the stream's hint
-  const counts = replyCounts(blok.messages);
-  const visibleMessages = blok.messages.slice(start);
+  const counts = replyCounts(said);
+  // Each agent's finished turn is one line above its reply
+  // (src/lib/turnFold.ts). A room's transcript does not say where a turn
+  // began, so where one seen starting began is kept here: nothing of it
+  // folds while it runs, whoever else speaks meanwhile. One already
+  // running when the room was opened has no such place (null).
+  const liveFrom = useRef<Map<string, number | null> | null>(null);
+  const seen = liveFrom.current;
+  const live = new Map<string, number | null>();
+  for (const m of working) live.set(m.id, seen ? (seen.has(m.id) ? (seen.get(m.id) ?? null) : said.length) : null);
+  liveFrom.current = live;
+  const liveKey = [...live].map(([id, since]) => `${id}:${since}`).join(" ");
+  const folded = useMemo(() => foldRoom(said, live), [said, liveKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const visibleRows = useMemo(() => rowsFrom(folded.rows, start), [folded, start]);
+  const [openFolds, setOpenFolds] = useState<ReadonlySet<string>>(() => new Set());
 
   const pinned = useRef(true);
+  useStickToBottom(scrollRef, pinned);
+  const scrolledTo = useRef(0);
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
-    pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    // scrolling up near the top brings the next page in without a press
+    const lastTop = scrolledTo.current;
+    scrolledTo.current = el.scrollTop;
+    // Only the reader scrolling up lets go of the end. Content that grew
+    // under a reader who was there (a font, a card laying out) reaches
+    // this as a scroll too, and used to leave them short of the last line.
+    pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80 || (pinned.current && el.scrollTop >= lastTop);
+    if (shouldLoadEarlier({ top: el.scrollTop, lastTop, more: start > 0 || earlier.remaining > 0, loading: earlier.loading })) showEarlier();
   };
 
   useLayoutEffect(() => {
@@ -408,35 +461,79 @@ export function RoomView({ blok }: { blok: Blok }) {
       el.scrollTop += el.scrollHeight - preExpand.current;
       preExpand.current = null;
     }
-  }, [start]);
+    // a page from the server lands above with start still at 0
+  }, [start, said.length]);
 
+  // When a turn ends its work folds, and the reply stays where it is on
+  // screen for a reader who is not at the end. After the effect above:
+  // that one adds to where the reader is, and this one then finds the
+  // reply already in place.
+  useHoldPlace(
+    scrollRef,
+    pinned,
+    blok.id,
+    lastFoldKey(folded.rows),
+    folded.hold ? `[data-room-msg="${folded.hold.message.id}"]` : null,
+  );
+  // Opening a fold leaves its line where it was pressed. At the end of
+  // the room, following the end would scroll the line away instead.
+  const toggleFold = (key: string) => {
+    pinned.current = false;
+    setOpenFolds((open) => {
+      const next = new Set(open);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  };
+
+  const earlier = useEarlier("room", { ...blok, threadId: blok.id });
   const showEarlier = () => {
     preExpand.current = scrollRef.current?.scrollHeight ?? null;
     pinned.current = false;
-    setBoundary(Math.max(0, start - TRANSCRIPT_WINDOW));
+    if (start > 0) return setBoundary(Math.max(0, start - TRANSCRIPT_WINDOW));
+    // everything here is showing; the rest is still on the computer
+    setBoundary(0);
+    void earlier.load();
   };
 
   useEffect(() => {
     if (!pinned.current) return;
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [blok.id, blok.messages.length, working.length]);
+  }, [blok.id, said.length, waiting.length, working.length]);
 
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
+    // Empty is one row (rows=1): measured, a placeholder too long for the
+    // line wraps and stands the box two rows tall before anything is typed.
+    if (!text) {
+      el.style.height = "";
+      return;
+    }
     el.style.height = "0px";
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }, [text]);
 
   const send = () => {
     if (!text.trim()) return;
+    const sent = { text: text.trim(), attachments: [] };
     dispatch({
       type: "sendToRoom",
       blokId: blok.id,
-      text: text.trim(),
+      text: sent.text,
       replyTo: replyTo ?? undefined,
+      // a line that did not go comes back to the box, or to the room's
+      // kept draft when the room was left meanwhile
+      onFailed: () => {
+        if (mounted.current) return receive(sent);
+        const box = boxFor(draftKey);
+        if (box) return box(sent);
+        const back = takeBack(readDraft(draftKey), sent);
+        if (back) keepDraft(draftKey, back);
+      },
     });
     setText("");
+    latestText.current = "";
     setReplyTo(null);
   };
 
@@ -484,6 +581,57 @@ export function RoomView({ blok }: { blok: Blok }) {
       body: JSON.stringify({ leadOnly: !blok.leadOnly }),
     }).catch(() => {});
   };
+
+  // One stretch of the room as its rows: what stays in the open, or a
+  // fold's work once it is opened. Who spoke last and a run of tool calls
+  // are read within the stretch, since rows with a fold between them are
+  // not next to each other on the page.
+  const rowsOf = (list: readonly Message[]) =>
+    list.map((m, i) => {
+      const prev = list[i - 1];
+      // one member's run of tool calls reads as one line
+      if (m.kind === "activity" && m.tool) {
+        if (prev?.kind === "activity" && prev.from === m.from && !prev.deleted) return null;
+        const run: Message[] = [];
+        for (let j = i; j < list.length; j++) {
+          const next = list[j];
+          if (next.kind !== "activity" || next.from !== m.from || next.deleted || !next.tool) break;
+          run.push(next);
+        }
+        return <ToolRun key={m.id} messages={run} className="pl-11" />;
+      }
+      const showSpeaker = !prev || prev.from !== m.from || prev.role !== m.role;
+      const answers = replyLabel(counts.get(m.id) ?? 0);
+      return (
+        <div
+          key={m.id}
+          data-room-msg={m.id}
+          className={cn(
+            "rounded-2xl transition-colors duration-700",
+            highlightId === m.id && "bg-brand/10",
+          )}
+        >
+          <RoomMessage
+            message={m}
+            members={members}
+            people={roomPeople}
+            ownerName={blok.sharing ? ownerName : undefined}
+            showSpeaker={showSpeaker}
+            roomId={blok.id}
+            onReply={setReplyTo}
+            onForward={(message, author) => setForwarding({ message, author })}
+          />
+          {answers && (
+            <button
+              onClick={() => setLensAnd("forum")}
+              className="ml-11 mt-0.5 rounded-md px-1.5 py-0.5 text-[11.5px] text-brand-ink transition-colors duration-150 hover:bg-accent"
+            >
+              {answers}
+            </button>
+          )}
+        </div>
+      );
+    });
 
   return (
     <main className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
@@ -620,7 +768,7 @@ export function RoomView({ blok }: { blok: Blok }) {
       >
         {lens === "forum" ? (
           <ForumLens
-            messages={blok.messages}
+            messages={said}
             members={members}
             onOpenInStream={(messageId) => {
               setLensAnd("stream");
@@ -628,6 +776,12 @@ export function RoomView({ blok }: { blok: Blok }) {
               // the stream may be windowed to its tail, so open the whole
               // thing rather than scrolling to something not rendered
               setBoundary(0);
+              // and a message under a fold is shown by opening the fold
+              const fold = foldHolding(folded.rows, said.findIndex((m) => m.id === messageId));
+              if (fold) {
+                pinned.current = false;
+                setOpenFolds((open) => new Set(open).add(fold));
+              }
               requestAnimationFrame(() => {
                 document
                   .querySelector(`[data-room-msg="${messageId}"]`)
@@ -637,59 +791,31 @@ export function RoomView({ blok }: { blok: Blok }) {
           />
         ) : (
         <div className="mx-auto flex max-w-[760px] flex-col gap-2 pb-4 pt-3">
-          {start > 0 && (
+          {(start > 0 || earlier.remaining > 0) && (
             <button
               onClick={showEarlier}
-              className="mx-auto mt-3 rounded-full border px-3.5 py-1.5 text-[12px] text-muted-foreground transition-colors duration-150 hover:border-foreground/25 hover:text-foreground"
+              disabled={earlier.loading}
+              className="mx-auto mt-3 inline-flex items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-[12px] text-muted-foreground transition-colors duration-150 hover:border-foreground/25 hover:text-foreground disabled:opacity-60"
             >
-              Show earlier messages ({start} more)
+              {earlier.loading && <Loader2 size={12} className="animate-spin" />}
+              Show earlier messages ({start + earlier.remaining} more)
             </button>
           )}
-          {visibleMessages.map((m, i) => {
-            const prev = visibleMessages[i - 1];
-            // one member's run of tool calls reads as one line
-            if (m.kind === "activity" && m.tool) {
-              if (prev?.kind === "activity" && prev.from === m.from && !prev.deleted) return null;
-              const run: Message[] = [];
-              for (let j = i; j < visibleMessages.length; j++) {
-                const next = visibleMessages[j];
-                if (next.kind !== "activity" || next.from !== m.from || next.deleted || !next.tool) break;
-                run.push(next);
-              }
-              return <ToolRun key={m.id} messages={run} className="pl-11" />;
-            }
-            const showSpeaker = !prev || prev.from !== m.from || prev.role !== m.role;
-            const answers = replyLabel(counts.get(m.id) ?? 0);
-            return (
-              <div
-                key={m.id}
-                data-room-msg={m.id}
-                className={cn(
-                  "rounded-2xl transition-colors duration-700",
-                  highlightId === m.id && "bg-brand/10",
-                )}
-              >
-                <RoomMessage
-                  message={m}
-                  members={members}
-                  people={roomPeople}
-                  ownerName={blok.sharing ? ownerName : undefined}
-                  showSpeaker={showSpeaker}
-                  roomId={blok.id}
-                  onReply={setReplyTo}
-                  onForward={(message, author) => setForwarding({ message, author })}
-                />
-                {answers && (
-                  <button
-                    onClick={() => setLensAnd("forum")}
-                    className="ml-11 mt-0.5 rounded-md px-1.5 py-0.5 text-[11.5px] text-brand-ink transition-colors duration-150 hover:bg-accent"
+          {visibleRows.flatMap((row) =>
+            row.kind === "said"
+              ? rowsOf(row.items.map((item) => item.message))
+              : [
+                  <TurnFoldLine
+                    key={`fold:${row.fold.key}`}
+                    fold={row.fold}
+                    open={openFolds.has(row.fold.key)}
+                    onToggle={() => toggleFold(row.fold.key)}
+                    className="pl-11"
                   >
-                    {answers}
-                  </button>
-                )}
-              </div>
-            );
-          })}
+                    {openFolds.has(row.fold.key) && rowsOf(row.fold.messages)}
+                  </TurnFoldLine>,
+                ],
+          )}
           {working.map((m) => (
             <div key={m.id} className="flex animate-rise-in items-center gap-2.5 pl-11 text-[12px] text-muted-foreground">
               <Loader2 size={11} className="animate-spin" />
@@ -706,6 +832,20 @@ export function RoomView({ blok }: { blok: Blok }) {
         )}
       </div>
 
+      <WaitingStrip
+        messages={waiting}
+        threadId={blok.id}
+        senderOf={(m) =>
+          m.role === "bot"
+            ? (members.find((b) => b.id === m.from)?.name ?? "An agent")
+            : m.author
+              ? (roomPeople.find((p) => p.id === m.author)?.name ?? "A former member")
+              : m.via
+                ? (CHANNEL_NAMES[m.via] ?? "the linked chat")
+                : null
+        }
+        working={working.length > 0}
+      />
       <div className="relative px-4 pb-4 pt-1 md:px-6 md:pb-5">
         {replyTo && (
           <div className="mx-auto mb-2 max-w-[760px]">
@@ -714,7 +854,7 @@ export function RoomView({ blok }: { blok: Blok }) {
         )}
         {mentionMatches.length > 0 && (
           <div className="mx-auto mb-1.5 max-w-[760px]">
-            <div className="overflow-hidden rounded-xl border bg-popover p-1 shadow-lg shadow-[--shadow-color]">
+            <div className="overflow-hidden rounded-xl border bg-popover p-1 shadow-lg shadow-(color:--shadow-color)">
               {mentionMatches.map((m, i) => (
                 <button
                   key={m.id}
@@ -779,7 +919,7 @@ export function RoomView({ blok }: { blok: Blok }) {
             placeholder={
               replyTo ? `Reply to ${replyTo.author}…` : `Message ${blok.name}, or @name someone`
             }
-            className="w-full min-w-0 resize-none self-center bg-transparent py-1 text-[14.5px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground"
+            className="w-full min-w-0 resize-none self-center bg-transparent py-1 text-[14.5px] leading-relaxed text-foreground outline-none placeholder:truncate placeholder:text-muted-foreground placeholder-shown:overflow-hidden placeholder-shown:[mask-image:linear-gradient(to_right,#000_calc(100%-28px),transparent)]"
           />
           <button
             onClick={send}
@@ -845,7 +985,7 @@ function RoomFolderButton({ blok }: { blok: Blok }) {
         <FolderOpen size={16} className={shown ? "text-brand-ink" : undefined} />
       </Button>
       {open && (
-        <div className="absolute right-0 top-11 z-30 w-[320px] max-w-[92vw] animate-pop-in rounded-2xl border bg-popover p-3.5 shadow-xl shadow-[--shadow-color]">
+        <div className="absolute right-0 top-11 z-30 w-[320px] max-w-[92vw] animate-pop-in rounded-2xl border bg-popover p-3.5 shadow-xl shadow-(color:--shadow-color)">
           <div className="text-[13px] font-semibold text-foreground">Shared working folder</div>
           {pinned ? (
             <>

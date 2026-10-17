@@ -473,3 +473,27 @@
   right: 3px !important;
   width: 6px !important;
 }
+
+/* The caret on a reply that is still arriving. It rides the end of the
+   last line rather than sitting on a line of its own under the text,
+   which read as a blank line the reply had not written. */
+.streaming-text > :last-child::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 14px;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: var(--muted-foreground);
+  animation: caret-blink 1s ease-in-out infinite;
+}
+@keyframes caret-blink {
+  50% {
+    opacity: 0.2;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .streaming-text > :last-child::after {
+    animation: none;
+  }
+}

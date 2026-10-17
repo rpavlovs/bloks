@@ -15,10 +15,11 @@
 // far as the harness is: loopback always, the local network when pairing
 // is on. Local tooling and LAN services today; the internet arrives with
 // the relay.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
+import { readSaved, writeFileAtomic } from "./atomic-write.ts";
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
 
@@ -40,6 +41,11 @@ export interface WebhookRecord {
   blokId?: string;
   workflowId?: string;
   enabled: boolean;
+  /** The conversation an agent's events go to, by title or by id.
+   * Absent means the agent's first, General, as for a routine or a
+   * watcher that names none (GitHub 237). Hooks from before that were
+   * given "Webhooks", the lane they always used. */
+  thread?: string;
   createdAt: number;
   lastFiredAt?: number;
   firedCount?: number;
@@ -56,20 +62,15 @@ export class WebhookStore {
 
   constructor() {
     mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-    try {
-      const raw = JSON.parse(readFileSync(FILE, "utf8"));
-      // hand-editable file: keep only rows that still look like ours
-      this.hooks = Array.isArray(raw) ? raw.filter(valid) : [];
-    } catch {
-      this.hooks = [];
-    }
+    // hand-editable file: keep only rows that still look like ours
+    this.hooks = readSaved<WebhookRecord[]>(FILE, [], Array.isArray).filter(valid);
   }
 
   private save() {
-    writeFileSync(FILE, JSON.stringify(this.hooks, null, 2), { mode: 0o600 });
+    writeFileAtomic(FILE, JSON.stringify(this.hooks, null, 2), 0o600);
   }
 
-  create(name: string, target: { botId?: string; blokId?: string; workflowId?: string }): WebhookRecord | null {
+  create(name: string, target: { botId?: string; blokId?: string; workflowId?: string }, thread?: string): WebhookRecord | null {
     if (this.hooks.length >= MAX_HOOKS) return null;
     const hook: WebhookRecord = {
       id: newId(),
@@ -78,6 +79,8 @@ export class WebhookStore {
       ...(target.botId ? { botId: target.botId } : {}),
       ...(target.blokId ? { blokId: target.blokId } : {}),
       ...(target.workflowId ? { workflowId: target.workflowId } : {}),
+      // only an agent has conversations to choose from
+      ...(target.botId && thread ? { thread } : {}),
       enabled: true,
       createdAt: Date.now(),
     };
@@ -137,6 +140,26 @@ export class WebhookStore {
     return hook;
   }
 
+  /** Where an agent's events go from now on; undefined is its first
+   * conversation. A room or a workflow has no conversations to name. */
+  setThread(id: string, thread: string | undefined): WebhookRecord | null {
+    const hook = this.hooks.find((h) => h.id === id);
+    if (!hook) return null;
+    if (thread && hook.botId) hook.thread = thread;
+    else delete hook.thread;
+    this.save();
+    return hook;
+  }
+
+  /** Every agent's hook that names no conversation is given this one,
+   * once, on the upgrade that made the first conversation the default
+   * (GitHub 237), so what is filed keeps going where it went. */
+  nameUnnamed(thread: string): void {
+    const unnamed = this.hooks.filter((hook) => hook.botId && !hook.thread);
+    for (const hook of unnamed) hook.thread = thread;
+    if (unnamed.length) this.save();
+  }
+
   /** A new token: the old URL stops answering, the hook keeps its story. */
   rotate(id: string): WebhookRecord | null {
     const hook = this.hooks.find((h) => h.id === id);
@@ -162,6 +185,12 @@ export class WebhookStore {
   }
 }
 
+/** A conversation's title or id as a hook names it: one line, as short
+ * as any lane title, or nothing. */
+export function cleanThread(raw: unknown): string | undefined {
+  return typeof raw === "string" ? raw.replace(/\s+/g, " ").trim().slice(0, 40) || undefined : undefined;
+}
+
 function valid(row: any): row is WebhookRecord {
   return (
     row &&
@@ -169,7 +198,7 @@ function valid(row: any): row is WebhookRecord {
     typeof row.token === "string" &&
     row.token.length >= 24 &&
     typeof row.name === "string" &&
-    (typeof row.botId === "string" || typeof row.blokId === "string")
+    (typeof row.botId === "string" || typeof row.blokId === "string" || typeof row.workflowId === "string")
   );
 }
 

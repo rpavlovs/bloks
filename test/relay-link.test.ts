@@ -12,6 +12,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { after, before, describe, test } from "node:test";
 
 import { deviceKey, open, peek, seal } from "../server/relay-crypto.ts";
+import { SeenNonces } from "../server/relay-link.ts";
 import { startHarness, type Harness } from "./helpers/server.ts";
 
 /** A relay just real enough: it holds the agent stream, hands over asks,
@@ -19,7 +20,14 @@ import { startHarness, type Harness } from "./helpers/server.ts";
 function stubRelay() {
   let send: ((frame: unknown) => void) | null = null;
   const results = new Map<string, { status: number; payload: string }>();
+  /** How the next result posts go wrong, one per post: a status to answer
+   * with, or "drop" to cut the socket. Empty means they land. */
+  const resultFaults: Array<number | "drop"> = [];
+  const resultAttempts = new Map<string, number>();
   const pushed: Array<{ frames: string[]; wake: string | { reason: string; sealed?: Record<string, string> } | null }> = [];
+  /** How long each push is held before it is answered, and how many were
+   * open at once at most. */
+  const events = { delayMs: 0, open: 0, mostOpen: 0 };
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const path = (req.url ?? "").split("?")[0];
@@ -34,10 +42,27 @@ function stubRelay() {
     req.on("end", () => {
       const parsed = body ? JSON.parse(body) : {};
       if (path === "/space/agent/result") {
-        results.set(String(parsed.id), { status: Number(parsed.status), payload: String(parsed.payload) });
+        const id = String(parsed.id);
+        resultAttempts.set(id, (resultAttempts.get(id) ?? 0) + 1);
+        const fault = resultFaults.shift();
+        if (fault === "drop") return void req.socket.destroy();
+        if (fault) {
+          res.writeHead(fault, { "content-type": "application/json" });
+          return void res.end("{}");
+        }
+        results.set(id, { status: Number(parsed.status), payload: String(parsed.payload) });
       }
       if (path === "/space/agent/events") {
         pushed.push({ frames: parsed.frames ?? [], wake: parsed.wake ?? null });
+        if (events.delayMs) {
+          events.open++;
+          events.mostOpen = Math.max(events.mostOpen, events.open);
+          return void setTimeout(() => {
+            events.open--;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end("{}");
+          }, events.delayMs);
+        }
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end("{}");
@@ -48,7 +73,10 @@ function stubRelay() {
     server,
     ask: (id: string, payload: string) => send?.({ kind: "ask", id, payload }),
     results,
+    resultFaults,
+    resultAttempts,
     pushed,
+    events,
     get connected() {
       return send !== null;
     },
@@ -187,6 +215,200 @@ describe("the relay link", () => {
     assert.equal(fourth!.status, 404);
   });
 
+  test("the build a phone names inside its sealed request shows on the Mac's device list", async () => {
+    relay.ask("ask-client", seal(sealKey, deviceId, { method: "GET", path: "/api/bots", client: "iOS 2.1.6 (15)" }));
+    await waitUntil(() => relay.results.get("ask-client"));
+    const status = await h.json("/api/pair");
+    const device = status.devices.find((d: { id: string }) => d.id === deviceId);
+    assert.equal(device?.client, "iOS 2.1.6 (15)");
+  });
+
+  test("a phone that only ever comes through the relay still has a last seen time", async () => {
+    // a second phone, so nothing earlier in this file has spoken for it
+    const started = await h.json("/api/pair/start", { method: "POST" });
+    const claimed = await h.json("/api/pair/claim", {
+      method: "POST",
+      body: JSON.stringify({ code: started.code, device: "A relayed phone" }),
+    });
+    const id = claimed.device.id as string;
+    const digest = createHash("sha256").update(claimed.token as string).digest("hex");
+    const key = deviceKey(digest, "phone-to-mac");
+    const lastSeen = async () =>
+      (await h.json("/api/pair")).devices.find((d: { id: string }) => d.id === id)?.lastSeen as number | undefined;
+    assert.equal(await lastSeen(), undefined);
+
+    // what does not open, or does not pass the checks, is not the phone
+    const wrongKey = deviceKey("11".repeat(32), "phone-to-mac");
+    relay.ask("seen-forged", seal(wrongKey, id, { method: "GET", path: "/api/bots" }));
+    relay.ask("seen-stale", seal(key, id, { method: "POST", path: "/api/bloks", ts: Date.now() - 10 * 60_000, nonce: "n-seen" }));
+    relay.ask("seen-stranger", seal(wrongKey, "not-a-device", { method: "GET", path: "/api/bots" }));
+    for (const ask of ["seen-forged", "seen-stale", "seen-stranger"]) await waitUntil(() => relay.results.get(ask));
+    assert.equal(await lastSeen(), undefined, "a request that never opened counted as the phone being here");
+    const status = await h.json("/api/pair");
+    assert.ok(!status.devices.some((d: { id: string }) => d.id === "not-a-device"));
+
+    const before = Date.now();
+    relay.ask("seen-ok", seal(key, id, { method: "GET", path: "/api/bots" }));
+    await waitUntil(() => relay.results.get("seen-ok"));
+    const seen = await lastSeen();
+    assert.ok(seen && seen >= before, "a relayed request did not mark the phone seen");
+  });
+
+  test("an answer lost on the way is sent again until it lands", async () => {
+    // a relay that errors once and then loses the socket: the phone still
+    // gets its answer, on the third try
+    relay.resultFaults.push(503, "drop");
+    relay.ask("ask-retry", seal(sealKey, deviceId, { method: "GET", path: "/api/bots" }));
+    const landed = await waitUntil(() => relay.results.get("ask-retry"));
+    assert.ok(landed, "a retried answer never landed");
+    assert.equal(relay.resultAttempts.get("ask-retry"), 3);
+    const answer = open(openKey, peek(landed!.payload)!) as { status: number };
+    assert.equal(answer.status, 200);
+    const state = await h.json("/api/relay/status");
+    assert.equal(state.delivering, true, "an answer that landed in the end is not a failing line");
+  });
+
+  test("a line that hears but cannot answer says so, and says so when it recovers", async () => {
+    const status = async (want: boolean) => {
+      const until = Date.now() + 10_000;
+      for (;;) {
+        const s = await h.json("/api/relay/status");
+        if (s.delivering === want || Date.now() > until) return s;
+        await new Promise((r) => setTimeout(r, 40));
+      }
+    };
+
+    // a refusal is final, so the answer is lost at once rather than after
+    // the whole retry budget, and the status must stop claiming all is well
+    relay.resultFaults.push(401);
+    relay.ask("ask-lost", seal(sealKey, deviceId, { method: "GET", path: "/api/bots" }));
+    const failing = await status(false);
+    assert.equal(failing.connected, true, "the stream itself is still up");
+    assert.equal(failing.delivering, false, "a lost answer left the status green");
+    assert.match(failing.problem ?? "", /not getting through/);
+    assert.equal(relay.resultAttempts.get("ask-lost"), 1, "a refusal was retried");
+
+    // one landed answer is not enough to call it healthy again; a short
+    // run is
+    for (const id of ["ok-1", "ok-2", "ok-3"]) {
+      relay.ask(id, seal(sealKey, deviceId, { method: "GET", path: "/api/bots" }));
+      await waitUntil(() => relay.results.get(id));
+    }
+    const back = await status(true);
+    assert.equal(back.delivering, true, "the status never recovered");
+    assert.equal(back.problem, null);
+  });
+
+  test("through the relay, long conversations arrive as their newest part, and the rest pages in", async () => {
+    // several megabytes of conversation, the size that stopped a phone
+    // from loading the list at all
+    const { bot } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Talker" }) });
+    for (let i = 0; i < 40; i++) {
+      await h.fetch(`/api/bots/${bot.id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ text: `message ${i} ` + "x".repeat(90_000) }),
+      });
+    }
+    // each send starts a turn that fails here with a notice; let those land
+    let local = await h.json("/api/bots");
+    for (let settled = 0; settled < 3; ) {
+      await new Promise((r) => setTimeout(r, 150));
+      const again = await h.json("/api/bots");
+      const count = (x: any) => x.bots.reduce((n: number, b: any) => n + b.messages.length + (b.busy ? 1000 : 0), 0);
+      settled = count(again) === count(local) ? settled + 1 : 0;
+      local = again;
+    }
+    const whole = local.bots.find((b: any) => b.id === bot.id);
+    const ours = whole.messages.filter((m: any) => m.role === "user");
+    assert.equal(ours.length, 40, "on this machine the list stays whole");
+    assert.equal(whole.olderMessages ?? 0, 0);
+
+    const ask = async (id: string, path: string) => {
+      relay.ask(id, seal(sealKey, deviceId, { method: "GET", path }));
+      const got = await waitUntil(() => relay.results.get(id));
+      assert.ok(got, `no answer for ${path}`);
+      assert.ok(JSON.stringify(got).length < 2_000_000, "an answer bigger than the relay takes");
+      return open(openKey, peek(got!.payload)!) as { status: number; body: any };
+    };
+
+    const zero = await ask("zero-list", "/api/bots?messages=0");
+    assert.equal(zero.status, 200);
+    // nothing carried, and every message left behind for a page back
+    for (const b of zero.body.bots) {
+      assert.deepEqual(b.messages, []);
+      assert.equal(b.olderMessages, local.bots.find((l: any) => l.id === b.id).messages.length);
+    }
+    const metadata = ({ messages: _messages, olderMessages: _older, ...fields }: any) => fields;
+    assert.deepEqual(zero.body.bots.map(metadata), local.bots.map(metadata));
+
+    const list = await ask("big-list", "/api/bots");
+    assert.equal(list.status, 200);
+    const trimmed = list.body.bots.find((b: any) => b.id === bot.id);
+    assert.ok(trimmed.olderMessages > 0, "a trimmed transcript did not say what it left behind");
+    assert.equal(trimmed.messages.length + trimmed.olderMessages, whole.messages.length);
+    assert.deepEqual(
+      trimmed.messages.map((m: any) => m.id),
+      whole.messages.slice(-trimmed.messages.length).map((m: any) => m.id),
+      "the trimmed part is not the newest",
+    );
+    // every other agent still got its latest words
+    for (const b of list.body.bots) {
+      const full = local.bots.find((x: any) => x.id === b.id);
+      if (full.messages.length) assert.ok(b.messages.length > 0, `${b.name} arrived empty`);
+    }
+
+    // walk back to the very first message, a page at a time
+    let messages = trimmed.messages;
+    let older = trimmed.olderMessages;
+    for (let page = 0; older > 0 && page < 20; page++) {
+      const q = `before=${messages[0].id}&thread=${trimmed.threadId}`;
+      const earlier = await ask(`page-${page}`, `/api/bots/${bot.id}/messages?${q}`);
+      assert.equal(earlier.status, 200);
+      assert.ok(earlier.body.messages.length > 0, "a page came back empty with more to go");
+      messages = [...earlier.body.messages, ...messages];
+      older = earlier.body.olderMessages;
+    }
+    assert.equal(older, 0);
+    assert.deepEqual(
+      messages.map((m: any) => m.id),
+      whole.messages.map((m: any) => m.id),
+      "paging back did not rebuild the transcript",
+    );
+
+    // a conversation of another agent is not reachable through this one
+    const stray = await ask("stray", `/api/bots/${bot.id}/messages?thread=not-a-lane`);
+    assert.equal(stray.status, 404);
+  });
+
+  test("pushes go out one at a time, in the order they happened", async () => {
+    // Sent all at once, a slow relay could deliver a reply's late delta
+    // after the turn ended, and the phone showed the reply twice. The
+    // relay hands a push's frames on before it answers, so one open push
+    // at a time keeps the order all the way to the phone.
+    const { bot } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "n-start" }) });
+    relay.pushed.length = 0;
+    relay.events.delayMs = 60;
+    relay.events.mostOpen = 0;
+    try {
+      for (let i = 0; i < 12; i++) {
+        await h.fetch(`/api/bots/${bot.id}`, { method: "PATCH", body: JSON.stringify({ name: `n-${String(i).padStart(2, "0")}` }) });
+      }
+      const names = () =>
+        relay.pushed
+          .flatMap((p) => p.frames)
+          .map((f) => open(openKey, peek(f)!) as any)
+          .filter((f) => f?.kind === "bot" && f.bot?.id === bot.id && /^n-\d+$/.test(f.bot.name ?? ""))
+          .map((f) => f.bot.name as string);
+      const all = await waitUntil(() => (names().includes("n-11") ? names() : undefined));
+      assert.ok(all, "the last rename never reached the relay");
+      assert.deepEqual(all, [...all!].sort(), "frames reached the relay out of order");
+      assert.equal(relay.events.mostOpen, 1, "more than one push was open at once");
+      assert.ok(relay.pushed.some((p) => p.frames.length > 1), "what waited behind a slow push did not go as one batch");
+    } finally {
+      relay.events.delayMs = 0;
+    }
+  });
+
   test("broadcasts go out sealed, and only an approval asks for a buzz, with its words sealed too", async (t) => {
     const { createServer: mkFake } = await import("node:http");
 
@@ -298,5 +520,39 @@ describe("the relay link", () => {
         body: JSON.stringify({ requestId: (card as any).requestId, behavior: "answer", message: "Yes" }),
       });
     }
+  });
+});
+
+describe("replay protection over time", () => {
+  // The freshness check accepts a stamp within two minutes either way, so
+  // a nonce has to be remembered for as long as its stamp can pass. The
+  // old memory cleared itself every two minutes and forgot nonces that
+  // were still inside that window.
+  test("a nonce is remembered for as long as its timestamp is fresh", () => {
+    const seen = new SeenNonces();
+    const t0 = 1_000_000_000_000;
+    // the shape of the old hole: a request, another 100s later, and a
+    // third at 125s, which used to clear everything seen before it
+    seen.remember("first", t0, t0);
+    seen.remember("a", t0 + 100_000, t0 + 100_000);
+    seen.remember("b", t0 + 125_000, t0 + 125_000);
+    // "a" is stamped 100s in and stays fresh until 220s, so a replay at
+    // 130s must still be recognised
+    assert.equal(seen.has("a"), true, "a nonce still inside its window was forgotten");
+    // once its stamp is past the window it is refused on freshness anyway,
+    // and the memory lets it go
+    seen.remember("c", t0 + 230_000, t0 + 230_000);
+    assert.equal(seen.has("a"), false);
+    assert.equal(seen.has("first"), false);
+  });
+
+  test("a stamp ahead of this clock is kept until it, too, goes stale", () => {
+    const seen = new SeenNonces();
+    const t0 = 1_000_000_000_000;
+    seen.remember("ahead", t0 + 100_000, t0);
+    seen.remember("later", t0 + 200_000, t0 + 200_000);
+    assert.equal(seen.has("ahead"), true);
+    seen.remember("much-later", t0 + 230_000, t0 + 230_000);
+    assert.equal(seen.has("ahead"), false);
   });
 });

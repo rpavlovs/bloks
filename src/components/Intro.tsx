@@ -18,6 +18,7 @@ import { api } from "@/state/store";
 import { BlokAvatar } from "./Avatar";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
+import { composioKeyMistake } from "@/lib/keyShape";
 import type { BlokExpression } from "@/lib/mascot";
 
 export const INTRO_KEY = "bloks-intro-v1";
@@ -219,17 +220,24 @@ function PluginsStage({ onDone }: { onDone: (connected: string[]) => void }) {
   const saveKey = () => {
     const trimmed = key.trim();
     if (!trimmed || saving) return;
+    const mistake = composioKeyMistake("composio", trimmed);
+    if (mistake) return setError(mistake);
     setSaving(true);
     setError(null);
     api("/api/config", { method: "PUT", body: JSON.stringify({ composio: { key: trimmed } }) })
       // prove the key actually reaches Composio before showing the grid
       .then(() => api("/api/connectors?services=slack"))
       .then((r: any) => {
-        if (!r?.configured) throw new Error("that key did not reach Composio");
+        // the status check answers 200 with an error when Composio refuses
+        if (!r?.configured || r.error) throw new Error(r?.error ?? "");
         setStep("grid");
         void refreshStatus(EVERYDAY.map((t) => t.slug));
       })
-      .catch(() => setError("That key didn't work. Check it and try again, or skip for now."))
+      .catch((e: Error) =>
+        // Composio's own reason when it gave one (a refused key and an
+        // unreachable service need different next steps)
+        setError(e.message ? `${e.message} Or skip for now.` : "That key didn't work. Check it and try again, or skip for now."),
+      )
       .finally(() => setSaving(false));
   };
 
@@ -292,7 +300,11 @@ function PluginsStage({ onDone }: { onDone: (connected: string[]) => void }) {
           </button>
         </div>
         <p className="intro-rise mt-4 text-[11.5px] text-muted-foreground/70 [animation-delay:380ms]">
-          You can always do this later, in Plugins.
+          No key yet?{" "}
+          <a href="https://composio.dev" target="_blank" rel="noreferrer" className="underline hover:text-foreground">
+            Get a free one at composio.dev
+          </a>
+          , or skip and do this later in Plugins.
         </p>
       </Panel>
     );
@@ -350,12 +362,19 @@ function PluginsStage({ onDone }: { onDone: (connected: string[]) => void }) {
 function ToolIcon({ label, domain, icon }: { label: string; domain: string; icon?: string }) {
   const [stage, setStage] = useState(icon ? 0 : 1);
   if (stage === 0 && icon) {
-    return <img src={icon} alt="" className="size-7 rounded-lg" onError={() => setStage(1)} />;
+    return (
+      <img
+        src={`/api/connectors/icon?src=${encodeURIComponent(icon)}`}
+        alt=""
+        className="size-7 rounded-lg"
+        onError={() => setStage(1)}
+      />
+    );
   }
   if (stage === 1) {
     return (
       <img
-        src={`https://www.google.com/s2/favicons?domain=${domain}&sz=64`}
+        src={`/api/connectors/icon?domain=${encodeURIComponent(domain)}`}
         alt=""
         className="size-7 rounded-lg"
         onError={() => setStage(2)}

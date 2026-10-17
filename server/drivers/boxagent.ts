@@ -6,12 +6,13 @@
 // its own desktop, so "give this to my researcher and check back later" is
 // literally what happens.
 //
-// The substrate exposes this as four endpoints and no streaming:
+// The substrate (Boat, see server/boat.ts) exposes this as four endpoints
+// and no streaming:
 //
-//   POST /boxes/{id}/prompt              start work, get a prompt id
-//   GET  /boxes/{id}/prompts/{promptId}  has it finished
-//   GET  /boxes/{id}/events              what it has done so far
-//   POST /boxes/{id}/interrupt           stop
+//   POST /sandboxes/{id}/prompt              start work, get a prompt id
+//   GET  /sandboxes/{id}/prompts/{promptId}  has it finished
+//   GET  /sandboxes/{id}/events              what it has done so far
+//   POST /sandboxes/{id}/interrupt           stop
 //
 // So progress is polled rather than pushed, and the loop below is the
 // driver. Event payloads are matched loosely on purpose: the shapes have
@@ -29,9 +30,9 @@ import type {
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+import { BOAT_API } from "../boat.ts";
 
 const DRIVER_KIND = "boxAgent";
-const BOX_API = "https://ascii.dev/api/box/v1";
 
 const MODELS = {
   default: "claude-fable-5",
@@ -56,7 +57,8 @@ const SAYS_SOMETHING = /assistant|message|output/i;
 const DID_SOMETHING = /tool|command|exec|browse/i;
 
 /** Terminal states, in whatever tense the API reports them. */
-const SUCCEEDED = /completed|succeeded|done/i;
+// Boat says "finished"; the older names stay for a run reported the old way
+const SUCCEEDED = /finished|completed|succeeded|done/i;
 const FAILED = /failed|error|cancelled|interrupted/i;
 
 export interface BoxAgentConfig {
@@ -101,7 +103,7 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
     });
 
     const call = async (path: string, init: RequestInit = {}) => {
-      const response = await fetch(`${BOX_API}${path}`, {
+      const response = await fetch(`${BOAT_API}${path}`, {
         ...init,
         headers: {
           authorization: `Bearer ${token}`,
@@ -112,7 +114,7 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
       });
       const body: any = await response.json().catch(() => null);
       if (!response.ok || body?.ok === false) {
-        throw new Error(body?.code ?? body?.error ?? `box HTTP ${response.status}`);
+        throw new Error(body?.message ?? body?.code ?? (typeof body?.error === "string" ? body.error : null) ?? `Boat HTTP ${response.status}`);
       }
       return body;
     };
@@ -141,7 +143,7 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
         .filter((part) => part !== undefined)
         .join("\n");
 
-      const started: any = await call(`/boxes/${boxId}/prompt`, {
+      const started: any = await call(`/sandboxes/${boxId}/prompt`, {
         method: "POST",
         body: JSON.stringify({ provider: agentFor(model), model, prompt }),
       });
@@ -160,7 +162,7 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
         boxId,
         cancel: () => {
           cancelled = true;
-          void call(`/boxes/${boxId}/interrupt`, { method: "POST" }).catch(() => {});
+          void call(`/sandboxes/${boxId}/interrupt`, { method: "POST" }).catch(() => {});
         },
       });
 
@@ -184,7 +186,7 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
 
             // Events first, so whatever the agent did is on the record
             // before the status that says it finished.
-            const payload: any = await call(`/boxes/${boxId}/events`).catch(() => null);
+            const payload: any = await call(`/sandboxes/${boxId}/events`).catch(() => null);
             for (const event of payload?.events ?? payload?.items ?? []) {
               // Not every event carries an id, so a digest of the event
               // itself stands in. Replaying one twice is worse than
@@ -217,9 +219,9 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
             }
 
             if (promptId) {
-              const status: any = await call(`/boxes/${boxId}/prompts/${promptId}`).catch(() => null);
+              const status: any = await call(`/sandboxes/${boxId}/prompts/${promptId}`).catch(() => null);
               appendNative(threadId, { dir: "in", source: "box.prompt.status", msg: status });
-              const state = String(status?.prompt?.status ?? status?.status ?? "");
+              const state = String(status?.promptRun?.status ?? status?.prompt?.status ?? status?.status ?? "");
 
               if (SUCCEEDED.test(state)) {
                 const result = status?.prompt?.result ?? status?.result ?? lastSpoken;
@@ -240,6 +242,8 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
                   ...envelope(threadId, turnId),
                   type: "item.completed",
                   itemType: "assistant_text",
+                  // Keep the existing chat placeholder, but never announce it as provider text.
+                  ...(!final && !lastSpoken ? { syntheticText: true as const } : {}),
                   text: final || lastSpoken || "(finished)",
                 });
                 return settle(true, null);

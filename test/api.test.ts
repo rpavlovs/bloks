@@ -7,6 +7,7 @@
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +27,27 @@ async function waitFor<T>(check: () => Promise<T | null>, timeoutMs = 15_000): P
     await new Promise((r) => setTimeout(r, 150));
   }
   return null;
+}
+
+/** An agent whose engine is gone. A PATCH cannot name an engine the
+ * workspace lacks, so the agent picks a real custom endpoint and the
+ * endpoint is then removed, the way an agent loses its engine in use. */
+async function agentWithoutEngine(name: string): Promise<string> {
+  const { bot } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name }) });
+  const { endpoints } = await h.json("/api/custom-endpoints", {
+    method: "POST",
+    body: JSON.stringify({ name: `${name} host`, url: "http://127.0.0.1:9/v1", key: "sk-test-orphan" }),
+  });
+  const endpoint = endpoints.find((e: any) => e.name === `${name} host`);
+  const picked = await h.fetch(`/api/bots/${bot.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ modelSelection: { instanceId: endpoint.instanceId, model: "x" } }),
+  });
+  assert.equal(picked.status, 200);
+  assert.equal((await h.fetch(`/api/custom-endpoints/${endpoint.id}`, { method: "DELETE" })).status, 200);
+  const { instances } = await h.json("/api/instances");
+  assert.ok(!instances.some((i: any) => i.instanceId === endpoint.instanceId), "the endpoint's engine is still registered");
+  return bot.id;
 }
 
 before(async () => {
@@ -65,6 +87,20 @@ describe("the origin check", () => {
     assert.equal(res.status, 403);
     const { bots } = await h.json("/api/bots");
     assert.ok(!bots.some((b: any) => b.name === "planted"));
+  });
+
+  test("a sandboxed page, which says its origin is null, cannot change your approvals", async () => {
+    // an agent's HTML artifact opened in a browser, or any sandboxed frame:
+    // content an agent wrote, sending the simple POST that skips preflight
+    const res = await h.fetchAs("null", "/api/approvals", {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: JSON.stringify({ mode: "full", applyToAll: true }),
+    });
+    assert.equal(res.status, 403);
+    const after = await h.json("/api/approvals");
+    assert.notEqual(after.mode, "full", "the sandboxed page changed the approvals");
+    assert.equal(after.agents.full, 0);
   });
 
   test("the app's own origin works", async () => {
@@ -115,6 +151,26 @@ describe("input limits", () => {
     assert.equal(saved.name.length, MAX_NAME_CHARS);
 
     await h.fetch(`/api/bots/${bot.id}?forget=1`, { method: "DELETE" });
+  });
+
+  test("a new agent opens with a setup question only when one was sent", async () => {
+    const { bot: plain } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Plain" }) });
+    assert.deepEqual(
+      plain.messages.map((m: any) => m.kind),
+      ["text"],
+      "a hire without a setup question starts with its greeting alone",
+    );
+
+    const setup = { title: "Which inbox first?", subtitle: "", options: ["Work", "Personal"] };
+    const { bot: asked } = await h.json("/api/bots", {
+      method: "POST",
+      body: JSON.stringify({ name: "Asked", setup }),
+    });
+    assert.deepEqual(asked.messages.map((m: any) => m.kind), ["text", "options"]);
+    assert.equal(asked.messages[1].card.title, setup.title);
+
+    await h.fetch(`/api/bots/${plain.id}?forget=1`, { method: "DELETE" });
+    await h.fetch(`/api/bots/${asked.id}?forget=1`, { method: "DELETE" });
   });
 
   test("a room needs at least two real agents", async () => {
@@ -446,6 +502,36 @@ describe("skills", () => {
     });
     assert.ok(res.status >= 400, `expected a refusal, got ${res.status}`);
   });
+
+  test("the limit counts characters, not bytes (#165)", async () => {
+    // 16,000 Cyrillic characters is 32,000 bytes, which used to be refused
+    const fits = await h.fetch("/api/skills", {
+      method: "POST",
+      body: JSON.stringify({ name: "Russian", body: "я".repeat(16_000) }),
+    });
+    assert.equal(fits.status, 201);
+
+    const over = await h.fetch("/api/skills", {
+      method: "POST",
+      body: JSON.stringify({ name: "Russian too", body: "я".repeat(16_001) }),
+    });
+    assert.equal(over.status, 413);
+    assert.match((await over.json()).error, /16,001 characters/);
+  });
+
+  test("a skill file edited past the limit is cut at it, not skipped", async () => {
+    // 20,000 CJK characters is 60,000 bytes, more than the old guard of
+    // twice the limit in bytes, so the file used to vanish from the list
+    mkdirSync(join(h.home, ".bloks", "skills"), { recursive: true });
+    writeFileSync(
+      join(h.home, ".bloks", "skills", "long-hand.md"),
+      `---\nname: Long hand\ndescription: edited by hand\n---\n\n${"漢".repeat(20_000)}\n`,
+    );
+    const { skills } = await h.json("/api/skills");
+    const mine = skills.find((s: any) => s.id === "long-hand");
+    assert.ok(mine, "the file should still be listed");
+    assert.equal([...mine.body].length, 16_000);
+  });
 });
 
 describe("agents", () => {
@@ -477,7 +563,7 @@ describe("agents", () => {
 
     // and the notice has to be readable, not an errno
     assert.ok(/not installed/i.test(failed.text), failed.text);
-    assert.ok(/npm i -g/.test(failed.text), "it should say how to fix it");
+    assert.ok(/install\.sh|npm i -g/.test(failed.text), "it should say how to fix it");
     assert.ok(!/ENOENT|spawn /.test(failed.text), `errno leaked: ${failed.text}`);
   });
 
@@ -577,28 +663,18 @@ describe("webhooks", () => {
     const got = await h.fetch(`/hook/${webhook.token}`);
     assert.equal(got.status, 405);
 
-    // the real token answers immediately, before any turn resolves
-    const fired = await h.fetch(`/hook/${webhook.token}`, {
+    // an agent with no engine cannot take the turn, so the receiver answers
+    // with a 409 (a configuration refusal) rather than a 202 and a dropped event
+    const orphan = await agentWithoutEngine("Orphan");
+    const orphanHook = await h.json("/api/webhooks", {
+      method: "POST",
+      body: JSON.stringify({ name: "Orphaned", botId: orphan }),
+    });
+    const refused = await h.fetch(`/hook/${orphanHook.webhook.token}`, {
       method: "POST",
       body: JSON.stringify({ event: "build_failed", branch: "main" }),
     });
-    assert.equal(fired.status, 202);
-
-    // no engine exists in this harness, so the turn fails, and that
-    // failure must land in a transcript rather than vanish. Deliveries
-    // run in their own "Webhooks" lane so they never hijack the active
-    // conversation, the trace lives there.
-    const note = await waitFor(async () => {
-      const { bots: after } = await h.json("/api/bots");
-      const bot = after.find((b: any) => b.id === bots[0].id);
-      const lane = bot.tasks.find((t: any) => t.title === "Webhooks");
-      if (!lane) return null;
-      const { bot: opened } = await h.json(`/api/bots/${bot.id}/tasks/${lane.id}/activate`, {
-        method: "POST",
-      });
-      return opened.messages.find((m: any) => m.kind === "notice" || m.kind === "activity") ?? null;
-    });
-    assert.ok(note, "the fired webhook left no trace in any lane");
+    assert.equal(refused.status, 409);
   });
 
   test("a deleted webhook stops answering", async () => {
@@ -613,10 +689,20 @@ describe("webhooks", () => {
   });
 
   test("a hook keeps its story: rename, deliveries, and a fresh URL", async () => {
-    const { bots } = await h.json("/api/bots");
+    // a room target, so the delivery is recorded whatever state the agent's
+    // engine is in; an agent that cannot take a turn refuses the event instead
+    // its own agents, so a turn the room starts cannot hold a shared one busy
+    const members = [];
+    for (const name of ["Deploy A", "Deploy B"]) {
+      members.push((await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name }) })).bot.id);
+    }
+    const { blok } = await h.json("/api/bloks", {
+      method: "POST",
+      body: JSON.stringify({ name: "Deploy room", memberIds: members }),
+    });
     const { webhook } = await h.json("/api/webhooks", {
       method: "POST",
-      body: JSON.stringify({ name: "Deploys", botId: bots[0].id }),
+      body: JSON.stringify({ name: "Deploys", blokId: blok.id }),
     });
 
     const renamed = await h.json(`/api/webhooks/${webhook.id}`, {
@@ -745,6 +831,40 @@ describe("routine shapes", () => {
     await h.fetch(`/api/bloks/${blok.id}`, { method: "DELETE" });
   });
 
+  test("a routine can run in a conversation of its own, and defaults to General", async () => {
+    const { bot } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Two Jobs" }) });
+    const routine = async (name: string, thread?: string) =>
+      (
+        await h.json("/api/routines", {
+          method: "POST",
+          body: JSON.stringify({ targetId: bot.id, targetKind: "agent", name, prompt: name, time: "08:00", ...(thread ? { thread } : {}) }),
+        })
+      ).routine;
+    const news = await routine("News digest", "  Morning\n news  ");
+    const inbox = await routine("Inbox sweep");
+    assert.equal(news.thread, "Morning news", "one short line, like any lane title");
+    assert.equal(inbox.thread, undefined);
+
+    // no engine here, so each turn fails at once; the lane it opened stays
+    await h.fetch(`/api/routines/${news.id}/run`, { method: "POST" });
+    await h.fetch(`/api/routines/${inbox.id}/run`, { method: "POST" });
+    const titles = (await h.json("/api/bots")).bots.find((b: any) => b.id === bot.id).tasks.map((t: any) => t.title);
+    assert.ok(titles.includes("Morning news"), titles.join(", "));
+    // one that names none runs where the person talks to the agent
+    assert.deepEqual(titles, ["General", "Morning news"]);
+
+    // and it can be moved back to General
+    const { routine: moved } = await h.json(`/api/routines/${news.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ thread: null }),
+    });
+    assert.equal(moved.thread, undefined);
+
+    await h.fetch(`/api/routines/${news.id}`, { method: "DELETE" });
+    await h.fetch(`/api/routines/${inbox.id}`, { method: "DELETE" });
+    await h.fetch(`/api/bots/${bot.id}?forget=1`, { method: "DELETE" });
+  });
+
   test("a routine carries a name, a duration, and a place to run", async () => {
     const { bots } = await h.json("/api/bots");
     const made = await h.json("/api/routines", {
@@ -810,6 +930,33 @@ describe("routine shapes", () => {
     });
     assert.equal(moved.routine.date, laterDay);
     assert.equal(moved.routine.time, "16:30");
+    await h.fetch(`/api/routines/${made.routine.id}`, { method: "DELETE" });
+  });
+
+  test("an over-long prompt is refused on create and on edit, and nothing changes (GitHub 163)", async () => {
+    const { bots } = await h.json("/api/bots");
+    const routine = (prompt: string) => ({ targetId: bots[0].id, targetKind: "agent", prompt, time: "07:00", days: [2] });
+    const before = (await h.json("/api/routines")).routines.length;
+
+    const refused = await h.fetch("/api/routines", { method: "POST", body: JSON.stringify(routine(`Too long ${"x".repeat(4_000)}`)) });
+    assert.equal(refused.status, 400);
+    const { error } = await refused.json();
+    assert.equal(error, "routine prompt is too long: maximum 4000, received 4009");
+    assert.equal((await h.json("/api/routines")).routines.length, before, "a refused routine was filed anyway");
+
+    const made = await h.json("/api/routines", { method: "POST", body: JSON.stringify(routine("y".repeat(4_000))) });
+    assert.equal(made.routine.prompt.length, 4_000, "a prompt right at the limit is kept whole");
+
+    const edit = await h.fetch(`/api/routines/${made.routine.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ prompt: "z".repeat(4_001), time: "08:00" }),
+    });
+    assert.equal(edit.status, 400);
+    assert.match((await edit.json()).error, /maximum 4000, received 4001/);
+    const kept = (await h.json("/api/routines")).routines.find((r: any) => r.id === made.routine.id);
+    assert.equal(kept.prompt, "y".repeat(4_000));
+    assert.equal(kept.time, "07:00", "the rest of a refused edit landed anyway");
+
     await h.fetch(`/api/routines/${made.routine.id}`, { method: "DELETE" });
   });
 });
@@ -1195,7 +1342,254 @@ describe("defaults for new agents", () => {
     await h.fetch(`/api/bots/${plain.id}?forget=1`, { method: "DELETE" });
   });
 
-  test("an agent never passes on or takes more approvals than it has", async (t) => {
+  test("one approvals choice for the workspace: new agents start on it, and every agent can be moved to it", async () => {
+    const before = await h.json("/api/approvals");
+    assert.equal(before.mode, "ask");
+    const { bot: one } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Before" }) });
+
+    // the default alone leaves agents already here as they were
+    let res = await h.json("/api/approvals", { method: "PUT", body: JSON.stringify({ mode: "edits" }) });
+    assert.deepEqual(res, { mode: "edits", changed: 0 });
+    const kept = (await h.json("/api/bots")).bots.find((b: any) => b.id === one.id);
+    assert.equal(kept.approvals ?? "ask", "ask");
+    const { bot: two } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "After" }) });
+    assert.equal(two.approvals, "edits", "a new agent starts on the workspace's choice");
+
+    // and on request it moves everyone
+    res = await h.json("/api/approvals", { method: "PUT", body: JSON.stringify({ mode: "full", applyToAll: true }) });
+    assert.equal(res.mode, "full");
+    assert.ok(res.changed >= 2);
+    const all = (await h.json("/api/bots")).bots.filter((b: any) => !b.hidden && !b.archivedAt);
+    assert.ok(all.every((b: any) => b.approvals === "full"));
+    assert.equal((await h.json("/api/config")).agentDefaults.approvals, "full");
+    assert.equal((await h.fetch("/api/approvals", { method: "PUT", body: JSON.stringify({ mode: "yolo" }) })).status, 400);
+
+    // back to asking, for the tests after this one
+    await h.json("/api/approvals", { method: "PUT", body: JSON.stringify({ mode: "ask", applyToAll: true }) });
+    assert.equal((await h.json("/api/config")).agentDefaults.approvals, undefined);
+    await h.fetch(`/api/bots/${one.id}?forget=1`, { method: "DELETE" });
+    await h.fetch(`/api/bots/${two.id}?forget=1`, { method: "DELETE" });
+  });
+
+  test("a signed-out Claude Code is an error that says what to do, never the agent's reply", async (t) => {
+    const home = mkdtempSync(join(tmpdir(), "bloks-signedout-"));
+    const cli = join(home, "fake-claude.mjs");
+    writeFileSync(
+      cli,
+      `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args[0] === "--version") { console.log("9.9.9 (Claude Code)"); process.exit(0); }
+if (args[0] === "auth") { console.log(JSON.stringify({ loggedIn: true })); process.exit(0); }
+process.stdin.resume();
+((go) => { let line = ""; const take = (c) => { line += c; while (line.includes(String.fromCharCode(10))) { const at = line.indexOf(String.fromCharCode(10)); const next = line.slice(0, at); line = line.slice(at + 1); if (!next.trim() || JSON.parse(next).type !== "user") continue; if (typeof input !== "undefined") input = next; process.stdin.off("data", take); go(); return; } }; process.stdin.on("data", take); })(() => {
+  // what the real CLI prints with nobody signed in
+  console.log(JSON.stringify({ type: "assistant", error: "authentication_failed", message: { model: "<synthetic>", content: [{ type: "text", text: "Not logged in · Please run /login" }] } }));
+  console.log(JSON.stringify({ type: "result", subtype: "success", is_error: true, result: "Not logged in · Please run /login" }));
+});
+`,
+      { mode: 0o755 },
+    );
+    mkdirSync(join(home, ".bloks"), { recursive: true });
+    writeFileSync(join(home, ".bloks", "config.json"), JSON.stringify({ instances: { claude: { driver: "claudeAgent", config: { cli } } } }));
+    const h2 = await startHarness({ HOME: home });
+    t.after(async () => {
+      await h2.stop();
+      rmSync(home, { recursive: true, force: true });
+    });
+    const { bot } = await h2.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Unsigned" }) });
+    await h2.fetch(`/api/bots/${bot.id}`, { method: "PATCH", body: JSON.stringify({ modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } }) });
+    await h2.fetch(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "hello" }) });
+    const said = await waitFor(async () => {
+      const found = (await h2.json("/api/bots")).bots.find((b: any) => b.id === bot.id);
+      return !found.busy && found.messages.some((m: any) => m.kind === "notice") ? found.messages : null;
+    });
+    assert.ok(said, "no notice arrived");
+    assert.ok(!said.some((m: any) => m.role === "bot" && m.kind === "text" && /Not logged in/.test(m.text ?? "")), "the CLI's words were shown as the agent's");
+    const notices = said.filter((m: any) => m.kind === "notice");
+    assert.equal(notices.length, 1, "one notice, not one per layer");
+    assert.match(notices[0].text, /not signed in.*run claude/i);
+  });
+
+  test("a Codex turn the provider refuses says why in the chat", async (t) => {
+    const home = mkdtempSync(join(tmpdir(), "bloks-codex-fail-"));
+    const cli = join(home, "fake-codex.mjs");
+    // A stand-in for \`codex app-server\` that fails every turn the way the
+    // real one does when the provider keeps answering 429: an \`error\`
+    // notification, then a failed \`turn/completed\`. A message saying
+    // "quietly" gets only the failed turn, the way an engine that gives
+    // no error of its own ends one.
+    writeFileSync(
+      cli,
+      `#!${process.execPath}
+import { createInterface } from "node:readline";
+const args = process.argv.slice(2);
+if (args[0] === "--version") { console.log("codex-cli 9.9.9"); process.exit(0); }
+if (args[0] === "login") { console.log("Logged in using an API key"); process.exit(0); }
+const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+const failure = { message: "exceeded retry limit, last status: 429 Too Many Requests", codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 429 } } };
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const m = JSON.parse(line);
+  if (m.method === "model/list") return send({ id: m.id, result: { data: [{ id: "gpt-test", model: "gpt-test", displayName: "gpt-test", isDefault: true, hidden: false }] } });
+  if (m.method === "thread/start" || m.method === "thread/resume") return send({ id: m.id, result: { thread: { id: "codex-thread" }, model: "gpt-test" } });
+  if (m.method === "turn/start") {
+    send({ id: m.id, result: { turn: { id: "codex-turn", status: "inProgress" } } });
+    const quietly = JSON.stringify(m.params.input).includes("quietly");
+    if (!quietly) send({ method: "error", params: { error: failure, willRetry: false, threadId: "codex-thread", turnId: "codex-turn" } });
+    return send({ method: "turn/completed", params: { threadId: "codex-thread", turn: { id: "codex-turn", status: "failed", error: failure } } });
+  }
+  if (m.id !== undefined && m.method) send({ id: m.id, result: {} });
+});
+`,
+      { mode: 0o755 },
+    );
+    mkdirSync(join(home, ".bloks"), { recursive: true });
+    writeFileSync(join(home, ".bloks", "config.json"), JSON.stringify({ instances: { codex: { driver: "codex", config: { cli } } } }));
+    const h2 = await startHarness({ HOME: home });
+    t.after(async () => {
+      await h2.stop();
+      rmSync(home, { recursive: true, force: true });
+    });
+    const { bot } = await h2.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Refused" }) });
+    await h2.fetch(`/api/bots/${bot.id}`, { method: "PATCH", body: JSON.stringify({ modelSelection: { instanceId: "codex", model: "gpt-test" } }) });
+    const notices = async (count: number) =>
+      waitFor(async () => {
+        const found = (await h2.json("/api/bots")).bots.find((b: any) => b.id === bot.id);
+        const shown = found.messages.filter((m: any) => m.kind === "notice");
+        return !found.busy && shown.length >= count ? shown : null;
+      });
+
+    await h2.fetch(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "hello" }) });
+    const first = await notices(1);
+    assert.ok(first, "the failed turn ended in silence");
+    assert.equal(first.length, 1, "one notice, not one per layer");
+    assert.match(first[0].text, /429 Too Many Requests/);
+
+    await h2.fetch(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "try again, quietly" }) });
+    const second = await notices(2);
+    assert.ok(second, "a failed turn with only a stop reason ended in silence");
+    assert.equal(second.length, 2);
+    assert.match(second[1].text, /429 Too Many Requests/);
+  });
+
+  test("a permission asked after its turn ended still gets the answer the log records", async (t) => {
+    // A Claude Code process can work on after its result (a background
+    // task, a subagent) and ask again over the same connection. Auto mode
+    // recorded an allow, but the answer went to a broker that was gone,
+    // and fifteen minutes later the ask was denied by its timeout.
+    const home = mkdtempSync(join(tmpdir(), "bloks-late-ask-"));
+    const log = join(home, "answers.log");
+    const cli = join(home, "fake-claude.mjs");
+    writeFileSync(
+      cli,
+      `#!${process.execPath}
+import { appendFileSync, readFileSync } from "node:fs";
+import { connect } from "node:net";
+const argv = process.argv.slice(2);
+if (argv[0] === "--version") { console.log("9.9.9 (Claude Code)"); process.exit(0); }
+if (argv[0] === "auth") { console.log(JSON.stringify({ loggedIn: true })); process.exit(0); }
+const note = (line) => appendFileSync(${JSON.stringify(log)}, JSON.stringify(line) + "\\n");
+const cfg = JSON.parse(readFileSync(argv[argv.indexOf("--mcp-config") + 1], "utf8"));
+const socketPath = cfg.mcpServers.bloks.args.at(-1);
+process.stdin.resume();
+((go) => { let line = ""; const take = (c) => { line += c; while (line.includes(String.fromCharCode(10))) { const at = line.indexOf(String.fromCharCode(10)); const next = line.slice(0, at); line = line.slice(at + 1); if (!next.trim() || JSON.parse(next).type !== "user") continue; if (typeof input !== "undefined") input = next; process.stdin.off("data", take); go(); return; } }; process.stdin.on("data", take); })(() => {
+  const sock = connect(socketPath);
+  let buf = "";
+  const waiters = new Map();
+  sock.on("data", (d) => {
+    buf += d;
+    for (let i; (i = buf.indexOf("\\n")) !== -1; ) {
+      const f = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+      note({ answer: f.id, behavior: f.behavior });
+      waiters.get(f.id)?.(f);
+    }
+  });
+  const ask = (id) => new Promise((resolve) => {
+    waiters.set(id, resolve);
+    sock.write(JSON.stringify({ t: "ask", id, kind: "permission", tool: "Bash", input: { command: "echo " + id } }) + "\\n");
+  });
+  sock.on("connect", async () => {
+    await ask("during-turn");
+    console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done for now" }));
+    setTimeout(async () => { await ask("after-turn"); setTimeout(() => process.exit(0), 200); }, 400);
+    setTimeout(() => process.exit(0), 20000);
+  });
+});
+`,
+      { mode: 0o755 },
+    );
+    mkdirSync(join(home, ".bloks"), { recursive: true });
+    writeFileSync(join(home, ".bloks", "config.json"), JSON.stringify({ instances: { claude: { driver: "claudeAgent", config: { cli } } } }));
+    const h2 = await startHarness({ HOME: home });
+    t.after(async () => {
+      await h2.stop();
+      rmSync(home, { recursive: true, force: true });
+    });
+    const { bot } = await h2.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Background" }) });
+    await h2.fetch(`/api/bots/${bot.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ modelSelection: { instanceId: "claude", model: "claude-sonnet-5" }, approvals: "auto" }),
+    });
+    await h2.fetch(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "start" }) });
+    const answers = () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []);
+    const late = await waitFor(async () => answers().find((a: any) => a.answer === "after-turn") ?? null, 8_000);
+    assert.equal(answers().find((a: any) => a.answer === "during-turn")?.behavior, "allow");
+    assert.equal(late?.behavior, "allow", "the ask made after the turn ended was never answered");
+  });
+
+  test("full access takes Claude Code's own prompts off, and every other mode keeps them", async (t) => {
+    const home = mkdtempSync(join(tmpdir(), "bloks-full-"));
+    const seen = join(home, "argv.json");
+    const cli = join(home, "fake-claude.mjs");
+    writeFileSync(
+      cli,
+      `#!${process.execPath}
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--version") { console.log("9.9.9 (Claude Code)"); process.exit(0); }
+if (args[0] === "auth") { console.log(JSON.stringify({ loggedIn: true })); process.exit(0); }
+appendFileSync(${JSON.stringify(seen)}, JSON.stringify(args) + "\\n");
+process.stdin.resume();
+((go) => { let line = ""; const take = (c) => { line += c; while (line.includes(String.fromCharCode(10))) { const at = line.indexOf(String.fromCharCode(10)); const next = line.slice(0, at); line = line.slice(at + 1); if (!next.trim() || JSON.parse(next).type !== "user") continue; if (typeof input !== "undefined") input = next; process.stdin.off("data", take); go(); return; } }; process.stdin.on("data", take); })(() => console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false })));
+`,
+      { mode: 0o755 },
+    );
+    mkdirSync(join(home, ".bloks"), { recursive: true });
+    writeFileSync(join(home, ".bloks", "config.json"), JSON.stringify({ instances: { claude: { driver: "claudeAgent", config: { cli } } } }));
+    const h2 = await startHarness({ HOME: home });
+    t.after(async () => {
+      await h2.stop();
+      rmSync(home, { recursive: true, force: true });
+    });
+    const { bot } = await h2.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Runner" }) });
+    const turn = async (approvals: string) => {
+      await h2.fetch(`/api/bots/${bot.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ approvals, modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } }),
+      });
+      const before = existsSync(seen) ? readFileSync(seen, "utf8").trim().split("\n").length : 0;
+      await h2.fetch(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "go" }) });
+      for (let i = 0; i < 200; i++) {
+        const lines = existsSync(seen) ? readFileSync(seen, "utf8").trim().split("\n") : [];
+        const { bots } = await h2.json("/api/bots");
+        if (lines.length > before && !bots.find((b: any) => b.id === bot.id).busy) return JSON.parse(lines[lines.length - 1]);
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      throw new Error("the turn never ran");
+    };
+    const full = await turn("full");
+    assert.equal(full[full.indexOf("--permission-mode") + 1], "bypassPermissions");
+    assert.ok(!full.includes("--permission-prompt-tool"), "nothing to broker when nothing asks");
+    const asking = await turn("ask");
+    assert.equal(asking[asking.indexOf("--permission-mode") + 1], "acceptEdits");
+    assert.ok(asking.includes("--permission-prompt-tool"), "every other mode keeps the approval bridge");
+    assert.ok(!asking.includes("--settings"), "hooks run unless switched off");
+    // hooks switched off for this agent (#81)
+    await h2.fetch(`/api/bots/${bot.id}`, { method: "PATCH", body: JSON.stringify({ engineHooks: false }) });
+    const quiet = await turn("ask");
+    assert.deepEqual(JSON.parse(quiet[quiet.indexOf("--settings") + 1]), { disableAllHooks: true });
+  });
+
+  test("an agent never passes on or takes more approvals or seniority than it has", async (t) => {
     // A stand-in for Claude Code that uses the turn's real credential the
     // way the CLI does, so the checks under test are the server's own.
     const home = mkdtempSync(join(tmpdir(), "bloks-approvals-"));
@@ -1204,20 +1598,26 @@ describe("defaults for new agents", () => {
     writeFileSync(
       cli,
       `#!${process.execPath}
-import { writeFileSync } from "node:fs";
+import { renameSync, writeFileSync } from "node:fs";
 const [first] = process.argv.slice(2);
 if (first === "--version") { console.log("9.9.9 (Claude Code)"); process.exit(0); }
 if (first === "auth") { console.log(JSON.stringify({ loggedIn: true })); process.exit(0); }
 process.stdin.resume();
-process.stdin.on("end", async () => {
+((go) => { let line = ""; const take = (c) => { line += c; while (line.includes(String.fromCharCode(10))) { const at = line.indexOf(String.fromCharCode(10)); const next = line.slice(0, at); line = line.slice(at + 1); if (!next.trim() || JSON.parse(next).type !== "user") continue; if (typeof input !== "undefined") input = next; process.stdin.off("data", take); go(); return; } }; process.stdin.on("data", take); })(async () => {
   const url = process.env.BLOKS_URL;
   const headers = { authorization: "Bearer " + process.env.BLOKS_TOKEN, "content-type": "application/json" };
   const call = (method, path, body) => fetch(url + path, { method, headers, body: body && JSON.stringify(body) });
   const me = (await (await call("GET", "/api/agent/whoami")).json()).botId;
   const raise = (await call("PATCH", "/api/bots/" + me, { approvals: "auto" })).status;
-  const hired = (await (await call("POST", "/api/bots", { name: "Hired" })).json()).bot.id;
+  const raiseSeniority = await call("PATCH", "/api/bots/" + me, { seniority: 5 });
+  const refusedSeniority = { status: raiseSeniority.status, body: await raiseSeniority.json() };
+  const afterRaise = (await (await call("GET", "/api/bots")).json()).bots.find((bot) => bot.id === me).seniority;
+  await call("PATCH", "/api/bots/" + me, { seniority: "5" });
+  const afterStringRaise = (await (await call("GET", "/api/bots")).json()).bots.find((bot) => bot.id === me).seniority;
+  const hired = (await (await call("POST", "/api/bots", { name: "Hired", seniority: 5 })).json()).bot.id;
   const lower = (await call("PATCH", "/api/bots/" + me, { approvals: "ask" })).status;
-  writeFileSync(${JSON.stringify(out)}, JSON.stringify({ me, raise, hired, lower }));
+  const lowerSeniority = (await call("PATCH", "/api/bots/" + me, { seniority: 2 })).status;
+  writeFileSync(${JSON.stringify(out)} + ".tmp", JSON.stringify({ me, raise, refusedSeniority, afterRaise, afterStringRaise, hired, lower, lowerSeniority })); renameSync(${JSON.stringify(out)} + ".tmp", ${JSON.stringify(out)});
   console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" }));
 });
 `,
@@ -1236,7 +1636,7 @@ process.stdin.on("end", async () => {
 
     await h2.fetch("/api/config", { method: "PUT", body: JSON.stringify({ agentDefaults: { approvals: "auto" } }) });
     // the person may hand out anything, and a hire of theirs gets the default
-    const { bot: lead } = await h2.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Lead" }) });
+    const { bot: lead } = await h2.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Lead", seniority: 3 }) });
     assert.equal(lead.approvals, "auto");
     await h2.fetch(`/api/bots/${lead.id}`, {
       method: "PATCH",
@@ -1244,7 +1644,7 @@ process.stdin.on("end", async () => {
     });
 
     await h2.fetch(`/api/bots/${lead.id}/messages`, { method: "POST", body: JSON.stringify({ text: "go" }) });
-    let seen: { me: string; raise: number; hired: string; lower: number } | undefined;
+    let seen: { me: string; raise: number; refusedSeniority: { status: number; body: any }; afterRaise: number; afterStringRaise: unknown; hired: string; lower: number; lowerSeniority: number } | undefined;
     for (let i = 0; i < 200 && !seen; i++) {
       if (existsSync(out)) seen = JSON.parse(readFileSync(out, "utf8"));
       else await new Promise((r) => setTimeout(r, 50));
@@ -1258,6 +1658,29 @@ process.stdin.on("end", async () => {
     // capped at the hirer's level at the moment of hiring, not the default
     assert.equal(bots.find((b: any) => b.id === seen!.hired).approvals, "edits");
     assert.equal(bots.find((b: any) => b.id === lead.id).approvals, "ask");
+
+    await t.test("an agent's own seniority raise is refused without changing it", () => {
+      assert.equal(seen!.refusedSeniority.status, 403);
+      assert.equal(seen!.refusedSeniority.body.error, "an agent cannot raise its own seniority");
+      assert.equal(seen!.afterRaise, 3);
+    });
+    await t.test("a string cannot raise an agent's stored seniority", () => {
+      assert.equal(seen!.afterStringRaise, 3);
+    });
+    await t.test("an agent's own seniority lower is accepted", () => {
+      assert.equal(seen!.lowerSeniority, 200);
+      assert.equal(bots.find((b: any) => b.id === lead.id).seniority, 2);
+    });
+    await t.test("a hire cannot outrank the agent that hires it", () => {
+      assert.equal(bots.find((b: any) => b.id === seen!.hired).seniority, 3);
+    });
+    for (const [wanted, seniority] of [[0, 1], [9, 5], [2.6, 3]]) {
+      await t.test(`the person can set seniority ${wanted}, rounded and clamped to ${seniority}`, async () => {
+        const res = await h2.fetch(`/api/bots/${lead.id}`, { method: "PATCH", body: JSON.stringify({ seniority: wanted }) });
+        assert.equal(res.status, 200);
+        assert.equal((await res.json()).bot.seniority, seniority);
+      });
+    }
   });
 });
 
@@ -2116,12 +2539,25 @@ describe("task lanes", () => {
     assert.ok(switched.messages.length > 0, "General still has the greeting");
   });
 
-  test("the lane cap is three, and the refusal is readable", async () => {
-    await h.json(`/api/bots/${botId}/tasks`, { method: "POST", body: "{}" });
+  test("the lane cap is twenty, and the refusal is readable", async () => {
+    // three used to run out as soon as each conversation was about one
+    // thing, with routines and background work taking lanes of their own
+    const opened: string[] = [];
+    const { bots } = await h.json("/api/bots");
+    const before = bots.find((b: any) => b.id === botId).tasks.length;
+    for (let open = before; open < 20; open++) {
+      const { bot } = await h.json(`/api/bots/${botId}/tasks`, { method: "POST", body: "{}" });
+      opened.push(bot.activeTaskId);
+      assert.equal(bot.tasks.length, open + 1);
+    }
     const res = await h.fetch(`/api/bots/${botId}/tasks`, { method: "POST", body: "{}" });
     assert.equal(res.status, 409);
     const body = await res.json();
-    assert.ok(/at most 3/.test(body.error), body.error);
+    assert.ok(/at most 20/.test(body.error), body.error);
+    // back to the three lanes the tests below expect
+    for (const id of opened.slice(Math.max(0, 3 - before))) {
+      assert.equal((await h.fetch(`/api/bots/${botId}/tasks/${id}`, { method: "DELETE" })).status, 200);
+    }
   });
 
   test("a lane can be renamed, to one short line", async () => {
@@ -2150,21 +2586,114 @@ describe("task lanes", () => {
     assert.equal(missing.status, 404);
   });
 
-  test("closing a lane removes it; the last lane refuses to close", async () => {
+  test("General is never closed", async () => {
     const { bots } = await h.json("/api/bots");
-    let bot = bots.find((b: any) => b.id === botId);
+    const bot = bots.find((b: any) => b.id === botId);
+    const general = bot.tasks[0];
+
+    const res = await h.fetch(`/api/bots/${botId}/tasks/${general.id}`, { method: "DELETE" });
+    assert.equal(res.status, 409);
+    assert.equal(typeof (await res.json()).error, "string");
+
+    const { bots: after } = await h.json("/api/bots");
+    assert.equal(after.find((b: any) => b.id === botId).tasks[0].id, general.id);
+  });
+
+  test("clearing empties a conversation in place", async () => {
+    const { bots } = await h.json("/api/bots");
+    const bot = bots.find((b: any) => b.id === botId);
+    const general = bot.tasks[0];
+    const others = bot.tasks.slice(1).map((t: any) => t.id);
+    const { bot: before } = await h.json(`/api/bots/${botId}/tasks/${general.id}/activate`, { method: "POST" });
+    assert.ok(before.messages.length > 0, "General has the greeting to clear");
+    const res = await h.fetch(`/api/bots/${botId}/tasks/${general.id}/clear`, { method: "POST" });
+    assert.equal(res.status, 200);
+    const { bot: after, seq } = await res.json();
+    assert.equal(typeof seq, "number", "the answer says which frame it matches");
+    assert.equal(after.tasks[0].id, general.id, "the same lane, so everything routed to it still arrives");
+    assert.equal(after.tasks[0].title, general.title);
+    assert.deepEqual(after.tasks.slice(1).map((t: any) => t.id), others, "the other lanes are left alone");
+    assert.deepEqual(after.messages, [], "its messages are gone");
+    const missing = await h.fetch(`/api/bots/${botId}/tasks/no-such-lane/clear`, { method: "POST" });
+    assert.equal(missing.status, 404);
+  });
+
+  test("closing a lane removes it, and an agent falls back to General", async () => {
+    const { bots } = await h.json("/api/bots");
+    const bot = bots.find((b: any) => b.id === botId);
+    const general = bot.tasks[0];
+    await h.json(`/api/bots/${botId}/tasks/${bot.tasks[1].id}/activate`, { method: "POST" });
+
     for (const lane of bot.tasks.slice(1)) {
-      const res = await h.fetch(`/api/bots/${botId}/tasks/${lane.id}?forget=1`, { method: "DELETE" });
+      const res = await h.fetch(`/api/bots/${botId}/tasks/${lane.id}`, { method: "DELETE" });
       assert.equal(res.status, 200);
     }
-    ({ bots: bot } = { bots: null } as any);
+
     const { bots: after } = await h.json("/api/bots");
     const remaining = after.find((b: any) => b.id === botId);
-    assert.equal(remaining.tasks.length, 1);
-    const last = await h.fetch(`/api/bots/${botId}/tasks/${remaining.tasks[0].id}?forget=1`, {
-      method: "DELETE",
-    });
-    assert.equal(last.status, 409);
+    assert.deepEqual(remaining.tasks.map((t: any) => t.id), [general.id]);
+    assert.equal(remaining.activeTaskId, general.id);
+    assert.equal(remaining.threadId, general.id);
+  });
+
+  test("a new conversation opens beside General", async () => {
+    const { bot } = await h.json(`/api/bots/${botId}/tasks`, { method: "POST", body: JSON.stringify({ title: "Real work" }) });
+    assert.deepEqual(bot.tasks.map((t: any) => t.title), ["General", "Real work"]);
+
+    const { bot: two } = await h.json(`/api/bots/${botId}/tasks`, { method: "POST", body: JSON.stringify({ title: "Second" }) });
+    assert.equal(two.tasks.length, 3);
+  });
+
+  test("a conversation action's answer says which frame it matches, so a later one wins", async () => {
+    // A slow answer used to put an older record back over a rename made
+    // elsewhere meanwhile. Each answer now carries the sequence of the
+    // bot frame sent with it, and a rename after it sends a higher one.
+    const created = await h.json(`/api/bots/${botId}/tasks`, { method: "POST", body: JSON.stringify({ title: "Seq" }) });
+    assert.equal(typeof created.seq, "number");
+    const activated = await h.json(`/api/bots/${botId}/tasks/${created.bot.activeTaskId}/activate`, { method: "POST" });
+    assert.ok(activated.seq > created.seq);
+    const closed = await h.json(`/api/bots/${botId}/tasks/${created.bot.activeTaskId}`, { method: "DELETE" });
+    assert.ok(closed.seq > activated.seq);
+  });
+
+  test("one conversation can be marked unread from its own menu", async () => {
+    const { bots } = await h.json("/api/bots");
+    const bot = bots.find((b: any) => b.id === botId);
+    const other = bot.tasks.find((t: any) => t.id !== bot.activeTaskId);
+    const res = await h.fetch(`/api/bots/${botId}/tasks/${other.id}`, { method: "PATCH", body: JSON.stringify({ unread: true }) });
+    assert.equal(res.status, 200);
+    const { bot: after } = await res.json();
+    assert.equal(after.tasks.find((t: any) => t.id === other.id).unread, true);
+    assert.equal(after.unread, true, "the agent's dot follows its conversations");
+    assert.ok(!after.tasks.find((t: any) => t.id === bot.activeTaskId).unread, "only that conversation");
+  });
+
+  test("unread is per lane: opening one reads it, and the agent stays unread while another waits", async () => {
+    const { bot } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Two Topics" }) });
+    const first = bot.activeTaskId;
+    const { bot: withSecond } = await h.json(`/api/bots/${bot.id}/tasks`, { method: "POST", body: JSON.stringify({ title: "Second" }) });
+    const second = withSecond.activeTaskId;
+    const lanes = async () => (await h.json("/api/bots")).bots.find((b: any) => b.id === bot.id);
+
+    // something lands in the second while you are looking at it, then you leave
+    await h.json(`/api/bots/${bot.id}`, { method: "PATCH", body: JSON.stringify({ unread: true }) });
+    await h.json(`/api/bots/${bot.id}/tasks/${first}/activate`, { method: "POST" });
+    let now = await lanes();
+    assert.equal(now.unread, true, "the agent is unread while any lane is");
+    assert.equal(now.tasks.find((t: any) => t.id === second).unread, true);
+    assert.equal(now.tasks.find((t: any) => t.id === first).unread, false);
+    assert.equal(typeof now.tasks[0].lastAt, "number");
+
+    // reading the open lane does not read the other one
+    await h.json(`/api/bots/${bot.id}`, { method: "PATCH", body: JSON.stringify({ unread: false }) });
+    assert.equal((await lanes()).unread, true);
+
+    // opening it does
+    await h.json(`/api/bots/${bot.id}/tasks/${second}/activate`, { method: "POST" });
+    now = await lanes();
+    assert.equal(now.unread, false);
+    assert.equal(now.tasks.every((t: any) => !t.unread), true);
+    await h.fetch(`/api/bots/${bot.id}?forget=1`, { method: "DELETE" });
   });
 
   test("a turn in one lane leaves the other lanes free", async () => {
@@ -2190,6 +2719,18 @@ describe("task lanes", () => {
       body: JSON.stringify({ text: "go too" }),
     });
     assert.equal(second.status, 202, "a parallel lane is not gated by the first");
+    // Stopped before the next test. Whatever engine this agent is left on
+    // from earlier tests may well answer, and a turn that outlives this
+    // test can still be running, or waiting on a card, when a later one
+    // looks at the workspace: a settings change no longer ends it.
+    for (const lane of lanes) {
+      const settled = await waitFor(async () => {
+        await h.fetch(`/api/bots/${botId}/interrupt`, { method: "POST", body: JSON.stringify({ taskId: lane.id }) });
+        const { bots } = await h.json("/api/bots");
+        return !bots.find((b: any) => b.id === botId)?.tasks.find((t: any) => t.id === lane.id)?.busy;
+      });
+      assert.ok(settled, "a lane stayed busy after it was stopped");
+    }
   });
 });
 
@@ -2456,6 +2997,38 @@ describe("taking an agent somewhere else", () => {
       assert.equal(res.status, 400);
       assert.match((await res.json()).error, /agent file|not an agent/);
     }
+  });
+
+  test("an imported agent runs on the engines it ran on, its backup included", async () => {
+    const { bot } = await furnished();
+    const { instances } = await h.json("/api/instances");
+    const [first, second] = instances.map((i: any) => i.instanceId);
+    assert.ok(first && second, "the harness needs two engines for this test");
+    const model = { instanceId: first, model: "main-model" };
+    const backup = { instanceId: second, model: "backup-model" };
+    await h.fetch(`/api/bots/${bot.id}`, { method: "PATCH", body: JSON.stringify({ modelSelection: model, backupSelection: backup }) });
+    const file = await (await h.fetch(`/api/bots/${bot.id}/export`)).json();
+    assert.deepEqual(file.agent.backup, backup);
+
+    const { bot: arrived, preview } = await h.json("/api/agents/import", { method: "POST", body: JSON.stringify({ file }) });
+    assert.deepEqual(arrived.modelSelection, model, "the main engine was not applied");
+    assert.deepEqual(arrived.backupSelection, backup, "the backup engine was dropped");
+    // routines, webhooks and watchers belong to the workspace, not the file
+    assert.ok(preview.notes.some((n: string) => /routines, webhooks and watchers/i.test(n)));
+    await h.fetch(`/api/bots/${arrived.id}?forget=1`, { method: "DELETE" });
+  });
+
+  test("an engine this workspace does not have leaves the default in place", async () => {
+    const { bot } = await furnished();
+    const file = await (await h.fetch(`/api/bots/${bot.id}/export`)).json();
+    const elsewhere = {
+      ...file,
+      agent: { ...file.agent, model: { instanceId: "not-here", model: "m" }, backup: { instanceId: "nor-here", model: "m" } },
+    };
+    const { bot: arrived } = await h.json("/api/agents/import", { method: "POST", body: JSON.stringify({ file: elsewhere }) });
+    assert.notEqual(arrived.modelSelection.instanceId, "not-here");
+    assert.ok(!arrived.backupSelection || arrived.backupSelection.instanceId !== "nor-here");
+    await h.fetch(`/api/bots/${arrived.id}?forget=1`, { method: "DELETE" });
   });
 
   test("a website cannot make you import an agent", async () => {
@@ -3555,6 +4128,28 @@ describe("suggested skills", () => {
     assert.equal((await h.json("/api/config")).skills.propose, false);
   });
 
+  test("the app icon route fetches favicons and known logos, and nothing else", async () => {
+    for (const query of [
+      "src=https%3A%2F%2Fevil.example%2Fx.png",
+      "src=http%3A%2F%2F127.0.0.1%3A22%2F",
+      "src=https%3A%2F%2Fcomposio.dev.evil.example%2Fx.png",
+      "domain=..%2Fetc%2Fpasswd",
+      "domain=localhost",
+      "",
+    ]) {
+      const res = await h.fetch(`/api/connectors/icon?${query}`);
+      assert.equal(res.status, 400, `${query || "no query"} was fetched`);
+    }
+  });
+
+  test("finishing setup succeeds, the first time and every time after", async () => {
+    for (let i = 0; i < 2; i++) {
+      const res = await h.fetch("/api/config", { method: "PUT", body: JSON.stringify({ setupDone: true }) });
+      assert.equal(res.status, 200, `attempt ${i + 1} answered ${res.status}`);
+    }
+    assert.equal((await h.json("/api/config")).setupDone, true);
+  });
+
   test("the switch round-trips", async () => {
     await h.json("/api/config", { method: "PUT", body: JSON.stringify({ skills: { propose: true } }) });
     assert.equal((await h.json("/api/config")).skills.propose, true);
@@ -3730,7 +4325,11 @@ describe("absorbing one message after a turn", () => {
 describe("what is running", () => {
   test("an idle workspace answers with empty lists rather than nothing", async () => {
     const activity = await h.json("/api/activity");
-    assert.deepEqual(activity.waiting, []);
+    // The workspace is shared with the tests above, and one of them can
+    // leave an ask open on another agent, so "idle" is read as "a list",
+    // not as "empty".
+    assert.ok(Array.isArray(activity.waiting));
+    assert.ok(activity.waiting.every((w: any) => typeof w.botId === "string" && typeof w.kind === "string"));
     assert.ok(Array.isArray(activity.running));
     assert.ok(Array.isArray(activity.agents));
     assert.equal(typeof activity.today.turns, "number");
@@ -4194,15 +4793,98 @@ describe("the job board", () => {
     await h.fetch(`/api/jobs/${job.id}`, { method: "DELETE" });
   });
 
-  test("a job with nothing to do is refused, and one taken off the board is gone", async () => {
+  /** An engine that holds every answer until the test gives one. */
+  async function heldEngine(t: any) {
+    const { createServer } = await import("node:http");
+    let answer: string | null = null;
+    const waiting: Array<() => void> = [];
+    const fake = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        if (req.url?.endsWith("/models")) return res.end(JSON.stringify({ data: [{ id: "grok-4" }] }));
+        const reply = () =>
+          res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: answer }, finish_reason: "stop" }] }));
+        if (answer === null) waiting.push(reply);
+        else reply();
+      });
+    });
+    await new Promise<void>((r) => fake.listen(0, "127.0.0.1", () => r()));
+    t.after(() => fake.close());
+    await h.fetch("/api/providers/grok/connect", {
+      method: "POST",
+      body: JSON.stringify({ key: "xai-test-000000000000", url: `http://127.0.0.1:${(fake.address() as any).port}` }),
+    });
+    return (content: string) => {
+      answer = content;
+      for (const reply of waiting.splice(0)) reply();
+    };
+  }
+
+  const onBoard = async (id: string) => (await h.json("/api/jobs")).jobs.find((j: any) => j.id === id);
+
+  test("a job with nothing to do is refused, and one taken off the board is gone", async (t) => {
+    // Posting offers a job at once to whoever ranks first, before the
+    // POST answers, so what DELETE does depends on whether somebody took
+    // it. Both cases are set up here rather than left to whichever agents
+    // earlier tests leave behind, which made this flaky.
+    const answer = await heldEngine(t);
+    const clerk = await agent("Quill", "Filing clerk", ["Filing"]);
+
     const empty = await h.fetch("/api/jobs", { method: "POST", body: JSON.stringify({ title: "  " }) });
     assert.equal(empty.status, 400);
 
+    // somebody is on it: cancelled rather than erased, since their turn is still out there
+    const { job: taken } = await h.json("/api/jobs", { method: "POST", body: JSON.stringify({ title: "Filing" }) });
+    assert.equal(taken.claimedBy, clerk.id);
+    await h.fetch(`/api/jobs/${taken.id}`, { method: "DELETE" });
+    assert.equal((await onBoard(taken.id))?.state, "cancelled");
+
+    // nobody is on it, because the one who fits is busy: it is gone
     const { job } = await h.json("/api/jobs", { method: "POST", body: JSON.stringify({ title: "Filing" }) });
+    assert.equal(job.state, "open");
     await h.fetch(`/api/jobs/${job.id}`, { method: "DELETE" });
-    const { jobs } = await h.json("/api/jobs");
-    assert.equal(jobs.some((j: any) => j.id === job.id), false);
+    assert.equal(await onBoard(job.id), undefined);
     assert.equal((await h.fetch(`/api/jobs/${job.id}`, { method: "DELETE" })).status, 404);
+
+    // the clerk hands the cancelled one back: it stays off the board
+    // rather than going to the next agent
+    answer("PASS not mine");
+    const handedBack = await waitFor(async () => {
+      const j = await onBoard(taken.id);
+      return j?.offers[0]?.passed ? j : null;
+    });
+    assert.ok(handedBack, "the hand-back never landed");
+    assert.equal(handedBack.state, "cancelled");
+    assert.equal(handedBack.offers.length, 1, "nobody else was asked");
+
+    // and the clerk leaving does not put it back either
+    await h.fetch(`/api/bots/${clerk.id}?forget=1`, { method: "DELETE" });
+    assert.equal((await onBoard(taken.id))?.state, "cancelled");
+    await h.fetch(`/api/jobs/${taken.id}`, { method: "DELETE" });
+  });
+
+  test("an agent that goes away leaves the jobs it finished as they were", async (t) => {
+    await engine(t, () => "Catalogued all of it.");
+    const keeper = await agent("Wren", "Herbarium keeper", ["Herbarium cataloguing"]);
+    const { job } = await h.json("/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ title: "Herbarium cataloguing" }),
+    });
+    assert.equal(job.claimedBy, keeper.id);
+    const done = await waitFor(async () => {
+      const j = await onBoard(job.id);
+      return j?.state === "done" ? j : null;
+    });
+    assert.ok(done, "the job was never done");
+
+    // archiving and deleting both let go of what an agent holds; neither
+    // should reopen what it already finished
+    await h.fetch(`/api/bots/${keeper.id}`, { method: "DELETE" });
+    assert.equal((await onBoard(job.id))?.state, "done", "archiving reopened a finished job");
+    await h.fetch(`/api/bots/${keeper.id}?forget=1`, { method: "DELETE" });
+    assert.equal((await onBoard(job.id))?.state, "done", "deleting reopened a finished job");
+    await h.fetch(`/api/jobs/${job.id}`, { method: "DELETE" });
   });
 
   test("posting to the board is in the record", async () => {
@@ -4231,9 +4913,9 @@ describe("the command line an agent drives", () => {
     const res = await h.fetch("/api/agent/whoami");
     assert.equal(res.status, 401);
     const madeUp = await h.fetch("/api/bots", { headers: { authorization: "Bearer blk_not-a-real-token" } });
-    // an unknown bearer is simply not an agent; the request is judged as
-    // whatever else it is, which from this origin is the user
-    assert.equal(madeUp.status, 200);
+    // an unknown bearer is not the user either: somebody meant to be
+    // somebody in particular, and this server does not know who
+    assert.equal(madeUp.status, 401);
   });
 
   test("the CLI answers JSON, and says so without a credential", async () => {
@@ -4273,14 +4955,44 @@ describe("the command line an agent drives", () => {
     // without a credential the guard is not involved at all
     assert.equal((await h.fetch("/api/config")).status, 200);
 
-    // and with a made-up one, nothing changes: an unknown bearer is not
-    // an agent, so this is still the person at the keyboard
+    // and a made-up one is refused, not read as the person at the keyboard
     const pretend = await h.fetch("/api/config", {
       headers: { authorization: "Bearer blk_pretend" },
     });
-    assert.equal(pretend.status, 200);
+    assert.equal(pretend.status, 401);
 
     await h.fetch(`/api/bots/${bot.id}?forget=1`, { method: "DELETE" });
+  });
+
+  test("the CLI lists only the agents and rooms that are not archived", async (t) => {
+    const { execFile } = await import("node:child_process");
+    // set up as the person, then list as an agent would: the command
+    // needs a credential, and only a turn's own is one
+    const { h2, token } = await heldTurn(t);
+    const list = (command: string) =>
+      new Promise<any[]>((resolve) => {
+        execFile(
+          process.execPath,
+          [cli, command],
+          { env: { ...process.env, BLOKS_URL: h2.url, BLOKS_TOKEN: token } },
+          (_error, stdout) => resolve(JSON.parse(stdout || "[]")),
+        );
+      });
+    const { bot: live } = await h2.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Live" }) });
+    const { bot: retired } = await h2.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Retired" }) });
+    const room = (name: string) =>
+      h2.json("/api/bloks", { method: "POST", body: JSON.stringify({ name, memberIds: [live.id, retired.id] }) });
+    const { blok: open } = await room("Open room");
+    const { blok: shelved } = await room("Shelved room");
+    await h2.json(`/api/bots/${retired.id}`, { method: "DELETE" });
+    await h2.json(`/api/bloks/${shelved.id}`, { method: "PATCH", body: JSON.stringify({ archived: true }) });
+
+    const ids = (await list("agents")).map((a) => a.id);
+    assert.ok(ids.includes(live.id), "a working agent is missing");
+    assert.ok(!ids.includes(retired.id), "an archived agent is listed as if it could answer");
+    const roomIds = (await list("rooms")).map((r) => r.id);
+    assert.ok(roomIds.includes(open.id), "an open room is missing");
+    assert.ok(!roomIds.includes(shelved.id), "an archived room is listed as if it were open");
   });
 
   test("an agent renames the conversation it is in, and only its own", async (t) => {
@@ -4293,18 +5005,18 @@ describe("the command line an agent drives", () => {
       fake,
       `#!${process.execPath}
 import { execFileSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { renameSync, writeFileSync } from "node:fs";
 const [first] = process.argv.slice(2);
 if (first === "--version") { console.log("9.9.9 (Claude Code)"); process.exit(0); }
 if (first === "auth") { console.log(JSON.stringify({ loggedIn: true })); process.exit(0); }
 process.stdin.resume();
-process.stdin.on("end", async () => {
+((go) => { let line = ""; const take = (c) => { line += c; while (line.includes(String.fromCharCode(10))) { const at = line.indexOf(String.fromCharCode(10)); const next = line.slice(0, at); line = line.slice(at + 1); if (!next.trim() || JSON.parse(next).type !== "user") continue; if (typeof input !== "undefined") input = next; process.stdin.off("data", take); go(); return; } }; process.stdin.on("data", take); })(async () => {
   const renamed = JSON.parse(execFileSync(process.execPath, [${JSON.stringify(cli)}, "rename", "Q3", "numbers"], { encoding: "utf8" }));
   const headers = { authorization: "Bearer " + process.env.BLOKS_TOKEN, "content-type": "application/json" };
   const call = (method, path, body) => fetch(process.env.BLOKS_URL + path, { method, headers, body: body && JSON.stringify(body) });
   const other = (await (await call("GET", "/api/bots")).json()).bots.find((b) => b.name === "Other");
   const theirs = (await call("PATCH", "/api/bots/" + other.id + "/tasks/" + other.tasks[0].id, { title: "Mine now" })).status;
-  writeFileSync(${JSON.stringify(out)}, JSON.stringify({ renamed, theirs }));
+  writeFileSync(${JSON.stringify(out)} + ".tmp", JSON.stringify({ renamed, theirs })); renameSync(${JSON.stringify(out)} + ".tmp", ${JSON.stringify(out)});
   console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" }));
 });
 `,
@@ -4504,15 +5216,13 @@ describe("a conversation that fills up", () => {
       return bot && !bot.busy ? bot : null;
     });
 
-  test("the lane says how full it is, so a ring has something to draw", async (t) => {
+  test("a provider that reports no usage has no measured ring", async (t) => {
     await watchfulEngine(t, () => ({ text: "noted" }));
     const bot = await onGrok("Ringer");
     await h.fetch(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "hello" }) });
     const settled = await settle(bot.id);
     const lane = settled.tasks.find((t: any) => t.id === settled.activeTaskId);
-    assert.ok(lane.context, "a lane with no pressure to report cannot draw a ring");
-    assert.equal(lane.context.limit, 131_072, "grok's window");
-    assert.ok(lane.context.fraction >= 0 && lane.context.fraction <= 1);
+    assert.deepEqual(lane.context, { used: 0, limit: 0, fraction: 0, measured: false, window: "table", summarised: false });
     assert.equal(lane.context.summarised, false);
     await h.fetch(`/api/bots/${bot.id}?forget=1`, { method: "DELETE" });
   });
@@ -4884,7 +5594,10 @@ describe("taking back an answer that is not a paragraph", () => {
     // A question you took back is not a question. The card used to
     // survive the deletion, so the buttons stayed live on every open
     // client and the thing you took back could still be answered.
-    const { bot } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Asker" }) });
+    const { bot } = await h.json("/api/bots", {
+      method: "POST",
+      body: JSON.stringify({ name: "Asker", setup: { title: "Which first?", subtitle: "", options: ["This", "That"] } }),
+    });
     const thread = bot.threadId;
 
     const asked = await waitFor(async () => {
@@ -5112,5 +5825,442 @@ describe("a held agent whose lane is also busy", () => {
 
     await h.json(`/api/bots/${bot.id}/wheel`, { method: "DELETE" });
     await h.fetch(`/api/bots/${bot.id}?forget=1`, { method: "DELETE" });
+  });
+});
+
+// ── a credential this server does not know ─────────────────────────────
+
+/** One request written byte for byte, for headers fetch() will not send
+ * as given: an empty one, two of the same, a stray carriage return. An
+ * event stream is answered as soon as its head arrives. */
+function raw(
+  url: string,
+  method: string,
+  path: string,
+  headers: string[],
+  body?: string,
+): Promise<{ status: number; headers: string; body: string }> {
+  const { hostname, port, host } = new URL(url);
+  const lines = [
+    `${method} ${path} HTTP/1.1`,
+    `Host: ${host}`,
+    "Origin: http://localhost:5199",
+    "Connection: close",
+    ...(body === undefined ? [] : ["Content-Type: application/json", `Content-Length: ${Buffer.byteLength(body)}`]),
+    ...headers,
+  ];
+  return new Promise((resolve, reject) => {
+    let data = "";
+    const done = () => {
+      const split = data.indexOf("\r\n\r\n");
+      const head = split === -1 ? data : data.slice(0, split);
+      let rest = split === -1 ? "" : data.slice(split + 4);
+      if (/^transfer-encoding: chunked/im.test(head)) {
+        let joined = "";
+        for (let size = parseInt(rest, 16); size > 0; size = parseInt(rest, 16)) {
+          const start = rest.indexOf("\r\n") + 2;
+          joined += rest.slice(start, start + size);
+          rest = rest.slice(start + size + 2);
+        }
+        rest = joined;
+      }
+      resolve({ status: Number(/^HTTP\/1\.1 (\d{3})/.exec(head)?.[1] ?? 0), headers: head, body: rest });
+    };
+    const socket = connect(Number(port), hostname, () => socket.write(`${lines.join("\r\n")}\r\n\r\n${body ?? ""}`));
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      data += chunk;
+      if (/^content-type: text\/event-stream/im.test(data) && data.includes("\r\n\r\n")) {
+        socket.destroy();
+        done();
+      }
+    });
+    socket.on("end", done);
+    socket.on("error", reject);
+  });
+}
+
+/** A real turn held open by a stand-in engine, so a test can use the
+ * credential that turn was given for as long as it needs, then end it. */
+async function heldTurn(t: { after: (fn: () => unknown) => void }) {
+  const home = mkdtempSync(join(tmpdir(), "bloks-held-"));
+  const tokenFile = join(home, "token");
+  const release = join(home, "release");
+  const fake = join(home, "fake-claude.mjs");
+  writeFileSync(
+    fake,
+    `#!${process.execPath}
+import { existsSync, renameSync, writeFileSync } from "node:fs";
+const [first] = process.argv.slice(2);
+if (first === "--version") { console.log("9.9.9 (Claude Code)"); process.exit(0); }
+if (first === "auth") { console.log(JSON.stringify({ loggedIn: true })); process.exit(0); }
+process.stdin.resume();
+((go) => { let line = ""; const take = (c) => { line += c; while (line.includes(String.fromCharCode(10))) { const at = line.indexOf(String.fromCharCode(10)); const next = line.slice(0, at); line = line.slice(at + 1); if (!next.trim() || JSON.parse(next).type !== "user") continue; if (typeof input !== "undefined") input = next; process.stdin.off("data", take); go(); return; } }; process.stdin.on("data", take); })(async () => {
+  writeFileSync(${JSON.stringify(tokenFile)}, process.env.BLOKS_TOKEN ?? "");
+  for (let i = 0; i < 1200 && !existsSync(${JSON.stringify(release)}); i++) await new Promise((r) => setTimeout(r, 50));
+  console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" }));
+});
+`,
+    { mode: 0o755 },
+  );
+  mkdirSync(join(home, ".bloks"), { recursive: true });
+  writeFileSync(
+    join(home, ".bloks", "config.json"),
+    JSON.stringify({ instances: { claude: { driver: "claudeAgent", config: { cli: fake } } } }),
+  );
+  const h2 = await startHarness({ HOME: home });
+  t.after(async () => {
+    writeFileSync(release, "");
+    await h2.stop();
+    rmSync(home, { recursive: true, force: true });
+  });
+  const { bot } = await h2.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Holder" }) });
+  await h2.fetch(`/api/bots/${bot.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } }),
+  });
+  await h2.fetch(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "go" }) });
+  let token = "";
+  for (let i = 0; i < 200 && !token; i++) {
+    if (existsSync(tokenFile)) token = readFileSync(tokenFile, "utf8");
+    else await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.match(token, /^blk_/, "the stand-in engine never got a credential");
+  const whoami = () => raw(h2.url, "GET", "/api/agent/whoami", [`Authorization: Bearer ${token}`]);
+  return {
+    h2,
+    bot,
+    token,
+    /** Let the turn finish, and wait until its credential is spent. */
+    async end() {
+      writeFileSync(release, "");
+      for (let i = 0; i < 200 && (await whoami()).status !== 401; i++) await new Promise((r) => setTimeout(r, 50));
+    },
+  };
+}
+
+describe("a credential this server does not know", () => {
+  const REFUSAL = { error: "this request's credential is not recognized. It may have expired or been revoked." };
+
+  test("sent but unknown is refused, whatever its shape, and is never the person", async () => {
+    const madeUp = "blk_made-up-but-token-shaped-0123456789";
+    const shapes = [
+      "Authorization: ",
+      "Authorization: Bearer",
+      "Authorization: Bearer    ",
+      "Authorization: Basic dXNlcjpwYXNz",
+      "Authorization: blk_no-scheme-at-all",
+      `Authorization: Bearer ${madeUp}`,
+    ];
+    const agents = async () => (await h.json("/api/bots")).bots.length;
+    const before = await agents();
+    for (const shape of shapes) {
+      for (const path of ["/api/telegram", "/api/config", "/api/bots"]) {
+        assert.equal((await raw(h.url, "GET", path, [shape])).status, 401, `${JSON.stringify(shape)} on ${path}`);
+      }
+      const made = await raw(h.url, "POST", "/api/bots", [shape], JSON.stringify({ name: "Should not exist" }));
+      assert.equal(made.status, 401, `${JSON.stringify(shape)} made an agent`);
+      assert.match(made.headers, /^www-authenticate: Bearer error="invalid_token"$/im);
+      assert.deepEqual(JSON.parse(made.body), REFUSAL);
+    }
+    assert.equal(await agents(), before, "a refused request left something behind");
+
+    // with no credential at all, the person at the keyboard is still that
+    assert.equal((await raw(h.url, "GET", "/api/telegram", [])).status, 200);
+
+    // and a refusal repeats nothing it was sent, in the answer or the log
+    for (const part of [madeUp, "dXNlcjpwYXNz", "blk_no-scheme-at-all"]) {
+      assert.ok(!h.logs().includes(part), `the log holds ${part}`);
+    }
+  });
+
+  test("a query string or a cookie is not a credential, and the streams follow the same rule", async () => {
+    // ignored exactly as before: nothing reads a credential from either
+    const q = await raw(h.url, "GET", "/api/telegram?token=blk_made-up&access_token=blk_made-up&key=blk_made-up", [
+      "Cookie: token=blk_made-up; session=blk_made-up",
+    ]);
+    assert.equal(q.status, 200);
+
+    const { bots } = await h.json("/api/bots");
+    const terminal = `/api/bots/${bots[0].id}/terminal/stream`;
+    for (const path of ["/api/events", terminal]) {
+      assert.equal((await raw(h.url, "GET", path, ["Authorization: Bearer blk_made-up"])).status, 401, path);
+    }
+    // and without one, as today
+    assert.equal((await raw(h.url, "GET", "/api/events", [])).status, 200);
+    assert.equal((await raw(h.url, "GET", terminal, [])).status, 409);
+  });
+
+  test("a webhook is its own credential, even when its sender adds another", async () => {
+    const { bots } = await h.json("/api/bots");
+    const { webhook } = await h.json("/api/webhooks", {
+      method: "POST",
+      body: JSON.stringify({ name: "Chatty sender", botId: bots[0].id }),
+    });
+    const fired = await raw(h.url, "POST", `/hook/${webhook.token}`, ["Authorization: Bearer whatever-the-sender-sends"], "{}");
+    assert.equal(fired.status, 202);
+    await h.fetch(`/api/webhooks/${webhook.id}`, { method: "DELETE" });
+  });
+
+  test("a paired device's token works on this machine as before, until the device is removed", async () => {
+    await h.fetch("/api/pair", { method: "PUT", body: JSON.stringify({ enabled: true }) });
+    const started = await h.json("/api/pair/start", { method: "POST" });
+    const claimed = await h.json("/api/pair/claim", {
+      method: "POST",
+      body: JSON.stringify({ credential: started.token, device: "test phone" }),
+    });
+    const withDevice = () => raw(h.url, "GET", "/api/bots", [`Authorization: Bearer ${claimed.token}`]);
+    assert.equal((await withDevice()).status, 200);
+    await h.fetch(`/api/pair/devices/${claimed.device.id}`, { method: "DELETE" });
+    assert.equal((await withDevice()).status, 401);
+    await h.fetch("/api/pair", { method: "PUT", body: JSON.stringify({ enabled: false }) });
+  });
+
+  test("a turn's own credential: what works today still works, and nothing near it is the person", async (t) => {
+    const { h2, bot, token, end } = await heldTurn(t);
+    const as = (auth: string[], path = "/api/agent/whoami", method = "GET", body?: string) =>
+      raw(h2.url, method, path, auth, body);
+
+    // exactly as bin/bloks.mjs sends it, and still narrowed to an agent
+    assert.equal((await as([`Authorization: Bearer ${token}`])).status, 200);
+    assert.equal((await as([`Authorization: Bearer ${token}`], "/api/telegram")).status, 403);
+
+    // near misses bearerToken already forgives: still the agent
+    for (const near of [`Bearer  ${token}`, `bearer ${token}`, `Bearer ${token} `]) {
+      assert.equal((await as([`Authorization: ${near}`])).status, 200, JSON.stringify(near));
+      assert.equal((await as([`Authorization: ${near}`], "/api/telegram")).status, 403, JSON.stringify(near));
+    }
+    // a stray carriage return never reaches the guard: the parser refuses it
+    assert.equal((await as([`Authorization: Bearer ${token}\r`], "/api/telegram")).status, 400);
+
+    // two of them: the first one counts, and the second is dropped
+    const junk = "Authorization: Bearer blk_junk";
+    const valid = `Authorization: Bearer ${token}`;
+    assert.equal((await as([valid, junk])).status, 200);
+    assert.equal((await as([valid, junk], "/api/telegram")).status, 403);
+    assert.equal((await as([junk, valid])).status, 401);
+    assert.equal((await as([junk, valid], "/api/telegram")).status, 401);
+
+    // a refused request costs the turn nothing: its whole budget is left
+    const note = JSON.stringify({ text: "a note" });
+    for (let i = 0; i < 5; i++) {
+      assert.equal((await as([junk, valid], `/api/bots/${bot.id}/memory`, "PUT", note)).status, 401);
+    }
+    for (let i = 0; i < 12; i++) {
+      assert.equal((await as([valid], `/api/bots/${bot.id}/memory`, "PUT", note)).status, 200, `write ${i + 1}`);
+    }
+    assert.equal((await as([valid], `/api/bots/${bot.id}/memory`, "PUT", note)).status, 429);
+
+    // after the turn, the same credential is refused rather than promoted
+    await end();
+    const count = async () => (await h2.json("/api/bots")).bots.length;
+    const before = await count();
+    assert.equal((await as([valid], "/api/telegram")).status, 401);
+    assert.equal((await as([valid], "/api/bots", "POST", JSON.stringify({ name: "Late" }))).status, 401);
+    assert.equal(await count(), before);
+
+    // and the command line says so in words
+    const { execFile } = await import("node:child_process");
+    const cli = fileURLToPath(new URL("../bin/bloks.mjs", import.meta.url));
+    for (const credential of [token, "blk_made-up"]) {
+      const said = await new Promise<{ code: number; out: any }>((resolve) =>
+        execFile(
+          process.execPath,
+          [cli, "whoami"],
+          { env: { ...process.env, BLOKS_URL: h2.url, BLOKS_TOKEN: credential } },
+          (error, stdout) => resolve({ code: error ? ((error as any).code ?? 1) : 0, out: JSON.parse(stdout || "{}") }),
+        ),
+      );
+      assert.equal(said.code, 1);
+      assert.equal(said.out.error, REFUSAL.error);
+    }
+    assert.ok(!h2.logs().includes(token.slice(4)), "the log holds the credential");
+  });
+});
+
+describe("webhook dispatch", () => {
+  /** A fake engine that answers only when released, so a webhook turn stays
+   * busy for as long as a test needs its lane to be busy. */
+  async function heldEngine(t: { after(fn: () => void): void }) {
+    const { createServer } = await import("node:http");
+    const waiting: Array<() => void> = [];
+    let open = false;
+    let requests = 0;
+    const fake = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        if (req.url?.endsWith("/models")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ data: [{ id: "grok-4" }] }));
+        }
+        requests++;
+        const answer = () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              choices: [{ message: { role: "assistant", content: "Noted." } }],
+              usage: { prompt_tokens: 5, completion_tokens: 2 },
+            }),
+          );
+        };
+        if (open) answer();
+        else waiting.push(answer);
+      });
+    });
+    await new Promise<void>((r) => fake.listen(0, "127.0.0.1", () => r()));
+    t.after(() => fake.close());
+
+    await h.fetch("/api/providers/grok/connect", {
+      method: "POST",
+      body: JSON.stringify({
+        key: "xai-test-000000000000",
+        url: `http://127.0.0.1:${(fake.address() as any).port}`,
+      }),
+    });
+    const made = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Watcher" }) });
+    const botId: string = made.bot.id;
+    await h.fetch(`/api/bots/${botId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ modelSelection: { instanceId: "grok", model: "grok-4" } }),
+    });
+    const { webhook } = await h.json("/api/webhooks", {
+      method: "POST",
+      // a lane of its own, as every hook had before General became the default
+      body: JSON.stringify({ name: "Ticker", botId, thread: "Webhooks" }),
+    });
+
+    return {
+      botId,
+      fire: (payload: unknown) => h.fetch(`/hook/${webhook.token}`, { method: "POST", body: JSON.stringify(payload) }),
+      /** Turns that have reached the engine and are waiting for release. */
+      parked: () => waiting.length,
+      requests: () => requests,
+      release() {
+        open = true;
+        for (const answer of waiting.splice(0)) answer();
+      },
+    };
+  }
+
+  async function bot(botId: string) {
+    const { bots } = await h.json("/api/bots");
+    return bots.find((b: any) => b.id === botId);
+  }
+
+  async function webhookLane(botId: string) {
+    return (await bot(botId)).tasks.find((t: any) => t.title === "Webhooks");
+  }
+
+  /** Waits for a condition and fails the test if it never holds, rather
+   * than carrying on as though it had. */
+  async function settles(check: () => Promise<boolean>, what: string) {
+    assert.ok(await waitFor(async () => ((await check()) ? true : null)), what);
+  }
+
+  /** The transcript of one lane, read the way the app reads it. */
+  async function laneText(botId: string, laneId: string) {
+    const { bot: opened } = await h.json(`/api/bots/${botId}/tasks/${laneId}/activate`, { method: "POST" });
+    return opened.messages.map((m: any) => m.text ?? "").join("\n");
+  }
+
+  test("an event for a busy lane waits and is delivered once the turn ends", async (t) => {
+    const eng = await heldEngine(t);
+    assert.equal((await eng.fire({ symbol: "FIRST" })).status, 202);
+    await settles(async () => eng.parked() === 1, "no turn reached the engine");
+
+    // Acknowledging this with 202 and then dropping it was the bug: the
+    // sender counted it delivered and the agent never saw it. Now a 202
+    // means it is saved and goes in the next turn.
+    const busy = await eng.fire({ symbol: "SECOND-BUSY" });
+    assert.equal(busy.status, 202);
+    assert.equal((await busy.json()).queued, true);
+    assert.equal(eng.requests(), 1, "a waiting event must not run beside the busy turn");
+
+    eng.release();
+    await settles(async () => eng.requests() === 2, "the waiting event never reached the engine");
+    await settles(async () => (await webhookLane(eng.botId))?.state === "idle", "the lane never went idle");
+    const lane = await webhookLane(eng.botId);
+    assert.equal((await laneText(eng.botId, lane.id)).match(/SECOND-BUSY/g)?.length, 1, "delivered once");
+  });
+
+  test("a burst on an idle lane starts one turn and the rest wait for the next", async (t) => {
+    const eng = await heldEngine(t);
+    // The first claim has to hold until startTurn has marked the lane busy,
+    // which takes several awaits, so the others must see the claim and
+    // wait behind it rather than start a second turn in the same lane.
+    const results = await Promise.all(Array.from({ length: 6 }, (_, i) => eng.fire({ symbol: `BURST-${i}` })));
+    assert.deepEqual(results.map((r) => r.status), [202, 202, 202, 202, 202, 202]);
+
+    await settles(async () => eng.parked() === 1, "no turn reached the engine");
+    eng.release();
+    // the five that waited go in one follow-up turn
+    await settles(async () => eng.requests() === 2, "the waiting events never ran");
+    await settles(async () => (await webhookLane(eng.botId))?.state === "idle", "the lane never went idle");
+    assert.equal(eng.requests(), 2);
+    const lane = await webhookLane(eng.botId);
+    const text = await laneText(eng.botId, lane.id);
+    for (let i = 0; i < 6; i++) assert.equal(text.match(new RegExp(`BURST-${i}\\b`, "g"))?.length, 1, `BURST-${i}`);
+  });
+
+  test("an agent on hold refuses the event before any lane or turn is made", async (t) => {
+    const eng = await heldEngine(t);
+    const held = await h.fetch(`/api/bots/${eng.botId}/wheel`, {
+      method: "POST",
+      body: JSON.stringify({ why: "taking over" }),
+    });
+    assert.equal(held.status, 200);
+
+    const refused = await eng.fire({ symbol: "HELD" });
+    assert.equal(refused.status, 503);
+    assert.equal(refused.headers.get("retry-after"), "60");
+    assert.equal(await webhookLane(eng.botId), undefined, "a refused event must not create a lane");
+    assert.equal(eng.requests(), 0);
+    const main = await bot(eng.botId);
+    assert.ok(!main.messages.some((m: any) => /could not start/.test(m.text ?? "")), "refused at the door, not a chat notice");
+
+    // handing the wheel back is what lets the retry land
+    assert.equal((await h.fetch(`/api/bots/${eng.botId}/wheel`, { method: "DELETE" })).status, 200);
+    assert.equal((await eng.fire({ symbol: "HELD" })).status, 202);
+    await settles(async () => eng.parked() === 1, "no turn reached the engine");
+    eng.release();
+    await settles(async () => (await webhookLane(eng.botId))?.state === "idle", "the lane never went idle");
+    assert.equal(eng.requests(), 1);
+  });
+
+  test("an agent with no engine refuses the event with a 409 and creates no lane", async () => {
+    const orphan = await agentWithoutEngine("Stranded");
+    const { webhook } = await h.json("/api/webhooks", {
+      method: "POST",
+      body: JSON.stringify({ name: "Stranded", botId: orphan, thread: "Webhooks" }),
+    });
+
+    const res = await h.fetch(`/hook/${webhook.token}`, { method: "POST", body: JSON.stringify({ x: 1 }) });
+    assert.equal(res.status, 409);
+    assert.equal(res.headers.get("retry-after"), null);
+    assert.equal(await webhookLane(orphan), undefined, "a refused event must not create a lane");
+    const after = await bot(orphan);
+    assert.ok(!after.messages.some((m: any) => /could not start/.test(m.text ?? "")));
+  });
+
+  test("a throw before the event is handed on frees the lane for the next event", async (t) => {
+    const eng = await heldEngine(t);
+    // The lane is claimed, then noteFired saves webhooks.json. A directory in
+    // its place makes that save throw, in the disposable home only, before
+    // the event reaches the turn.
+    const file = join(h.home, ".bloks", "webhooks.json");
+    rmSync(file);
+    mkdirSync(file);
+    const failed = await eng.fire({ x: 1 });
+    assert.equal(failed.status, 500, "the sender must see a failure, not a hung connection");
+    assert.equal(eng.requests(), 0);
+
+    rmSync(file, { recursive: true });
+    const next = await eng.fire({ x: 2 });
+    assert.equal(next.status, 202, "a leaked claim would refuse this event with a busy 503");
+    await settles(async () => eng.parked() === 1, "the next event never reached the engine");
+    eng.release();
+    await settles(async () => (await webhookLane(eng.botId))?.state === "idle", "the lane never went idle");
+    assert.equal(eng.requests(), 1);
   });
 });

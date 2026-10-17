@@ -11,6 +11,11 @@
 // Occurrences are projected client-side from each routine's time and
 // weekday set. The calendar shows intentions, and the details popover is
 // where a specific routine is paused, run now, or removed.
+//
+// A check-in is not an appointment, and one every quarter of an hour
+// drawn as cards would bury the week. So it is a thin band over its hours
+// with a tick for each check-in, a chip in the month, and a row in the
+// Check-ins strip under the grid that says it in words.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CalendarClock from "lucide-react/dist/esm/icons/calendar-clock.mjs";
 import ChevronLeft from "lucide-react/dist/esm/icons/chevron-left.mjs";
@@ -19,24 +24,28 @@ import Copy from "lucide-react/dist/esm/icons/copy.mjs";
 import Check from "lucide-react/dist/esm/icons/check.mjs";
 import Play from "lucide-react/dist/esm/icons/play.mjs";
 import Plus from "lucide-react/dist/esm/icons/plus.mjs";
+import Repeat from "lucide-react/dist/esm/icons/repeat.mjs";
 import Trash2 from "lucide-react/dist/esm/icons/trash-2.mjs";
 import Users from "lucide-react/dist/esm/icons/users.mjs";
 import Webhook from "lucide-react/dist/esm/icons/webhook.mjs";
 import Briefcase from "lucide-react/dist/esm/icons/briefcase.mjs";
 import Workflow from "lucide-react/dist/esm/icons/workflow.mjs";
 import X from "lucide-react/dist/esm/icons/x.mjs";
-import { useStore, type Bot } from "@/state/store";
+import { useStore, type AutomationsTab, type Bot } from "@/state/store";
 import { AgentAvatar, BlokAvatar } from "./Avatar";
 import { type Routine, type RoutineRun } from "./RoutinesSection";
 import { RoutinesDialog } from "./RoutinesDialog";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { useEscape } from "@/lib/useEscape";
 import { JobBoard } from "./JobBoard";
 import { Workflows } from "./Workflows";
 import { cn } from "@/lib/cn";
 import { WatchersTab } from "./WatchersTab";
 import Eye from "lucide-react/dist/esm/icons/eye.mjs";
 import { thisComputer } from "@/lib/thisComputer";
+import { gridHours } from "@/lib/dayGrid";
+import { checkInBand, foldQuietRuns, intervalShort } from "@/lib/checkIns";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
@@ -52,14 +61,16 @@ interface WebhookRow {
   botId?: string;
   blokId?: string;
   enabled: boolean;
+  /** The conversation an agent's events go to; absent is its first. */
+  thread?: string;
   lastFiredAt?: number;
   firedCount?: number;
   deliveries?: Array<{ at: number; excerpt: string }>;
 }
 
 const HOUR_PX = 52;
-const DAY_START = 6; // the gutter starts at 6am; earlier hours are rare
-const DAY_END = 23;
+/** How far apart check-in bands sit, side by side at a column's edge. */
+const BAND_STEP = 10;
 
 const dayKey = (d: Date) => d.toDateString();
 
@@ -84,7 +95,11 @@ function addMonths(d: Date, n: number): Date {
 
 export function AutomationsPanel({ onClose }: { onClose: () => void }) {
   const { state } = useStore();
-  const [tab, setTab] = useState<"schedules" | "watchers" | "workflows" | "webhooks" | "jobs">("schedules");
+  // a page like Settings, and closed the same way; the routine dialog on
+  // top of it registers after this and so takes Escape first
+  useEscape(onClose);
+  // a link from elsewhere (the security checkup's webhooks) opens its tab
+  const [tab, setTab] = useState<AutomationsTab>(state.routinesTab ?? "schedules");
   const [routines, setRoutines] = useState<Routine[] | null>(null);
   const [mode, setMode] = useState<"day" | "week" | "month">("week");
   const [anchor, setAnchor] = useState(() => startOfDay(new Date()));
@@ -110,13 +125,13 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
     for (const [index, { el }] of columnRects.current) {
       const rect = el.getBoundingClientRect();
       if (clientX >= rect.left && clientX <= rect.right) {
-        const raw = ((clientY - rect.top) / HOUR_PX) * 60 + DAY_START * 60;
+        const raw = ((clientY - rect.top) / HOUR_PX) * 60 + hours.start * 60;
         const snapped = Math.round(raw / 15) * 15;
         // clamp into the hours the grid actually draws, so a drop can
         // never send a chip somewhere the calendar cannot show it
         return {
           dayIndex: index,
-          minutes: Math.max(DAY_START * 60, Math.min(DAY_END * 60 - 15, snapped)),
+          minutes: Math.max(hours.start * 60, Math.min(hours.end * 60 - 15, snapped)),
         };
       }
     }
@@ -214,11 +229,12 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
   const visible = (routines ?? []).filter((r) => !filterId || r.targetId === filterId);
 
   /** Which routines land on a given day, with their minute offsets. A
-   * once routine lands only on its own date. */
+   * once routine lands only on its own date. Check-ins are drawn apart
+   * (checkInsOn). */
   const occurrences = useCallback(
     (day: Date) =>
       visible
-        .filter((r) => r.enabled)
+        .filter((r) => r.enabled && !r.every)
         .filter((r) =>
           r.repeat === "once"
             ? r.date ===
@@ -232,7 +248,18 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
         .sort((a, b) => a.minutes - b.minutes),
     [visible],
   );
+  // the hours the Day and Week grids draw: wide enough for every routine
+  // on the days in view, a 3 AM one included
+  const hours = gridHours(days.flatMap((day) => occurrences(day).map((slot) => slot.minutes)));
 
+  /** The check-ins that run on a given day, each drawn as one band. */
+  const checkInsOn = useCallback(
+    (day: Date) =>
+      visible.filter((r) => r.enabled && r.every && (r.days.length === 0 || r.days.includes(day.getDay()))),
+    [visible],
+  );
+
+  const checkIns = visible.filter((r) => r.enabled && r.every);
   const paused = visible.filter((r) => !r.enabled);
   const monthLabel = (mode === "month" ? anchor : days[0]).toLocaleDateString([], { month: "long", year: "numeric" });
   const today = dayKey(new Date());
@@ -367,6 +394,7 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
             <MonthGrid
               anchor={anchor}
               occurrences={occurrences}
+              checkInsOn={checkInsOn}
               targetOf={targetOf}
               onZoom={(day) => {
                 // a month cell zooms into that day for the full detail
@@ -379,10 +407,10 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
               <div className="flex min-w-[640px]">
                 {/* time gutter */}
                 <div className="sticky left-0 z-10 w-14 shrink-0 border-r bg-background pt-[34px]">
-                  {Array.from({ length: DAY_END - DAY_START }, (_, i) => (
+                  {Array.from({ length: hours.end - hours.start }, (_, i) => (
                     <div key={i} className="relative" style={{ height: HOUR_PX }}>
                       <span className="absolute -top-2 right-2 text-[10.5px] tabular-nums text-muted-foreground/70">
-                        {(DAY_START + i) % 12 || 12} {DAY_START + i < 12 ? "AM" : "PM"}
+                        {(hours.start + i) % 12 || 12} {hours.start + i < 12 ? "AM" : "PM"}
                       </span>
                     </div>
                   ))}
@@ -391,6 +419,9 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
                 {days.map((day, dayIndex) => {
                   const isToday = dayKey(day) === today;
                   const slots = occurrences(day);
+                  const bands = checkInsOn(day);
+                  // the cards leave the bands their own strip on the right
+                  const cardsRight = bands.length ? 6 + bands.length * BAND_STEP : 4;
                   return (
                     <div key={day.toISOString()} className="min-w-0 flex-1 border-r last:border-r-0">
                       <div
@@ -416,7 +447,7 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
                           else columnRects.current.delete(dayIndex);
                         }}
                         className="relative"
-                        style={{ height: (DAY_END - DAY_START) * HOUR_PX }}
+                        style={{ height: (hours.end - hours.start) * HOUR_PX }}
                         onClick={(e) => {
                           // the click that ends a drag lands here too (the
                           // click target is the columns' common ancestor);
@@ -427,7 +458,7 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
                           }
                           // clicking empty grid starts a routine at that hour
                           const rect = e.currentTarget.getBoundingClientRect();
-                          const minutes = ((e.clientY - rect.top) / HOUR_PX + DAY_START) * 60;
+                          const minutes = ((e.clientY - rect.top) / HOUR_PX + hours.start) * 60;
                           const hour = Math.max(0, Math.min(23, Math.floor(minutes / 60)));
                           setCreating({
                             time: `${String(hour).padStart(2, "0")}:00`,
@@ -437,7 +468,7 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
                         }}
                       >
                         {/* hour lines */}
-                        {Array.from({ length: DAY_END - DAY_START }, (_, i) => (
+                        {Array.from({ length: hours.end - hours.start }, (_, i) => (
                           <div
                             key={i}
                             className="absolute inset-x-0 border-t border-border/60"
@@ -445,12 +476,44 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
                           />
                         ))}
                         {/* the moment it is right now */}
-                        {isToday && <NowLine />}
+                        {isToday && <NowLine start={hours.start} end={hours.end} />}
+
+                        {/* check-ins: a band over their hours, a tick each */}
+                        {bands.map((routine, i) => {
+                          const band = checkInBand(routine, hours.start, hours.end);
+                          if (!band) return null;
+                          const target = targetOf(routine.targetId);
+                          const label = `${routine.name || routine.prompt}: ${routine.summary ?? ""}${target ? `, ${target.name}` : ""}`;
+                          return (
+                            <button
+                              key={routine.id}
+                              title={label}
+                              aria-label={label}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelected(routine);
+                              }}
+                              className="absolute w-2 overflow-hidden rounded-full border border-brand/40 bg-brand/10 transition-colors duration-150 hover:border-brand hover:bg-brand/20"
+                              style={{
+                                top: (band.top / 60) * HOUR_PX,
+                                height: Math.max(8, (band.height / 60) * HOUR_PX),
+                                right: 4 + i * BAND_STEP,
+                              }}
+                            >
+                              {band.ticks.map((tick) => (
+                                <span
+                                  key={tick}
+                                  className="absolute inset-x-0 h-px bg-brand-ink"
+                                  style={{ top: (tick / 60) * HOUR_PX }}
+                                />
+                              ))}
+                            </button>
+                          );
+                        })}
 
                         {slots.map(({ routine, minutes }) => {
                           const target = targetOf(routine.targetId);
-                          const top = ((minutes - DAY_START * 60) / 60) * HOUR_PX;
-                          if (top < -HOUR_PX) return null;
+                          const top = ((minutes - hours.start * 60) / 60) * HOUR_PX;
                           return (
                             <button
                               key={routine.id}
@@ -464,10 +527,11 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
                                 setSelected(routine);
                               }}
                               className={cn(
-                                "absolute inset-x-1 flex cursor-grab touch-none items-start gap-1.5 overflow-hidden rounded-lg border border-brand/25 bg-brand-soft px-1.5 py-1 text-left shadow-sm transition-transform duration-150 hover:scale-[1.02]",
+                                "absolute left-1 flex cursor-grab touch-none items-start gap-1.5 overflow-hidden rounded-lg border border-brand/25 bg-brand-soft px-1.5 py-1 text-left shadow-sm transition-transform duration-150 hover:scale-[1.02]",
                                 drag?.routine.id === routine.id && "opacity-40",
                               )}
                               style={{
+                                right: cardsRight,
                                 top: Math.max(0, top),
                                 // the chip blocks out its duration, like an
                                 // appointment would
@@ -497,6 +561,31 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
                         })}
                       </div>
                     </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ── check-ins, in words ── */}
+          {checkIns.length > 0 && (
+            <div className="shrink-0 border-t px-5 py-2.5">
+              <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+                Check-ins
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {checkIns.map((routine) => {
+                  const target = targetOf(routine.targetId);
+                  return (
+                    <button
+                      key={routine.id}
+                      onClick={() => setSelected(routine)}
+                      className="flex min-w-0 max-w-full items-center gap-1.5 rounded-full border border-brand/25 bg-brand-soft px-2.5 py-1 text-[12px] transition-colors hover:border-brand/50"
+                    >
+                      {target?.bot ? <AgentAvatar bot={target.bot} size={16} /> : <Repeat size={12} className="shrink-0 text-brand-ink" />}
+                      <span className="max-w-[160px] shrink-0 truncate font-medium text-foreground">{routine.name || routine.prompt}</span>
+                      <span className="min-w-0 truncate text-muted-foreground">{routine.summary}</span>
+                    </button>
                   );
                 })}
               </div>
@@ -566,16 +655,17 @@ export function AutomationsPanel({ onClose }: { onClose: () => void }) {
   );
 }
 
-/** The red line of the present moment, updated each minute. */
-function NowLine() {
+/** The red line of the present moment, updated each minute, on a grid
+ * that draws the hours from `start` to `end`. */
+function NowLine({ start, end }: { start: number; end: number }) {
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 60_000);
     return () => clearInterval(t);
   }, []);
   const minutes = now.getHours() * 60 + now.getMinutes();
-  const top = ((minutes - DAY_START * 60) / 60) * HOUR_PX;
-  if (top < 0 || top > (DAY_END - DAY_START) * HOUR_PX) return null;
+  const top = ((minutes - start * 60) / 60) * HOUR_PX;
+  if (top < 0 || top > (end - start) * HOUR_PX) return null;
   return (
     <div className="pointer-events-none absolute inset-x-0 z-10" style={{ top }}>
       <div className="h-px bg-destructive" />
@@ -614,11 +704,13 @@ function EmptyRhythm({ onCreate }: { onCreate: () => void }) {
 function MonthGrid({
   anchor,
   occurrences,
+  checkInsOn,
   targetOf,
   onZoom,
 }: {
   anchor: Date;
   occurrences: (day: Date) => Array<{ routine: Routine; minutes: number }>;
+  checkInsOn: (day: Date) => Routine[];
   targetOf: (id: string) => { name: string; bot?: Bot } | null;
   onZoom: (day: Date) => void;
 }) {
@@ -641,7 +733,11 @@ function MonthGrid({
         {cells.map((day) => {
           const inMonth = day.getMonth() === anchor.getMonth();
           const isToday = dayKey(day) === today;
-          const slots = occurrences(day);
+          // a check-in is one chip a day however often it runs
+          const slots = [
+            ...occurrences(day).map(({ routine }) => ({ routine, when: routine.time, checkIn: false })),
+            ...checkInsOn(day).map((routine) => ({ routine, when: intervalShort(routine.every!), checkIn: true })),
+          ];
           return (
             <button
               key={day.toISOString()}
@@ -659,16 +755,23 @@ function MonthGrid({
               >
                 {day.getDate()}
               </span>
-              {slots.slice(0, 3).map(({ routine }) => {
+              {slots.slice(0, 3).map(({ routine, when, checkIn }) => {
                 const target = targetOf(routine.targetId);
                 return (
                   <span
                     key={routine.id}
-                    className="flex items-center gap-1 overflow-hidden rounded-md border border-brand/20 bg-brand-soft px-1 py-0.5"
+                    className={cn(
+                      "flex items-center gap-1 overflow-hidden rounded-md border px-1 py-0.5",
+                      checkIn ? "border-dashed border-brand/30" : "border-brand/20 bg-brand-soft",
+                    )}
                   >
-                    {target?.bot && <AgentAvatar bot={target.bot} size={12} />}
+                    {checkIn ? (
+                      <Repeat size={10} className="shrink-0 text-brand-ink" />
+                    ) : (
+                      target?.bot && <AgentAvatar bot={target.bot} size={12} />
+                    )}
                     <span className="truncate text-[9.5px] font-medium text-foreground">
-                      {routine.time} {routine.name || routine.prompt}
+                      {when} {routine.name || routine.prompt}
                     </span>
                   </span>
                 );
@@ -708,7 +811,31 @@ function RunHistory({ runs }: { runs?: RoutineRun[] }) {
         Recent runs
       </div>
       <div className="max-h-[190px] overflow-y-auto">
-        {runs.map((run) => {
+        {foldQuietRuns(runs).map((row) => {
+          // a stretch of quiet check-ins is one row: they ran, and nothing needed you
+          if ("quiet" in row) {
+            const newest = row.quiet[0];
+            const oldest = row.quiet[row.quiet.length - 1];
+            const at = (run: RoutineRun) =>
+              new Date(run.startedAt).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+            return (
+              <div key={newest.id} className="flex w-full items-start gap-2 px-1.5 py-1.5">
+                <span className="mt-[5px] size-1.5 shrink-0 rounded-full bg-muted-foreground/40" />
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-baseline justify-between gap-2">
+                    <span className="text-[12px] tabular-nums text-muted-foreground">
+                      {row.quiet.length === 1 ? at(newest) : `${at(oldest)} to ${at(newest)}`}
+                    </span>
+                    <span className="shrink-0 text-[11px] text-muted-foreground">quiet</span>
+                  </span>
+                  <span className="mt-0.5 block text-[11.5px] text-muted-foreground">
+                    {row.quiet.length === 1 ? "Nothing needed you." : `${row.quiet.length} check-ins, nothing needed you.`}
+                  </span>
+                </span>
+              </div>
+            );
+          }
+          const { run } = row;
           const showing = open === run.id;
           const detail = run.error ?? run.summary ?? "";
           return (
@@ -817,9 +944,28 @@ function RoutineDetails({
               </div>
             )}
             <div className="mt-0.5 text-[12px] text-muted-foreground">
-              {target?.name} · {daysLabel} at {routine.time} · {routine.durationMin ?? 30} min
+              {target?.name} ·{" "}
+              {routine.every
+                ? routine.summary
+                : `${daysLabel} at ${routine.time} · ${routine.durationMin ?? 30} min${routine.quiet ? " · quiet" : ""}`}
               {runsOnLabel ? ` · ${runsOnLabel}` : ""}
             </div>
+            {routine.quiet && (
+              <div className="mt-0.5 text-[11.5px] text-muted-foreground/80">
+                Answers QUIET when nothing needs you, and a quiet run is not announced.
+              </div>
+            )}
+            {routine.lastReport && (
+              <div className="mt-1.5 line-clamp-3 text-[12px] leading-relaxed text-foreground/80" title={routine.lastReport.summary}>
+                <span className="text-muted-foreground">Last reported: </span>
+                {routine.lastReport.summary}
+              </div>
+            )}
+            {routine.enabled && routine.suspended === "archived" && (
+              <div className="mt-0.5 text-[12px] text-warning">
+                Paused while {target?.name ?? "its agent"} is archived. It runs again once restored.
+              </div>
+            )}
           </div>
           <Switch
             aria-label={`${routine.name || "This routine"}: on or off`}
@@ -1079,6 +1225,34 @@ function WebhooksTab({
                 </code>
               </div>
             </div>
+
+            {selected.botId && (
+              <label className="mt-4 block rounded-2xl border bg-card p-4">
+                <div className="text-[13px] font-semibold text-foreground">Conversation</div>
+                <input
+                  key={`${selected.id}:${selected.thread ?? ""}`}
+                  defaultValue={selected.thread ?? ""}
+                  maxLength={40}
+                  placeholder="General"
+                  onBlur={(e) => {
+                    const thread = e.target.value.trim();
+                    if (thread === (selected.thread ?? "")) return;
+                    api(`/api/webhooks/${selected.id}`, {
+                      method: "PATCH",
+                      body: JSON.stringify({ thread: thread || null }),
+                    })
+                      .then(load)
+                      .catch((err) => setError(err.message));
+                  }}
+                  onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+                  className="mt-2 w-full rounded-lg border border-input bg-background px-2.5 py-1.5 text-[13px] text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-ring/60"
+                />
+                <p className="mt-1.5 text-[12px] text-muted-foreground">
+                  Events go to {target?.name ?? "the agent"}'s first conversation, where you talk to it, unless you name
+                  another; one that does not exist is made.
+                </p>
+              </label>
+            )}
 
             <div className="mt-4 rounded-2xl border bg-card p-4">
               <div className="text-[13px] font-semibold text-foreground">Recent deliveries</div>

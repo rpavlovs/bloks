@@ -13,8 +13,11 @@
 // lane and keep talking. Switching lanes is one click; nothing queues
 // behind anything else.
 //
-// Capped at three running tasks per agent: enough to feel parallel,
-// few enough that each still gets real attention (and real compute).
+// Up to twenty lanes per agent, each running one turn at a time. Any of
+// them can be closed except General, the first, which is cleared instead,
+// because an agent always has somewhere to be talked to. Most agents have
+// only that one, so the strip appears once there is a second (ChatView);
+// the sidebar row opens one.
 //
 // A lane names itself from the first words of its first message, which
 // often say nothing about what it became. A double click renames it.
@@ -22,6 +25,8 @@ import { useRef, useState } from "react";
 import Plus from "lucide-react/dist/esm/icons/plus.mjs";
 import X from "lucide-react/dist/esm/icons/x.mjs";
 import { cn } from "@/lib/cn";
+import { plural } from "@/lib/plural";
+import { contextTitle, measuredContext, type LaneContext } from "@/lib/contextCard";
 
 export type TaskState = "working" | "needs-you" | "idle";
 
@@ -31,7 +36,7 @@ export interface TaskChipData {
   state: TaskState;
   usage?: { input: number; output: number; turns: number };
   /** How full this lane's conversation is. See server/context.ts. */
-  context?: { used: number; limit: number; fraction: number; summarised: boolean };
+  context?: LaneContext;
 }
 
 /** 842 tokens reads as itself; larger sums read as 12.3k or 1.2M. Zero
@@ -43,7 +48,8 @@ export function formatTokens(n: number): string | null {
   return `${(Math.round(n / 100_000) / 10).toFixed(1).replace(/\.0$/, "")}M`;
 }
 
-const MAX_TASKS = 3;
+/** The server's bound (MAX_TASKS in server/store.ts). */
+const MAX_TASKS = 20;
 
 /** The server keeps a lane title to one line of 40 characters. */
 const MAX_TITLE = 40;
@@ -95,7 +101,7 @@ function RenameChip({ title, onDone }: { title: string; onDone: (next: string | 
  * worth watching, because a ring at three percent on every chip is
  * decoration.
  */
-function ContextRing({
+export function ContextRing({
   fraction,
   summarised,
   size = 13,
@@ -135,7 +141,7 @@ function ContextRing({
 }
 
 /** Below this a ring says nothing anybody needs. */
-const RING_FROM = 0.25;
+export const RING_FROM = 0.25;
 
 function StateDot({ state }: { state: TaskState }) {
   if (state === "working") {
@@ -159,6 +165,7 @@ export function TaskStrip({
   onSelect,
   onNew,
   onClose,
+  onClear,
   onRename,
 }: {
   tasks: TaskChipData[];
@@ -166,6 +173,7 @@ export function TaskStrip({
   onSelect: (id: string) => void;
   onNew: () => void;
   onClose: (id: string) => void;
+  onClear: (id: string) => void;
   onRename?: (id: string, title: string) => void;
 }) {
   const [renaming, setRenaming] = useState<string | null>(null);
@@ -173,10 +181,11 @@ export function TaskStrip({
   const needsYou = tasks.filter((t) => t.state === "needs-you").length;
 
   return (
-    <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b bg-background/95 px-3 py-2.5 md:px-4">
-      {tasks.map((task) => {
+    <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b bg-background/95 px-3 py-2.5 max-md:[scrollbar-width:none] md:px-4 max-md:[&::-webkit-scrollbar]:hidden">
+      {tasks.map((task, index) => {
         const active = task.id === activeId;
-        const canClose = tasks.length > 1;
+        // General, the first, is cleared rather than closed
+        const isGeneral = index === 0;
         if (renaming === task.id) {
           return (
             <RenameChip
@@ -196,8 +205,8 @@ export function TaskStrip({
             onDoubleClick={onRename ? () => setRenaming(task.id) : undefined}
             title={onRename ? "Double-click to rename" : undefined}
             className={cn(
-              "group/chip flex max-w-[220px] shrink-0 items-center gap-2 rounded-full border py-1 text-[12px] transition-all duration-150",
-              canClose ? "pl-2.5 pr-1.5" : "px-2.5",
+              "group/chip flex max-w-[220px] shrink-0 items-center gap-2 rounded-full border py-1 text-[12px] transition-[background-color,border-color,color,box-shadow,scale] duration-150 ease-out active:scale-[0.97]",
+              "pl-2.5 pr-1.5",
               active
                 ? "border-foreground/25 bg-foreground text-background shadow-sm"
                 : "text-muted-foreground hover:border-foreground/25 hover:text-foreground",
@@ -206,15 +215,12 @@ export function TaskStrip({
           >
             <StateDot state={task.state} />
             <span className="truncate font-medium">{task.title}</span>
-            {task.context && (task.context.fraction >= RING_FROM || task.context.summarised) && (
+            {task.context && ((measuredContext(task.context) && task.context.fraction >= RING_FROM) || task.context.summarised) && (
               <span
                 className={cn("shrink-0", active ? "opacity-80" : "text-muted-foreground")}
-                title={
-                  `${Math.round(task.context.fraction * 100)}% of what this model will take` +
-                  (task.context.summarised ? ", and the earlier part has been summarised" : "")
-                }
+                title={contextTitle(task.context)}
               >
-                <ContextRing fraction={task.context.fraction} summarised={task.context.summarised} />
+                <ContextRing fraction={measuredContext(task.context) ? task.context.fraction : 0} summarised={task.context.summarised} />
               </span>
             )}
             {(() => {
@@ -223,29 +229,31 @@ export function TaskStrip({
               return label ? (
                 <span
                   className={cn("shrink-0 text-[10.5px] tabular-nums", active ? "opacity-70" : "text-muted-foreground/70")}
-                  title={`${task.usage!.input.toLocaleString()} in · ${task.usage!.output.toLocaleString()} out · ${task.usage!.turns} turns`}
+                  title={`${task.usage!.input.toLocaleString()} in · ${task.usage!.output.toLocaleString()} out · ${plural(task.usage!.turns, "turn")}`}
                 >
                   {label}
                 </span>
               ) : null;
             })()}
-            {canClose && (
-              <span
-                role="button"
-                tabIndex={-1}
-                aria-label={`Close ${task.title}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onClose(task.id);
-                }}
-                className={cn(
-                  "flex size-4 items-center justify-center rounded-full opacity-0 transition-opacity duration-150 group-hover/chip:opacity-100",
-                  active ? "hover:bg-background/20" : "hover:bg-accent",
-                )}
-              >
-                <X size={11} />
-              </span>
-            )}
+            {/* Quiet until the chip is hovered, which a touch screen never
+                does: there the X was invisible and still took a tap, so it
+                shows, a little larger, wherever the pointer is a finger. */}
+            <span
+              role="button"
+              tabIndex={-1}
+              aria-label={isGeneral ? `Clear ${task.title}` : `Close ${task.title}`}
+              title={isGeneral ? "Clear this conversation" : "Close this conversation"}
+              onClick={(e) => {
+                e.stopPropagation();
+                (isGeneral ? onClear : onClose)(task.id);
+              }}
+              className={cn(
+                "flex size-4 items-center justify-center rounded-full opacity-0 transition-opacity duration-150 group-hover/chip:opacity-100 pointer-coarse:size-5 pointer-coarse:opacity-100",
+                active ? "hover:bg-background/20" : "hover:bg-accent",
+              )}
+            >
+              <X size={11} />
+            </span>
           </button>
         );
       })}

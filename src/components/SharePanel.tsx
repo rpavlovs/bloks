@@ -153,7 +153,7 @@ export function SharePanel({ blok, open, onOpenChange }: { blok: Blok; open: boo
         ) : !data.plan ? (
           <div className="mt-4 rounded-2xl border bg-card p-4 text-[13px] leading-relaxed text-muted-foreground">
             Sharing a room needs Bloks Cloud, which is what carries people's messages to this computer
-            while they are away from it. Turn it on in Settings, under Devices, then come back here.
+            while they are away from it. Turn it on in Settings, under Bloks Cloud, then come back here.
           </div>
         ) : !shared ? (
           <div className="mt-4 space-y-3">
@@ -531,7 +531,7 @@ function ChatLinkSection({
         </div>
       ) : data.chat.connected.length === 0 ? (
         <div className="text-[12px] leading-snug text-muted-foreground">
-          Carry this room into a Slack or Discord channel. Connect one in Settings, under Devices.
+          Carry this room into a Slack or Discord channel. Connect one in Settings, under Chat and email.
         </div>
       ) : (
         <div className="space-y-2">

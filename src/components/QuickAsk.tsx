@@ -10,6 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import CornerDownLeft from "lucide-react/dist/esm/icons/corner-down-left.mjs";
 import { AgentAvatar } from "./Avatar";
 import { cn } from "@/lib/cn";
+import { api } from "@/state/store";
 
 interface QuickBot {
   id: string;
@@ -31,28 +32,43 @@ export function QuickAsk() {
   const [error, setError] = useState<string | null>(null);
   const input = useRef<HTMLTextAreaElement>(null);
 
-  // The roster is small and the panel is short-lived; one read on open is
-  // cheaper and calmer than a live subscription.
-  useEffect(() => {
-    void fetch("/api/bots")
-      .then((r) => r.json())
+  // The roster is small and the panel is short-lived; a read each time it
+  // opens is cheaper and calmer than a live subscription. Once at the
+  // start was not enough: the window stays loaded between uses, so an
+  // agent made or archived since was missing, or still offered. One
+  // message each is plenty to list them by.
+  const loadBots = () =>
+    api("/api/bots?messages=1")
       .then((d) => {
         const list: QuickBot[] = (d.bots ?? []).filter((b: QuickBot) => !b.hidden);
         setBots(list);
         setChosen((current) => (list.some((b) => b.id === current) ? current : (list[0]?.id ?? "")));
       })
       .catch(() => setError("Bloks is not running."));
+  useEffect(() => {
+    void loadBots();
   }, []);
 
   // Reopening should feel like a fresh field, not like resuming a form
   // somebody abandoned three days ago.
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Which opening of the panel this is. Clicking away hides it while a
+  // send can still be out (through Bloks Cloud that is up to twenty
+  // seconds), and its answer must not clear what this visit typed or
+  // close it.
+  const visit = useRef(0);
   useEffect(() => {
     const bridge = window.bloks;
     if (!bridge?.onQuickOpened) return;
     return bridge.onQuickOpened(() => {
+      visit.current += 1;
+      // the last send's goodbye must not close this visit
+      if (hideTimer.current) clearTimeout(hideTimer.current);
       setText("");
       setSent(null);
       setError(null);
+      setSending(false);
+      void loadBots();
       input.current?.focus();
     });
   }, []);
@@ -61,20 +77,42 @@ export function QuickAsk() {
     input.current?.focus();
   }, []);
 
+  // Sent is said only once the server took it. fetch alone counts a
+  // refusal (an archived agent, a message too long) as an answer, so the
+  // window said "Sent", closed, and took the words with it. A refusal now
+  // keeps the words here, with the reason, to change or send again.
+  const [sending, setSending] = useState(false);
   const send = () => {
     const body = text.trim();
     const bot = bots.find((b) => b.id === chosen);
-    if (!body || !bot) return;
+    if (!body || !bot || sending) return;
     localStorage.setItem(LAST_USED, bot.id);
-    setSent(bot.name);
-    setText("");
-    void fetch(`/api/bots/${bot.id}/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text: body }),
-    }).catch(() => setError("That did not send."));
-    // Long enough to read, short enough not to be in the way.
-    setTimeout(() => window.bloks?.quickHide(), 900);
+    setSending(true);
+    setError(null);
+    const mine = visit.current;
+    api(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: body }) })
+      .then(() => {
+        // it went; a later visit has nothing to be told
+        if (visit.current !== mine) return;
+        setSent(bot.name);
+        setText("");
+        // Long enough to read, short enough not to be in the way.
+        hideTimer.current = setTimeout(() => window.bloks?.quickHide(), 900);
+      })
+      .catch((e) => {
+        const why = `That did not send: ${e instanceof Error ? e.message : String(e)}`;
+        if (visit.current !== mine) {
+          // the words from the visit before, back only into an empty box
+          setText((now) => (now.trim() ? now : body));
+          setError((now) => now ?? why);
+          return;
+        }
+        setError(why);
+        input.current?.focus();
+      })
+      .finally(() => {
+        if (visit.current === mine) setSending(false);
+      });
   };
 
   const cycle = (by: number) => {
@@ -126,7 +164,7 @@ export function QuickAsk() {
               />
             </div>
             <div className="flex items-center gap-1.5 border-t px-3 py-1.5">
-              <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
+              <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                 {bots.slice(0, 8).map((b) => (
                   <button
                     key={b.id}

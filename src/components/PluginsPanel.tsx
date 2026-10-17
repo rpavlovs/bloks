@@ -7,7 +7,7 @@
 // Icons degrade in three steps, because one broken image in a grid of
 // otherwise-perfect logos looks worse than no logos at all: official
 // artwork, then the service's own favicon, then a letter.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Loader2 from "lucide-react/dist/esm/icons/loader-2.mjs";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import Search from "lucide-react/dist/esm/icons/search.mjs";
@@ -16,6 +16,7 @@ import { api, useStore } from "@/state/store";
 import { McpAppsCard } from "./McpApps";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
+import { useEscape } from "@/lib/useEscape";
 
 interface ToolkitCard {
   slug: string;
@@ -29,12 +30,19 @@ function ServiceIcon({ card }: { card: ToolkitCard }) {
   // step 0 is the real artwork, 1 the site's favicon, 2 a letter
   const [stage, setStage] = useState(card.logo ? 0 : card.domain ? 1 : 2);
   if (stage === 0 && card.logo) {
-    return <img src={card.logo} alt="" className="size-8 rounded-lg" onError={() => setStage(1)} />;
+    return (
+      <img
+        src={`/api/connectors/icon?src=${encodeURIComponent(card.logo)}`}
+        alt=""
+        className="size-8 rounded-lg"
+        onError={() => setStage(1)}
+      />
+    );
   }
   if (stage === 1 && card.domain) {
     return (
       <img
-        src={`https://www.google.com/s2/favicons?domain=${card.domain}&sz=64`}
+        src={`/api/connectors/icon?domain=${encodeURIComponent(card.domain)}`}
         alt=""
         className="size-8 rounded-lg"
         onError={() => setStage(2)}
@@ -50,6 +58,7 @@ function ServiceIcon({ card }: { card: ToolkitCard }) {
 
 export function PluginsPanel() {
   const { dispatch } = useStore();
+  useEscape(() => dispatch({ type: "togglePlugins", open: false }));
   const [cards, setCards] = useState<ToolkitCard[] | null>(null);
   const [source, setSource] = useState<"api" | "curated">("curated");
   const [configured, setConfigured] = useState(true);
@@ -62,12 +71,20 @@ export function PluginsPanel() {
   // MCP server draws for itself.
   const [view, setView] = useState<"connectors" | "apps">("connectors");
 
+  // What comes back covers only the slugs asked about, so it is merged in:
+  // replacing the map made every other connected app read as disconnected
+  // the moment one was connected or dropped.
+  const statusRef = useRef(status);
+  statusRef.current = status;
   const refreshStatus = useCallback((slugs: string[]) => {
     if (!slugs.length) return Promise.resolve();
     setRefreshing(true);
     return api(`/api/connectors?services=${slugs.join(",")}`)
-      .then((r) => setStatus(r.services ?? {}))
-      .catch(() => {})
+      .then((r) => {
+        setStatus((current) => ({ ...current, ...(r.services ?? {}) }));
+        setError(r.error ?? null);
+      })
+      .catch((e) => setError(e.message))
       .finally(() => setRefreshing(false));
   }, []);
 
@@ -93,11 +110,14 @@ export function PluginsPanel() {
     api(`/api/connectors/${slug}/authorize`, { method: "POST" })
       .then(({ url }) => {
         window.open(url);
-        // the user finishes OAuth in the browser; poll a few times to catch it
+        // The sign-in finishes in the browser, often after a password and a
+        // consent screen, so keep looking for two minutes rather than thirty
+        // seconds, and stop as soon as it lands. Read through a ref: the
+        // state this closure saw is the state before the click.
         let tries = 0;
         const timer = setInterval(() => {
+          if (statusRef.current[slug]?.connected || ++tries > 24) return clearInterval(timer);
           void refreshStatus([slug]);
-          if (++tries >= 6 || status[slug]?.connected) clearInterval(timer);
         }, 5000);
       })
       .catch((e) => setError(e.message))
@@ -105,6 +125,11 @@ export function PluginsPanel() {
   };
 
   const disconnect = (slug: string) => {
+    const label = cards?.find((c) => c.slug === slug)?.label ?? slug;
+    // every account behind it goes, and agents stop being able to use it
+    if (!window.confirm(`Disconnect ${label}? Your agents will no longer be able to use it until you connect it again.`)) {
+      return;
+    }
     setBusySlug(slug);
     api(`/api/connectors/${slug}`, { method: "DELETE" })
       .then(() => refreshStatus([slug]))
@@ -127,6 +152,18 @@ export function PluginsPanel() {
     )
     .sort((a, b) => Number(introPicks.has(b.slug)) - Number(introPicks.has(a.slug)));
 
+  // Status is fetched for the first forty cards up front. A search that
+  // surfaces one further down asks about it too, or an app you connected
+  // would show a Connect button just because it sorted late.
+  useEffect(() => {
+    if (!configured || !search) return;
+    const unknown = visible.map((c) => c.slug).filter((s) => !(s in statusRef.current)).slice(0, 40);
+    if (!unknown.length) return;
+    const timer = setTimeout(() => void refreshStatus(unknown), 350);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search, configured, cards]);
+
   return (
     <div
       className="absolute inset-0 z-20 flex animate-fade-in items-center justify-center bg-black/40 dark:bg-black/60"
@@ -134,7 +171,7 @@ export function PluginsPanel() {
     >
       <div
         className={cn(
-          "flex max-h-[80%] animate-pop-in flex-col rounded-2xl border bg-popover p-5 shadow-2xl shadow-[--shadow-color] transition-[width] duration-200",
+          "flex max-h-[80%] animate-pop-in flex-col rounded-2xl border bg-popover p-5 shadow-2xl shadow-(color:--shadow-color) transition-[width] duration-200",
           // an app needs room to be an app
           view === "apps" ? "w-[min(760px,92vw)]" : "w-[min(540px,92vw)]",
         )}
@@ -202,7 +239,7 @@ export function PluginsPanel() {
               className="underline"
               onClick={() => {
                 dispatch({ type: "togglePlugins", open: false });
-                dispatch({ type: "toggleAppSettings", open: true });
+                dispatch({ type: "toggleAppSettings", open: true, page: "apps" });
               }}
             >
               add one in Settings
@@ -217,7 +254,7 @@ export function PluginsPanel() {
               className="underline hover:text-foreground"
               onClick={() => {
                 dispatch({ type: "togglePlugins", open: false });
-                dispatch({ type: "toggleAppSettings", open: true });
+                dispatch({ type: "toggleAppSettings", open: true, page: "apps" });
               }}
             >
               Add a Composio API key

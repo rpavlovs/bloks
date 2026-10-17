@@ -2,12 +2,16 @@
 // thread to instance binding and per-instance resume cursors: persist
 // that binding from day one, because retrofitting it is painful).
 // messages-<threadId>.json holds the folded transcript.
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ChangesSummary } from "./checkpoints.ts";
+import type { TelegramReply } from "./telegram-returns.ts";
+import { readSaved, writeFileAtomic } from "./atomic-write.ts";
 import { DATA_DIR } from "./config.ts";
+import { compactedNotice, readingFor, type Reading } from "./context.ts";
 import { newId, type ModelSelection, type ThreadId } from "./contracts.ts";
+import { readGoal, type Goal } from "./goals.ts";
 
 export type BlokColor =
   | "green"
@@ -68,6 +72,14 @@ export interface OptionCardData {
   askedFor?: string;
   /** Who answered, when it was not the owner. */
   answeredBy?: string;
+  /** The turn that asked was cut off when Bloks stopped. Nothing is
+   * waiting on an answer any more, and none is ever taken as one. */
+  cutOff?: boolean;
+  /** Why it closed with nobody having answered it (a timeout, the turn
+   * ending, the engine closing it), in the words the card shows. Such a
+   * card stays in the conversation, where one only hidden read as a
+   * question that was never asked. */
+  closed?: string;
   /** Present when a lead has proposed hiring a team (server/teams.ts). */
   team?: {
     room: string;
@@ -76,10 +88,59 @@ export interface OptionCardData {
   };
 }
 
+/** A message between two agents, as it shows in either agent's chat.
+ * "in" is one that arrived from another agent and "out" is the sender's
+ * own record of sending it; the person's chat shows these as compact
+ * rows, and the whole exchange opens from either. "reply" is only found
+ * on messages written by 2.5.14 to 2.5.16, which marked what an agent
+ * said in a turn another agent started; that is `afterAgent` now. */
+export interface AgentNote {
+  dir: "in" | "out" | "reply";
+  peerId: string;
+  peerName: string;
+  /** "out" only: whether it was taken, queued behind a running turn, or refused. */
+  status?: "sent" | "queued" | "failed";
+}
+
+/** One note recall added to a turn (Message.recalled). */
+export interface RecalledNote {
+  kind: "conversation" | "room" | "memory";
+  /** The conversation or room it came from, and the message. A memory
+   * note names its file instead. */
+  threadId?: string;
+  messageId?: string;
+  memory?: string;
+  /** Where, as the person calls it: a conversation's title, a room's
+   * name, a memory file's name. */
+  where: string;
+  at: number;
+  /** Who said it, for a note from a conversation. */
+  who?: string;
+  /** The excerpt, as the agent was given it. */
+  text: string;
+}
+
 export interface Message {
+  /** Between two agents rather than with the person; see AgentNote. */
+  agent?: AgentNote;
+  /** A record of taking back waiting words, not a send to the peer. */
+  takeBack?: { peerId: string; peerName: string; messages: Array<{ id: string; laneId: string; text: string }> };
+  /** Said in this agent's own chat during a turn another agent's message
+   * started. Context only: it was not sent to that agent (an agent does
+   * that with \`bloks say\`), so it is shown in full like any reply, with
+   * a link to the exchange, and never as a message between them. */
+  afterAgent?: { peerId: string; peerName: string };
   /** Set on a room message that was said in the room's linked chat
    * channel, so the bridge does not say it there a second time. */
-  via?: "slack" | "discord" | "whatsapp" | "watcher" | "email";
+  via?: "slack" | "discord" | "whatsapp" | "watcher" | "email" | "webhook" | "routine" | "goal";
+  /** The routine's name and start mode when this message was written,
+   * and `quiet` when its agent was told it may answer QUIET. */
+  routine?: { name?: string; manual: boolean; quiet?: boolean };
+  /** Part of a quiet check-in: a routine's prompt that the agent answered
+   * with QUIET, that answer, and what the turn did in between. Nothing in
+   * it needed the person, so it marked nothing unread, notified nobody,
+   * and the chat folds a run of them into one muted line. */
+  quiet?: boolean;
   /** The user's selection on a decision component; distinct from the agent's recommendation. */
   decisionChoice?: number;
   id: string;
@@ -90,6 +151,25 @@ export interface Message {
   /** A notice that is something happening in the room (someone joined,
    * someone left) rather than something going wrong. */
   event?: boolean;
+  /** A notice about the lane's goal (server/goals.ts): set, or where it
+   * ended up. Done is news like a finished reply, blocked like a question. */
+  goal?: "set" | "done" | "blocked" | "out" | "paused";
+  /** A notice that agents stopped at the workspace turn limit (server/agent-chain.ts):
+   * an agent message was refused, or scheduled work did not start.
+   * Nothing is held for delivery. Like a blocked goal, it marks the
+   * conversation unread and wakes the phone (GitHub 248). A room mention
+   * held at MAX_AGENT_HOPS (server/room-hops.ts) is said the same way. */
+  chainHeld?: boolean;
+  /** Direct hold dedupe, excluding the redacted excerpt. */
+  chainHoldKey?: string;
+  /** What a chat on the phone is told of this notice instead of its
+   * text: the error alone, when the app's notice also says where to set
+   * a backup, which means nothing there (GitHub 284). */
+  phoneText?: string;
+  /** A notice marking where the engine compacted its own session, and by
+   * how much. A line in the conversation, not a warning, and never news:
+   * it marks nothing unread and is not carried into a linked channel. */
+  compaction?: { before: number | null; after: number | null; idle?: boolean };
   /** Which person wrote a user message in a shared room: a person id from
    * server/people.ts. Absent means the owner, which is every message
    * written before rooms could be shared. */
@@ -117,7 +197,12 @@ export interface Message {
   /** activity messages: tool name + outcome */
   /** `stopped`: the turn ended before this call reported back, so it
    * will never say whether it worked. */
-  tool?: { name: string; ok?: boolean; stopped?: boolean };
+  tool?: { name: string; command?: string; ok?: boolean; stopped?: boolean };
+  /** activity messages: this call was the 5th, 10th or 20th time its turn
+   * made the very same call (server/repeats.ts). On one row a turn, the
+   * latest to reach a higher mark; the row before it loses it. Beside
+   * `tool` rather than in it, because a call's result replaces `tool`. */
+  repeated?: number;
   /** screen messages: what the agent's desktop looked like, base64 */
   png?: string;
   mime?: string;
@@ -125,10 +210,64 @@ export interface Message {
   replyTo?: { id?: string; author: string; excerpt: string };
   /** artifact messages: a file the agent saved to its deliverables dir */
   artifact?: { name: string; mime: string; size: number };
-  /** sent while the lane was busy; drains into the next turn */
+  /** Sent while the lane was busy; drains into the next turn. Not part
+   * of the conversation until then: it is moved to the end of the
+   * transcript when it goes (Store.moveToEnd). */
   queued?: boolean;
+  /** When it was queued. Written since 2.5.19; a queued message without
+   * it predates recovery after a restart and is never run by it. */
+  queuedAt?: number;
+  /** The server queued the person's words while finishing up to restart.
+   * Cleared when delivered; never accepted from a client body. */
+  waitsFor?: "restart";
+  /** Taken by the turn already running in its lane (steerLane) rather
+   * than starting one. Every other message from the person, another
+   * agent, a routine or a watcher is where a turn begins, so this is
+   * what lets a finished turn be read back as one turn (GitHub 257),
+   * and where a Redo of it goes back to: the nearest earlier message
+   * without this (server/redo.ts). Absent on anything written before it
+   * was recorded, which then reads as having started a turn of its own. */
+  midTurn?: boolean;
+  /** Server-only return address for a Telegram request queued during
+   * drain. Preserved on edits, never accepted from a client body. */
+  telegramReply?: TelegramReply;
+  /** The person said this from Telegram rather than typing it here. It
+   * is their own words everywhere else; the one thing it changes is that
+   * the app does not offer to redo it (server/redo.ts), since what was
+   * answered went to the chat that asked. A Telegram message written
+   * before this was recorded reads as one typed here. */
+  fromTelegram?: boolean;
+  /** Server-created transport identity. A removed or replaced bot cannot
+   * start a queued request that belonged to its previous connection. */
+  telegramBinding?: { botId: string; generation: string };
+  /** Server-only: the Claude instance that accepted this queued text.
+   * Null means it was accepted on another engine; absent is a legacy queue.
+   * Derive command dispatch from the current text, including after edits. */
+  commandInstance?: string | null;
+  /** Server-created provenance for queued personal words. Never read
+   * from a message create/patch body; background text cannot name skills. */
+  namedSkills?: boolean;
+  /** When a queued message stopped waiting and went to the turn that
+   * answers it, which is also its `at` from then on, since that is when
+   * it entered the conversation. With `queuedAt` it says how long it waited. Absent on a
+   * message that never waited, one still waiting, one never sent, and
+   * one that went before this was recorded. */
+  deliveredAt?: number;
+  /** Queued, then never sent: it was still waiting when Bloks restarted
+   * and was too old, or too old a format, to run unattended. Kept in the
+   * transcript for the person to send again if it still matters. */
+  unsent?: boolean;
+  /** A notice about a turn cut off too long ago to pick up on its own:
+   * the lane it belongs to, for the Continue button, and `done` once it
+   * has been pressed or the conversation has moved on. */
+  carryOn?: { laneId: string; done?: boolean };
   /** When this message was last edited. Absent means never. */
   editedAt?: number;
+  /** What recall found in the agent's other conversations and memory
+   * files and added to the turn this message started, in the turn's own
+   * words and never its standing prompt. Only on the person's own message
+   * in an agent's conversation, and never shown to another agent. */
+  recalled?: RecalledNote[];
   /** Taken back. The row stays so replies pointing at it still make
    * sense and the transcript keeps its shape, but the words are gone
    * and no engine sees it again. */
@@ -172,11 +311,20 @@ export interface Message {
 export interface TaskRecord {
   /** Which provider instance last dispatched here. A different one next
    * time means that engine missed everything since and needs the story
-   * replayed. Never shipped to clients. */
+   * replayed. Empty when the session that served it was dropped
+   * (dropSession), which every engine counts as different. Never shipped
+   * to clients. */
   lastInstanceId?: string;
+  /** The CLI command this lane's engine was last told to run. A resumed
+   * session told something else gets a note saying so. Never shipped. */
+  briefedCli?: string;
   id: ThreadId;
   title: string;
   busy?: boolean;
+  /** Something landed here that nobody has read. Per lane, so opening an
+   * agent can go to the conversation that pinged you rather than the one
+   * you last had open; the agent's own flag is "any of these". */
+  unread?: boolean;
   /** The folder this lane's session is pinned to. Engines key their
    * sessions to a directory, so a lane keeps the folder its first turn
    * ran in even if the bot's setting changes later. null means "the
@@ -198,18 +346,45 @@ export interface TaskRecord {
      * whole. Absent means the whole covered part is in the summary. */
     microFrom?: number;
   };
-  /** Input tokens on the last turn, which is the closest thing to "how
-   * full is this lane" that a provider tells us. */
+  /** Input tokens on the last turn, kept with the lane's usage. Not how
+   * full the lane is: a turn of many requests sums them all, so nothing
+   * reads it for that any more. */
   lastInput?: number;
+  /** How full this lane's session is, in the engine's own numbers, with
+   * the engine and model that measured it (server/context.ts). The only
+   * measure there is: a lane without one from the engine and model it is
+   * on now has no fill. */
+  reading?: Reading;
+  /** One compaction waiting for its first subsequent request. Kept on
+   * the lane so an idle compaction can be completed after a restart. */
+  pendingCompaction?: {
+    threadId: string;
+    messageId: string;
+    instanceId: string;
+    model: string | null;
+    sessionId: string | null;
+  };
   /** Per-engine conversation cursors, one set per lane so parallel
    * lanes never share a session. */
   resumeCursors: Record<string, unknown>;
   createdAt: number;
+  /** Mail from senders the owner has not listed is answered here, and
+   * nothing of the owner's runs here unasked (drainMail in
+   * server/index.ts). Marked rather than known by its title, which the
+   * person may change. */
+  guestMail?: boolean;
+  /** What this lane keeps working toward, turn after turn, until it is
+   * done, blocked or out of turns (server/goals.ts). Goes with the lane:
+   * closed or cleared, the goal is gone too. */
+  goal?: Goal;
 }
 
-/** A bot runs at most this many lanes: enough to feel parallel, few
- * enough that each still gets real attention and real compute. */
-export const MAX_TASKS = 3;
+/** How many lanes an agent keeps open. Once three, which ran out as soon
+ * as each conversation was about one thing, and sooner still because
+ * routines and other background work open lanes of their own. This bound
+ * is only about keeping the list sane; each lane still runs one turn at a
+ * time. */
+export const MAX_TASKS = 20;
 
 export interface BotRecord {
   id: string;
@@ -229,6 +404,9 @@ export interface BotRecord {
   /** How senior this agent is in a room, 1 to 5. The most senior member
    * of a room carries the final call when members disagree. */
   seniority?: number;
+  /** The agent that hired this one, when an agent did. One of the two
+   * relationships that let one agent stop another's turn (GitHub 141). */
+  hiredBy?: string;
   /** How hard the engine should think, where the engine has the dial.
    * Unset means the engine's own default. */
   effort?: "low" | "medium" | "high";
@@ -269,12 +447,35 @@ export interface BotRecord {
   /** Read replies aloud as they settle, even outside a call. Off by
    * default: speech is billed per character. */
   speakReplies?: boolean;
+  /** False keeps Claude Code's plugin and settings hooks out of this
+   * agent's turns: a plugin's session-start text otherwise arrives in the
+   * agent's context, where it reads like an injected instruction. */
+  engineHooks?: boolean;
+  /** False stops recall before this agent's turns (the workspace switch
+   * is `recall.beforeTurn` in config.json). Unset is on. */
+  recallBeforeTurn?: boolean;
   /** Components this agent may not answer with. By exclusion rather than
    * by grant: withholding one from one agent should not touch anybody
    * else, and a list of everything permitted goes stale as the gallery
    * grows. See server/components.ts. */
   withoutComponents?: string[];
+  /** Held in place in the sidebar rather than sorted by activity. */
   pinned?: boolean;
+  /** Where a pinned agent stands among the pins of its section, 1 first,
+   * rooms and agents counted together. Null on a pin given no place yet,
+   * which stands after the placed ones, and on an agent that is not
+   * pinned. Null rather than absent once it has been set, so a client
+   * merging a patch cannot keep a place the agent no longer has. The
+   * order itself is compareRows in src/lib/sections.ts. */
+  pinOrder?: number | null;
+  /** When this agent last had something to do with the person, in ms:
+   * the person's own message to it, a reply in a turn the person
+   * started, or anything asking something of them (server/activity.ts,
+   * towardYou). Another agent's message, a routine, a watcher or a job
+   * waking it, does not move it. 0 means never; absent only on a record
+   * from before this was kept, until the first start seeds it from the
+   * transcripts. Unpinned agents sort by it, most recent first. */
+  activeWithYouAt?: number;
   hidden?: boolean;
   /** The sidebar heading this agent files under. One namespace shared
    * with rooms; absent or null means the plain Agents list. */
@@ -286,7 +487,7 @@ export interface BotRecord {
    * Deny rules outrank every mode: a mode is a wider allow, never a
    * way past something the user forbade.
    */
-  approvals?: "ask" | "edits" | "auto";
+  approvals?: "ask" | "edits" | "auto" | "full";
   /**
    * Retired rather than destroyed. Set instead of the record being
    * deleted, so an agent stops appearing and stops working without
@@ -298,6 +499,10 @@ export interface BotRecord {
    * still be in an older phone's list, live and unanswerable.
    */
   archivedAt?: number;
+  /** The agent that archived it, when one did rather than the person,
+   * and the note it left: which work it judged finished (GitHub 148). */
+  archivedBy?: string;
+  archiveNote?: string;
   /** Derived: true while ANY task runs. Task-level busy is the gate;
    * this stays for sidebar and composer affordances. */
   busy?: boolean;
@@ -307,6 +512,14 @@ export interface BotRecord {
 }
 
 const BOTS_FILE = join(DATA_DIR, "bots.json");
+
+/** Writes a file so that it is either the old one or the new one, never
+ * half of each: written aside, then renamed over. A crash mid-save used to
+ * leave bots.json cut short, and a bots.json that does not parse loads as
+ * no agents at all. Not flushed: these are rewritten on every message. */
+function writeWhole(file: string, text: string) {
+  writeFileAtomic(file, text, undefined, { flush: false });
+}
 const messagesFile = (threadId: string) => join(DATA_DIR, `messages-${threadId}.json`);
 
 const COLORS: BlokColor[] = [
@@ -350,29 +563,24 @@ export interface NewBotProfile {
 
 const DEFAULT_GREETING = "I'm ready. Tell me what you need and I'll get to work.";
 
-const DEFAULT_SETUP: OptionCardData = {
-  title: "How should we work together?",
-  subtitle: "This shapes how much I check in versus just handle things.",
-  options: [
-    "Check with me before acting",
-    "Act on the small stuff, ask on the big",
-    "Keep me posted, I trust you",
-  ],
-};
-
 export class Store {
   bots: BotRecord[] = [];
   private messages = new Map<string, Message[]>();
   private defaultSelection: () => ModelSelection;
+  /** Told about every message as it is written. Messages arrive through
+   * forty-odd doors, and something that cares about all of them (who the
+   * person has been with, in server/index.ts) watches this one instead. */
+  onAppend?: (threadId: string, message: Message) => void;
+  /** Told when messages already written change or move (`changed`, as
+   * they are now), or a whole transcript goes (null), so anything built
+   * from the transcripts (the recall index in server/index.ts) can check
+   * what it holds rather than be rebuilt on every write. */
+  onRewrite?: (threadId: string, changed: readonly Message[] | null) => void;
 
   constructor(defaultSelection: () => ModelSelection) {
     this.defaultSelection = defaultSelection;
     mkdirSync(DATA_DIR, { recursive: true });
-    try {
-      this.bots = JSON.parse(readFileSync(BOTS_FILE, "utf8"));
-    } catch {
-      this.bots = [];
-    }
+    this.bots = readSaved<BotRecord[]>(BOTS_FILE, [], Array.isArray);
     // busy never survives a restart, no turn does either
     for (const b of this.bots) {
       b.busy = false;
@@ -389,7 +597,16 @@ export class Store {
         ];
         b.activeTaskId = b.threadId;
       }
-      for (const t of b.tasks) t.busy = false;
+      for (const t of b.tasks) {
+        t.busy = false;
+        // a goal is read back as one or not at all: what drives turns
+        // unattended is not something to guess the shape of
+        if (t.goal !== undefined) {
+          const goal = readGoal(t.goal);
+          if (goal) t.goal = goal;
+          else delete t.goal;
+        }
+      }
       if (!b.activeTaskId || !b.tasks.some((t) => t.id === b.activeTaskId)) {
         b.activeTaskId = b.tasks[0].id;
         b.threadId = b.tasks[0].id;
@@ -398,17 +615,13 @@ export class Store {
   }
 
   private saveBots() {
-    writeFileSync(BOTS_FILE, JSON.stringify(this.bots, null, 2));
+    writeWhole(BOTS_FILE, JSON.stringify(this.bots, null, 2));
   }
 
   messagesFor(threadId: string): Message[] {
     let list = this.messages.get(threadId);
     if (!list) {
-      try {
-        list = JSON.parse(readFileSync(messagesFile(threadId), "utf8"));
-      } catch {
-        list = [];
-      }
+      list = readSaved<Message[]>(messagesFile(threadId), [], Array.isArray);
       this.messages.set(threadId, list!);
     }
     return list!;
@@ -418,7 +631,8 @@ export class Store {
     const full: Message = { id: newId(), at: Date.now(), ...message };
     const list = this.messagesFor(threadId);
     list.push(full);
-    writeFileSync(messagesFile(threadId), JSON.stringify(list, null, 2));
+    writeWhole(messagesFile(threadId), JSON.stringify(list, null, 2));
+    this.onAppend?.(threadId, full);
     return full;
   }
 
@@ -464,8 +678,50 @@ export class Store {
     // two apart, so it kept the card on every deletion.
     const card = "card" in patch ? patch.card : list[idx].card;
     list[idx] = { ...list[idx], ...patch, card };
-    writeFileSync(messagesFile(threadId), JSON.stringify(list, null, 2));
+    writeWhole(messagesFile(threadId), JSON.stringify(list, null, 2));
+    this.onRewrite?.(threadId, [list[idx]]);
     return list[idx];
+  }
+
+  /**
+   * Takes messages out of where they are and puts them at the end of the
+   * transcript, in the order given, each changed by `patch` on the way.
+   * A queued message waits outside the conversation and enters it when
+   * it goes, after everything said while it waited, so the order on disk
+   * is the order the agent heard things in (GitHub 170). Ids stay as
+   * they are, so a reply, an edit or a deletion still finds the message.
+   */
+  moveToEnd(threadId: string, messageIds: readonly string[], patch: (m: Message) => Partial<Message>): Message[] {
+    const list = this.messagesFor(threadId);
+    const moved: Message[] = [];
+    for (const id of messageIds) {
+      const idx = list.findIndex((m) => m.id === id);
+      if (idx === -1) continue;
+      const [message] = list.splice(idx, 1);
+      moved.push({ ...message, ...patch(message) });
+    }
+    if (!moved.length) return [];
+    list.push(...moved);
+    writeWhole(messagesFile(threadId), JSON.stringify(list, null, 2));
+    this.onRewrite?.(threadId, moved);
+    return moved;
+  }
+
+  /** Several request markers change together, without moving their
+   * transcript positions. A crash cannot leave half a burst claimed. */
+  patchMessages(threadId: string, messageIds: readonly string[], patch: (m: Message) => Partial<Message>): Message[] {
+    const ids = new Set(messageIds);
+    const changed: Message[] = [];
+    const list = this.messagesFor(threadId);
+    for (let i = 0; i < list.length; i++) if (ids.has(list[i].id)) {
+      list[i] = { ...list[i], ...patch(list[i]) };
+      changed.push(list[i]);
+    }
+    if (changed.length) {
+      writeWhole(messagesFile(threadId), JSON.stringify(list, null, 2));
+      this.onRewrite?.(threadId, changed);
+    }
+    return changed;
   }
 
   bot(id: string) {
@@ -477,8 +733,11 @@ export class Store {
     return this.bots.find((b) => b.tasks.some((t) => t.id === threadId)) ?? null;
   }
 
-  /** Creates an agent, seeded with its role's own greeting and setup
-   * question, a new agent is never anonymous or generically onboarded. */
+  /** Creates an agent, seeded with its role's own greeting and, when the
+   * caller brings one, its setup question. No question is invented for a
+   * caller that sent none: answering one only posts its text, so a stock
+   * "how should we work together" asks about approvals without setting
+   * them, on every agent another agent hires. */
   createBot(profile: NewBotProfile = {}): BotRecord {
     const bot: BotRecord = {
       id: newId(),
@@ -497,6 +756,9 @@ export class Store {
       modelSelection: this.defaultSelection(),
       resumeCursors: {},
       createdAt: Date.now(),
+      // nothing with the person yet; a route the person made it through
+      // says otherwise
+      activeWithYouAt: 0,
       tasks: [],
       activeTaskId: "",
     };
@@ -509,11 +771,9 @@ export class Store {
       kind: "text",
       text: profile.greeting?.trim() || DEFAULT_GREETING,
     });
-    this.appendMessage(bot.threadId, {
-      role: "bot",
-      kind: "options",
-      card: profile.setup ?? DEFAULT_SETUP,
-    });
+    if (profile.setup) {
+      this.appendMessage(bot.threadId, { role: "bot", kind: "options", card: profile.setup });
+    }
     return bot;
   }
 
@@ -525,12 +785,30 @@ export class Store {
    * agent in the list that cannot answer, or one out of the list that
    * can. Written here so no call site can get the pair wrong.
    */
-  archiveBot(id: string, now: number): BotRecord | null {
+  archiveBot(id: string, now: number, by?: { botId: string; note?: string }): BotRecord | null {
     const bot = this.bot(id);
     if (!bot || bot.archivedAt) return null;
+    const before = { hidden: bot.hidden, archivedBy: bot.archivedBy, archiveNote: bot.archiveNote };
     bot.archivedAt = now;
     bot.hidden = true;
-    this.saveBots();
+    if (by) {
+      bot.archivedBy = by.botId;
+      if (by.note) bot.archiveNote = by.note;
+      else delete bot.archiveNote;
+    }
+    try {
+      this.saveBots();
+    } catch (e) {
+      // not saved is not archived: the agent stays as it was, in service
+      delete bot.archivedAt;
+      bot.hidden = before.hidden;
+      bot.archivedBy = before.archivedBy;
+      bot.archiveNote = before.archiveNote;
+      if (bot.hidden === undefined) delete bot.hidden;
+      if (bot.archivedBy === undefined) delete bot.archivedBy;
+      if (bot.archiveNote === undefined) delete bot.archiveNote;
+      throw e;
+    }
     return bot;
   }
 
@@ -548,6 +826,8 @@ export class Store {
     if (!bot || (!bot.archivedAt && !bot.hidden)) return null;
     delete bot.archivedAt;
     delete bot.hidden;
+    delete bot.archivedBy;
+    delete bot.archiveNote;
     this.saveBots();
     return bot;
   }
@@ -556,12 +836,7 @@ export class Store {
     const bot = this.bot(id);
     if (!bot) return false;
     this.bots = this.bots.filter((b) => b.id !== id);
-    for (const task of bot.tasks) {
-      this.messages.delete(task.id);
-      try {
-        unlinkSync(messagesFile(task.id));
-      } catch {}
-    }
+    for (const task of bot.tasks) this.dropTranscript(task.id);
     this.saveBots();
     return true;
   }
@@ -569,9 +844,31 @@ export class Store {
   patchBot(id: string, patch: Partial<BotRecord>): BotRecord | null {
     const bot = this.bot(id);
     if (!bot) return null;
+    if (patch.modelSelection) this.cancelPendingForSelection(bot, patch.modelSelection);
     Object.assign(bot, patch);
     this.saveBots();
     return bot;
+  }
+
+  /** Several agents at once, written once: moving one pin renumbers its
+   * neighbours, and a file written per neighbour is a file half written
+   * if anything stops partway. Returns the agents that exist. */
+  patchBots(changes: ReadonlyArray<{ id: string; patch: Partial<BotRecord> }>): BotRecord[] {
+    const changed: BotRecord[] = [];
+    for (const { id, patch } of changes) {
+      const bot = this.bot(id);
+      if (!bot) continue;
+      if (patch.modelSelection) this.cancelPendingForSelection(bot, patch.modelSelection);
+      Object.assign(bot, patch);
+      changed.push(bot);
+    }
+    if (changed.length) this.saveBots();
+    return changed;
+  }
+
+  private cancelPendingForSelection(bot: BotRecord, selection: ModelSelection) {
+    if (bot.modelSelection.instanceId === selection.instanceId && (bot.modelSelection.model ?? null) === (selection.model ?? null)) return;
+    for (const task of bot.tasks) delete task.pendingCompaction;
   }
 
   /** Cursors are per-lane: the thread that produced the session owns it. */
@@ -601,6 +898,14 @@ export class Store {
     return task;
   }
 
+  /** Mark the lane strangers' mail is answered in (TaskRecord.guestMail). */
+  markGuestMail(threadId: string) {
+    const found = this.taskByThread(threadId);
+    if (!found || found.task.guestMail) return;
+    found.task.guestMail = true;
+    this.saveBots();
+  }
+
   setActiveTask(botId: string, taskId: string): boolean {
     const bot = this.bot(botId);
     const task = bot?.tasks.find((t) => t.id === taskId);
@@ -611,24 +916,61 @@ export class Store {
     return true;
   }
 
-  /** Closing a lane deletes its transcript; the last lane never closes. */
-  deleteTask(botId: string, taskId: string): "ok" | "busy" | "last" | "missing" {
+  /** Closing a lane deletes it and its transcript. General, the first
+   * lane, is never closed; it is cleared instead. */
+  deleteTask(botId: string, taskId: string): "ok" | "busy" | "missing" | "general" {
     const bot = this.bot(botId);
     const task = bot?.tasks.find((t) => t.id === taskId);
     if (!bot || !task) return "missing";
     if (task.busy) return "busy";
-    if (bot.tasks.length <= 1) return "last";
+    if (task === bot.tasks[0]) return "general";
+
     bot.tasks = bot.tasks.filter((t) => t.id !== taskId);
-    this.messages.delete(task.id);
-    try {
-      unlinkSync(messagesFile(task.id));
-    } catch {}
+    this.dropTranscript(task.id);
+    // a closed lane's unread goes with it
+    bot.unread = bot.tasks.some((t) => t.unread);
     if (bot.activeTaskId === task.id) {
       this.setActiveTask(botId, bot.tasks[0].id);
     } else {
       this.saveBots();
     }
     return "ok";
+  }
+
+  /** Clearing a lane empties it in place: the same id and title, with a
+   * fresh transcript and session. */
+  clearTask(botId: string, taskId: string): "ok" | "busy" | "missing" {
+    const bot = this.bot(botId);
+    const index = bot?.tasks.findIndex(({ id }) => id === taskId) ?? -1;
+    if (!bot || index < 0) return "missing";
+
+    const task = bot.tasks[index];
+    if (task.busy) return "busy";
+
+    bot.tasks[index] = { id: task.id, title: task.title, resumeCursors: {}, createdAt: Date.now() };
+    this.dropTranscript(task.id);
+    bot.unread = bot.tasks.some(({ unread }) => unread);
+    this.saveBots();
+    return "ok";
+  }
+
+  private dropTranscript(taskId: string) {
+    this.messages.delete(taskId);
+    try {
+      unlinkSync(messagesFile(taskId));
+    } catch {}
+    this.onRewrite?.(taskId, null);
+  }
+
+  /** Read or unread, one lane at a time, with the agent's flag following
+   * as "any lane unread" so every older reader of it stays right. */
+  markLane(botId: string, taskId: string, unread: boolean) {
+    const bot = this.bot(botId);
+    const task = bot?.tasks.find((t) => t.id === taskId);
+    if (!bot || !task) return;
+    task.unread = unread || undefined;
+    bot.unread = bot.tasks.some((t) => t.unread);
+    this.saveBots();
   }
 
   patchTaskTitle(botId: string, taskId: string, title: string) {
@@ -651,7 +993,7 @@ export class Store {
   }
 
   /** A settled turn's tokens fold into its lane's lifetime tally. */
-  addTaskUsage(threadId: string, input: number, output: number) {
+  addTaskUsage(threadId: string, input: number, output: number, fill?: number) {
     const found = this.taskByThread(threadId);
     if (!found) return;
     const safe = (n: number) => Math.max(0, Math.trunc(Number.isFinite(n) ? n : 0));
@@ -661,8 +1003,9 @@ export class Store {
     usage.turns += 1;
     found.task.usage = usage;
     // The last turn's input is how full this lane was, which is what the
-    // ring shows. A running total is a different question.
-    found.task.lastInput = safe(input);
+    // ring shows. A running total is a different question. A turn that
+    // compacted the session says how full it is now instead (`fill`).
+    found.task.lastInput = safe(fill ?? input);
     this.saveBots();
   }
 
@@ -681,6 +1024,24 @@ export class Store {
     return changed;
   }
 
+  /** Questions and approvals in a thread that a stopped engine was
+   * waiting on, settled as cut off. The engine process that held each
+   * request is gone, and a new one may number its own requests the same
+   * way, so an answer to an old card must never reach it as permission.
+   * A workflow's card waits on disk rather than on an engine, and stays. */
+  settleOpenAsks(threadId: string): Message[] {
+    const changed: Message[] = [];
+    for (const message of this.messagesFor(threadId)) {
+      const card = message.card;
+      if (message.kind !== "options" || !card?.requestId || card.runId || card.answered || card.dismissed) continue;
+      const patched = this.patchMessage(threadId, message.id, {
+        card: { ...card, answered: "Cut off when Bloks stopped", cutOff: true },
+      });
+      if (patched) changed.push(patched);
+    }
+    return changed;
+  }
+
   /** A lane starts a new engine session on its next turn, replaying
    * only what is still in its transcript. Every engine's cursor goes,
    * because each of them remembers the part being taken back. */
@@ -689,7 +1050,110 @@ export class Store {
     if (!found) return;
     found.task.resumeCursors = {};
     delete found.task.lastInstanceId;
+    // a reading measured a session that is not coming back
+    delete found.task.reading;
+    delete found.task.pendingCompaction;
     this.saveBots();
+  }
+
+  /** A new engine session on the lane's next turn, without the old one's
+   * context: every cursor goes, but the engine that served it is kept, so
+   * the next turn is not treated as an engine that missed the conversation
+   * and handed the whole transcript instead (GitHub 139). The transcript
+   * itself stays. */
+  startFreshSession(threadId: string) {
+    const found = this.taskByThread(threadId);
+    if (!found) return;
+    found.task.resumeCursors = {};
+    delete found.task.reading;
+    delete found.task.pendingCompaction;
+    this.saveBots();
+  }
+
+  /** One engine's session in a lane that must never be resumed: a safety
+   * refusal, which the session goes on refusing (GitHub 284). Its cursor
+   * goes, and the lane is marked as served by no engine in particular
+   * (an empty lastInstanceId), so whichever engine takes the next turn
+   * is told the conversation so far rather than starting blank or
+   * resuming a session that missed the last turns. */
+  dropSession(threadId: string, instanceId: string) {
+    const found = this.taskByThread(threadId);
+    if (!found) return;
+    delete found.task.resumeCursors[instanceId];
+    found.task.lastInstanceId = "";
+    if (found.task.reading?.instanceId === instanceId) delete found.task.reading;
+    if (found.task.pendingCompaction?.instanceId === instanceId) delete found.task.pendingCompaction;
+    this.saveBots();
+  }
+
+  /**
+   * Fold an engine's word on how full a lane is into what the lane knows.
+   * A part it did not say keeps its last value, but only from the same
+   * engine and model: a window measured by another is not this one's.
+   */
+  noteReading(
+    threadId: string,
+    by: { instanceId: string; model: string | null },
+    said: { used: number | null; window: number | null },
+    at = Date.now(),
+  ) {
+    const found = this.taskByThread(threadId);
+    if (!found) return;
+    const was = found.task.reading;
+    const same = was && was.instanceId === by.instanceId && (was.model ?? null) === by.model ? was : null;
+    const used = said.used ?? same?.used ?? 0;
+    const window = said.window ?? same?.window ?? null;
+    const next = { used: Math.max(0, Math.round(used)), window, instanceId: by.instanceId, model: by.model, at };
+    found.task.reading = next;
+    // a tool loop restates the same numbers often; the file is written
+    // when they change, not each time they are said
+    if (same && same.used === next.used && same.window === next.window) return;
+    this.saveBots();
+  }
+
+  /** Compaction metadata is not a request size. Keep only the matching
+   * window until this session makes its next request. A second boundary
+   * replaces the single pending link, leaving the earlier marker alone. */
+  beginCompaction(threadId: string, by: { instanceId: string; model: string | null }, where: string, messageId: string) {
+    const found = this.taskByThread(threadId);
+    if (!found) return;
+    const own = readingFor(found.task.reading, by);
+    if (own) found.task.reading = { ...own, used: 0, at: Date.now() };
+    else delete found.task.reading;
+    const cursor = found.task.resumeCursors[by.instanceId];
+    found.task.pendingCompaction = { ...by, threadId: where, messageId, sessionId: typeof cursor === "string" ? cursor : null };
+    this.saveBots();
+  }
+
+  /** Only the first real request from the same engine, model and session
+   * completes a marker. Reset or replacement sessions must not pair their
+   * request with a compaction they never went through. */
+  resolveCompaction(threadId: string, by: { instanceId: string; model: string | null }, used: number | null) {
+    const found = this.taskByThread(threadId);
+    const pending = found?.task.pendingCompaction;
+    if (!found || !pending) return null;
+    const cursor = found.task.resumeCursors[by.instanceId];
+    const same = pending.instanceId === by.instanceId && pending.model === by.model
+      && pending.sessionId === (typeof cursor === "string" ? cursor : null);
+    if (same && (typeof used !== "number" || !Number.isFinite(used) || used <= 0)) return null;
+    delete found.task.pendingCompaction;
+    this.saveBots();
+    if (!same) return null;
+    const marker = this.messagesFor(pending.threadId).find((m) => m.id === pending.messageId);
+    if (!marker?.compaction || marker.deleted) return null;
+    const compaction = { ...marker.compaction, after: Math.round(used!) };
+    const message = this.patchMessage(pending.threadId, pending.messageId, { compaction, text: compactedNotice(compaction) });
+    return message ? { threadId: pending.threadId, message } : null;
+  }
+
+  /** A lane's goal, set, moved on or cleared (undefined). */
+  setTaskGoal(threadId: string, goal: Goal | undefined): Goal | undefined {
+    const found = this.taskByThread(threadId);
+    if (!found) return undefined;
+    if (goal) found.task.goal = goal;
+    else delete found.task.goal;
+    this.saveBots();
+    return found.task.goal;
   }
 
   /** Record what a lane's earlier messages were folded into. */
@@ -704,11 +1168,14 @@ export class Store {
     this.saveBots();
   }
 
-  markTaskDispatched(botId: string, taskId: string, instanceId: string): void {
+  markTaskDispatched(botId: string, taskId: string, instanceId: string, cli?: string): void {
     const bot = this.bot(botId);
     const task = bot?.tasks.find((t) => t.id === taskId);
-    if (!task || task.lastInstanceId === instanceId) return;
+    if (!task) return;
+    const cliChanged = cli !== undefined && task.briefedCli !== cli;
+    if (task.lastInstanceId === instanceId && !cliChanged) return;
     task.lastInstanceId = instanceId;
+    if (cliChanged) task.briefedCli = cli;
     this.saveBots();
   }
 

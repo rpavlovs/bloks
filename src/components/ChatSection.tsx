@@ -11,6 +11,7 @@ import { api } from "@/state/store";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { usePageVisible } from "@/lib/pageVisible";
 
 type Platform = "slack" | "discord";
 
@@ -44,12 +45,15 @@ export function ChatSection() {
       .then(setStatus)
       .catch(() => setStatus(null));
 
+  // the connection settles a moment after it is saved, so this looks
+  // again, but only while somebody can see the answer
+  const visible = usePageVisible();
   useEffect(() => {
+    if (!visible) return;
     void load();
-    // the connection settles a moment after it is saved
     const timer = setInterval(() => void load(), 4000);
     return () => clearInterval(timer);
-  }, []);
+  }, [visible]);
 
   if (!status) return null;
   return (
@@ -352,7 +356,7 @@ function EmailCard() {
       </div>
       {!status.cloud && !status.enabled && (
         <div className="mt-3 rounded-lg bg-muted/60 px-3 py-2 text-[12px] leading-relaxed text-muted-foreground">
-          Needs Bloks Cloud: mail reaches this computer through it. Turn it on in Settings, Devices.
+          Needs Bloks Cloud: mail reaches this computer through it. Turn it on under Bloks Cloud.
         </div>
       )}
       {status.enabled && (
@@ -365,6 +369,8 @@ function EmailCard() {
           <div className="mt-3 border-t pt-3">
             <div className="text-[12px] text-muted-foreground">
               Who may write. Leave it empty and anyone with an address can; list addresses or @domains to allow only them.
+              While it is empty, mail is answered in its own conversation and in words only: no tools, none of your apps,
+              secrets, notes or past conversations, and only by agents on Claude Code or an API model.
             </div>
             <div className="mt-1.5 flex gap-2">
               <Input

@@ -17,8 +17,7 @@
 //
 // stdout carries the protocol. Nothing may ever be printed to it.
 import { readJsonLines } from "./ndjson.ts";
-
-const BOX_API = "https://ascii.dev/api/box/v1";
+import { BOAT_API } from "./boat.ts";
 const boxId = process.env.BLOKS_BOX_ID ?? "";
 const token = process.env.BLOKS_BOX_TOKEN ?? "";
 
@@ -33,10 +32,10 @@ const WITH_DISPLAY = "export DISPLAY=${DISPLAY:-:0}; ";
 // ── talking to the box ─────────────────────────────────────────────────
 
 async function runOnBox(command: string, timeoutMs = 60_000) {
-  const response = await fetch(`${BOX_API}/boxes/${boxId}/commands`, {
+  const response = await fetch(`${BOAT_API}/sandboxes/${boxId}/commands`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({ command }),
+    body: JSON.stringify({ command, timeoutSeconds: Math.min(600, Math.max(1, Math.ceil(timeoutMs / 1000))) }),
     signal: AbortSignal.timeout(timeoutMs),
   });
   const body: any = await response.json().catch(() => null);
@@ -51,7 +50,7 @@ async function runOnBox(command: string, timeoutMs = 60_000) {
 
 async function readBoxFile(path: string): Promise<string | null> {
   const response = await fetch(
-    `${BOX_API}/boxes/${boxId}/files?path=${encodeURIComponent(path)}&encoding=base64`,
+    `${BOAT_API}/sandboxes/${boxId}/files?path=${encodeURIComponent(path)}&encoding=base64`,
     { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(30_000) },
   );
   const body: any = await response.json().catch(() => null);

@@ -15,6 +15,8 @@ import { AgentAvatar } from "./Avatar";
 import { ChangesCard } from "./ChangesCard";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
+import { useEscape } from "@/lib/useEscape";
+import { plural } from "@/lib/plural";
 
 interface Attempt {
   id: string;
@@ -51,12 +53,7 @@ export function RehearsalsPanel() {
   }, []);
   // the server says when anything moves; this re-reads then
   useEffect(load, [load, state.rehearsalsTick]);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  useEscape(close);
 
   // attempts at one task together, newest task first
   const groups = useMemo(() => {
@@ -66,8 +63,7 @@ export function RehearsalsPanel() {
   }, [attempts]);
 
   const open = (a: Attempt) => {
-    dispatch({ type: "select", id: a.botId });
-    dispatch({ type: "selectTask", botId: a.botId, taskId: a.taskId });
+    dispatch({ type: "select", id: a.botId, lane: a.taskId });
     close();
   };
 
@@ -77,7 +73,7 @@ export function RehearsalsPanel() {
       onClick={close}
     >
       <div
-        className="flex h-[84%] w-[980px] max-w-[94vw] animate-pop-in flex-col overflow-hidden rounded-2xl border bg-popover shadow-2xl shadow-[--shadow-color]"
+        className="flex h-[84%] w-[980px] max-w-[94vw] animate-pop-in flex-col overflow-hidden rounded-2xl border bg-popover shadow-2xl shadow-(color:--shadow-color)"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-label="Rehearsals"
@@ -125,7 +121,7 @@ export function RehearsalsPanel() {
                       </div>
                       {group.length > 1 && (
                         <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                          {group.length} attempts
+                          {plural(group.length, "attempt")}
                         </span>
                       )}
                     </div>

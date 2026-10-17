@@ -9,6 +9,11 @@
 // The grammar is the GitHub one, because that is what models emit: a
 // header row, a delimiter row of dashes with optional colons for
 // alignment, then body rows. Outer pipes are optional on every row.
+//
+// Code fences are the other thing that only means something as a whole,
+// and they come first: nothing inside a fence is a table, a heading or a
+// bullet, it is code. A fence still open at the end is code too, because
+// a reply that is still streaming has not reached its closing fence yet.
 
 export type Align = "left" | "center" | "right";
 
@@ -27,7 +32,16 @@ export interface LinesBlock {
   offset: number;
 }
 
-export type Block = TableBlock | LinesBlock;
+export interface CodeBlock {
+  kind: "code";
+  /** Whatever followed the opening fence, if anything ("ts", "sh"). */
+  lang: string;
+  code: string;
+}
+
+export type Block = TableBlock | LinesBlock | CodeBlock;
+
+const FENCE_OPEN = /^\s*(```|~~~)\s*([\w+#.-]*)\s*$/;
 
 /** Split one row into cells. Outer pipes are optional; an escaped \| is
  * a literal pipe rather than a cell boundary. */
@@ -91,6 +105,18 @@ export function splitBlocks(text: string): Block[] {
 
   for (let i = 0; i < lines.length; i++) {
     const header = lines[i];
+    const fence = header.match(FENCE_OPEN);
+    if (fence) {
+      const close = fence[1];
+      const body: string[] = [];
+      let j = i + 1;
+      for (; j < lines.length && lines[j].trim() !== close; j++) body.push(lines[j]);
+      flush();
+      blocks.push({ kind: "code", lang: fence[2], code: body.join("\n") });
+      i = j;
+      pendingAt = j + 1;
+      continue;
+    }
     const aligns = i + 1 < lines.length ? alignmentsOf(lines[i + 1]) : null;
     if (!aligns || !looksLikeRow(header)) {
       if (!pending.length) pendingAt = i;
@@ -124,6 +150,11 @@ export function splitBlocks(text: string): Block[] {
 }
 
 /** Whether the text holds at least one table, without building blocks. */
+/** Whether the text holds anything but plain lines: a table or code. */
+export function hasBlocks(text: string): boolean {
+  return splitBlocks(text).some((block) => block.kind !== "lines");
+}
+
 export function hasTable(text: string): boolean {
   return splitBlocks(text).some((block) => block.kind === "table");
 }

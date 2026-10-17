@@ -27,13 +27,31 @@ import { gzipSync } from "node:zlib";
 import type { IncomingMessage } from "node:http";
 
 import { deviceKey, inviteKey, open, peek, seal, type Envelope, type RelayRequest } from "./relay-crypto.ts";
-import { pairedDevices } from "./pairing.ts";
+import { markSeen, pairedDevices } from "./pairing.ts";
 
 /** What to call the machine this harness runs on. Bloks ships on
  * Windows and Linux too, where "the Mac" reads as a copy-paste slip
  * rather than a description. */
 function thisMachine(): string {
   return process.platform === "darwin" ? "this Mac" : process.platform === "win32" ? "this PC" : "this computer";
+}
+
+/** Why the line went down, in words a settings screen can show. Node's
+ * fetch says only "fetch failed" and keeps the reason in its cause, and
+ * an abort here is the watchdog, which means nothing arrived in time.
+ * Never the request itself: that carries the token. */
+function lineProblem(e: unknown): string {
+  if (!(e instanceof Error)) return "the line failed";
+  if (e.name === "AbortError") return "nothing came back for a minute. A proxy or an antivirus that inspects secure connections can hold it back.";
+  const cause = (e as { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    const code = (cause as { code?: unknown }).code;
+    if (typeof code === "string" && /CERT|SELF_SIGNED|ISSUER/.test(code)) {
+      return "the secure connection was not trusted. A proxy or an antivirus that inspects secure connections is the usual cause.";
+    }
+    return typeof code === "string" ? `${cause.message} (${code})` : cause.message;
+  }
+  return e.message;
 }
 
 /** Proof that a replayed request came from this process, so the HTTP
@@ -59,6 +77,10 @@ export function relayInviteFor(req: IncomingMessage): string | null {
 const INVITE_ROUTES = new Set(["POST /api/member/claim", "GET /api/member/claim"]);
 /** The relay takes 2 MB a payload; sealing and base64 add about a third. */
 const MAX_RAW_ANSWER = 1_400_000;
+/** The relay counts the whole result post against its 2 MB and hangs up
+ * past it, which reads here as a lost connection. Stay under with room
+ * for the id and status around the payload. */
+const MAX_RESULT_POST = 1_950_000;
 
 /** Who a wake should reach: everybody (a string) or the phones registered
  * by the named relay client digests. `preview` asks for the notification's
@@ -78,6 +100,16 @@ export interface WakePreview {
   threadId?: string;
 }
 
+/** The build label a sealed request carried, as the header a request on
+ * the network would have sent it in. Shaped like a header value or not at
+ * all: it ends up in one. */
+function clientHeader(request: RelayRequest): Record<string, string> {
+  const label = request.client;
+  return typeof label === "string" && label.length <= 40 && /^[\w .()+/-]+$/.test(label)
+    ? { "x-bloks-client": label }
+    : {};
+}
+
 /** The device id a replayed relay request speaks for, or null for
  * anything that did not come from this file. */
 export function relayDeviceFor(req: IncomingMessage): string | null {
@@ -94,6 +126,11 @@ export interface RelayConfig {
 export interface RelayState {
   configured: boolean;
   connected: boolean;
+  /** Whether what this Mac sends is landing: answers to the phone's
+   * requests and the frames it pushes. The stream coming in is a
+   * separate thing, and on a lossy line it can stay open while replies
+   * go nowhere, so `connected` alone is not "working". */
+  delivering: boolean;
   spaceId: string | null;
   /** Last failure, for the settings screen. Never a secret. */
   problem: string | null;
@@ -101,9 +138,15 @@ export interface RelayState {
 }
 
 const RETRY_MIN_MS = 2_000;
-const RETRY_MAX_MS = 60_000;
+// the cap, which tests shorten to see a refused Mac try again
+const RETRY_MAX_MS = Number(process.env.BLOKS_RELAY_RETRY_MAX_MS) || 60_000;
 /** The relay drops a link it has not heard from; speak well inside that. */
 const KEEPALIVE_MS = 30_000;
+/** One push's limits, well inside the relay's 2 MB body cap. */
+const BATCH_BYTES = 1_500_000;
+const BATCH_FRAMES = 500;
+/** Pushes held while the line is slow, before the oldest are let go. */
+const OUTBOX_LIMIT = 2_000;
 /** No bytes from the relay for this long means a dead socket the OS has
  * not reported. The relay's own keepalive is every 25s, so 60s is two
  * missed beats. */
@@ -112,6 +155,38 @@ const WATCHDOG_MS = 60_000;
  * for a slow relay hop and modest clock skew, tight enough that a
  * captured frame is useless minutes later. */
 const REPLAY_WINDOW_MS = 120_000;
+
+/**
+ * The nonces of mutating requests already served. Each is kept until its
+ * own timestamp stops being fresh, since until then a repeat would pass
+ * the freshness check. Clearing the whole set on a timer used to forget a
+ * nonce while its timestamp could still pass, so a request captured just
+ * before a clear could be replayed once after it. A nonce is kept at most
+ * two windows (a timestamp may be a window ahead of this clock), which is
+ * what bounds the set.
+ */
+export class SeenNonces {
+  private until = new Map<string, number>();
+
+  has(nonce: string): boolean {
+    return this.until.has(nonce);
+  }
+
+  remember(nonce: string, ts: number, now = Date.now()) {
+    for (const [seen, stale] of this.until) if (stale < now) this.until.delete(seen);
+    this.until.set(nonce, ts + REPLAY_WINDOW_MS);
+  }
+}
+/** How long an answer keeps trying. The relay holds a phone's request for
+ * 20s and then tells it the Mac is offline, so past that a retry lands on
+ * nobody; a result it no longer waits for is a harmless 202. */
+const ANSWER_BUDGET_MS = 20_000;
+/** Outbound posts remembered for the health reading. One lost post on a
+ * rough line is noise; half of the recent ones failing is a line that
+ * looks up and is not. */
+const OUTBOUND_WINDOW = 10;
+const OUTBOUND_RECOVER = 3;
+const NOT_DELIVERING = "The line to Bloks Cloud is open, but replies are not getting through. Retrying.";
 
 export class RelayLink {
   private config: RelayConfig | null = null;
@@ -126,12 +201,27 @@ export class RelayLink {
   /** Consecutive failed pushes; enough of them means the line is dead
    * even though its read has not returned yet, so we force a redial. */
   private pushFailures = 0;
+  /** Pushes waiting their turn. They go out one POST at a time, in order:
+   * the relay hands a push's frames on before it answers, so one at a
+   * time keeps a reply's frames in the order they happened all the way
+   * to the phone. Sent all at once, a late delta could land after the
+   * turn ended and the reply showed twice. */
+  private outbox: Array<{ frames: string[]; wake?: unknown }> = [];
+  private pushing = false;
+  /** Recent outbound posts, oldest first: true for one that landed. */
+  private outbound: boolean[] = [];
   /** Nonces of mutating requests served recently, so a hostile relay
    * cannot replay a captured "approve" or "send". Bounded and time-swept;
    * the freshness window makes unbounded growth impossible anyway. */
-  private seenNonces = new Set<string>();
-  private nonceSweep = 0;
-  state: RelayState = { configured: false, connected: false, spaceId: null, problem: null, since: null };
+  private seenNonces = new SeenNonces();
+  state: RelayState = {
+    configured: false,
+    connected: false,
+    delivering: false,
+    spaceId: null,
+    problem: null,
+    since: null,
+  };
 
   /** Where to replay a decrypted request, i.e. our own loopback port. */
   private readonly port: number;
@@ -160,6 +250,10 @@ export class RelayLink {
    * envelopes are keyed from, and what spending it does. */
   pairSecret: (linkId: string) => string | null = () => null;
   pairClaim: (linkId: string, body: unknown) => unknown | null = () => null;
+  /** Called when the relay refuses this Mac's token. Another Bloks on the
+   * same ~/.bloks (the app beside a headless server) may have activated
+   * Cloud again and saved new tokens this process has not read yet. */
+  onRejected: () => void = () => {};
 
   constructor(port: number, onChange: (state: RelayState) => void = () => {}) {
     this.port = port;
@@ -177,6 +271,7 @@ export class RelayLink {
     this.state = {
       configured: Boolean(this.config),
       connected: false,
+      delivering: false,
       spaceId: null,
       problem: null,
       since: null,
@@ -196,7 +291,7 @@ export class RelayLink {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     if (this.state.connected) {
-      this.state = { ...this.state, connected: false, spaceId: null, since: null };
+      this.state = { ...this.state, connected: false, delivering: false, spaceId: null, since: null };
       this.onChange(this.state);
     }
   }
@@ -237,23 +332,59 @@ export class RelayLink {
       typeof wake === "object"
         ? { reason: wake.reason, ...(wake.clients ? { clients: wake.clients } : {}), ...(Object.keys(sealed).length ? { sealed } : {}) }
         : wake;
-    void fetch(`${this.config.url}/space/agent/events`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ frames, ...(sent ? { wake: sent } : {}) }),
-      signal: AbortSignal.timeout(10_000),
-    })
-      .then((res) => {
-        this.pushFailures = res.ok ? 0 : this.pushFailures + 1;
-        if (this.pushFailures >= 4) this.controller?.abort();
-      })
-      .catch(() => {
+    this.outbox.push({ frames, ...(sent ? { wake: sent } : {}) });
+    // a dead line is caught by the failures below; until then, the oldest
+    // frames are the ones worth least to a phone that catches up anyway
+    if (this.outbox.length > OUTBOX_LIMIT) this.outbox.splice(0, this.outbox.length - OUTBOX_LIMIT);
+    void this.pump();
+  }
+
+  /** Sends what is waiting, one POST at a time. Whatever piled up while one
+   * was in flight goes as one batch, up to the first push that wakes a
+   * phone (a batch carries one wake). */
+  private async pump() {
+    if (this.pushing) return;
+    this.pushing = true;
+    try {
+      while (this.outbox.length && this.config && this.state.connected) {
+        const frames: string[] = [];
+        let wake: unknown;
+        let bytes = 0;
+        while (this.outbox.length) {
+          const next = this.outbox[0];
+          const size = next.frames.reduce((n, f) => n + f.length, 0);
+          if (frames.length && (bytes + size > BATCH_BYTES || frames.length + next.frames.length > BATCH_FRAMES)) break;
+          this.outbox.shift();
+          frames.push(...next.frames);
+          bytes += size;
+          if (next.wake !== undefined) {
+            wake = next.wake;
+            break;
+          }
+        }
+        const ok = await fetch(`${this.config.url}/space/agent/events`, {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify({ frames, ...(wake !== undefined ? { wake } : {}) }),
+          signal: AbortSignal.timeout(10_000),
+        })
+          .then((res) => res.ok)
+          .catch(() => false);
         // A failed push is a dropped frame, not a broken link on its own.
         // But a run of them means the line is dead while its read still
-        // hangs, so force the redial the read has not noticed yet.
-        this.pushFailures++;
-        if (this.pushFailures >= 4) this.controller?.abort();
-      });
+        // hangs, so force the redial the read has not noticed yet. A line
+        // that drops every other post never makes a run, which is what
+        // the health reading is for.
+        this.pushFailures = ok ? 0 : this.pushFailures + 1;
+        this.noteOutbound(ok);
+        if (this.pushFailures >= 4) {
+          this.outbox = [];
+          this.controller?.abort();
+        }
+      }
+    } finally {
+      this.pushing = false;
+    }
   }
 
   /** A relay token of its own for one member, so removing them later does
@@ -369,18 +500,7 @@ export class RelayLink {
     };
   }
 
-  /** Record a nonce and, every so often, forget the whole set. Since a
-   * nonce is only accepted inside the freshness window, anything older is
-   * refused on timestamp anyway, so a periodic clear is safe and bounds
-   * the set without per-entry timers. */
-  private rememberNonce(nonce: string) {
-    this.seenNonces.add(nonce);
-    if (Date.now() - this.nonceSweep > REPLAY_WINDOW_MS) {
-      // keep only this generation; the previous one is now all stale
-      this.seenNonces = new Set([nonce]);
-      this.nonceSweep = Date.now();
-    }
-  }
+
 
   private schedule() {
     if (this.stopped) return;
@@ -411,6 +531,19 @@ export class RelayLink {
       keepalive = watchdog = null;
     };
     const alive = () => !this.stopped && gen === this.generation;
+    // A live relay sends its own keepalive comments every 25s. Nothing
+    // at all for this long is a dead socket the OS has not surfaced yet;
+    // abort and redial rather than hang on undici's minutes-long default.
+    // Armed before the request too: a proxy or a scanning antivirus that
+    // holds the answer back would otherwise leave the dial waiting for
+    // headers forever, with nothing on the screen to say why.
+    let heard = false;
+    const armWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = setTimeout(() => controller.abort(), WATCHDOG_MS);
+      watchdog.unref?.();
+    };
+    armWatchdog();
     try {
       const res = await fetch(`${this.config.url}/space/agent/stream`, {
         headers: { authorization: `Bearer ${this.config.agentToken}` },
@@ -425,29 +558,28 @@ export class RelayLink {
         if (res.status === 401 || res.status === 403) {
           this.setState({
             connected: false,
-            problem: `The relay is not accepting ${thisMachine()} yet. Retrying.`,
+            delivering: false,
+            // The usual cause by far: Cloud was activated again with the
+            // same licence, which retires the space this token belonged to.
+            problem: `Bloks Cloud does not recognise ${thisMachine()}'s space. If Cloud was activated again with this licence, here or elsewhere, activate it again on the computer that should keep it. Retrying.`,
           });
           this.retry = RETRY_MAX_MS;
           this.schedule();
+          this.onRejected();
           return;
         }
         throw new Error(`relay answered ${res.status}`);
       }
 
-      this.setState({ connected: true, problem: null, since: Date.now() });
+      // a fresh line starts trusted; what it sends decides from there
+      this.outbound = [];
+      this.setState({ connected: true, delivering: true, problem: null, since: Date.now() });
       this.pushFailures = 0;
       keepalive = setInterval(() => this.publish({ kind: "ping" }), KEEPALIVE_MS);
       keepalive.unref?.();
 
+      heard = true;
       const reader = res.body.getReader();
-      // A live relay sends its own keepalive comments every 25s. Nothing
-      // at all for this long is a dead socket the OS has not surfaced yet;
-      // abort and redial rather than hang on undici's minutes-long default.
-      const armWatchdog = () => {
-        if (watchdog) clearTimeout(watchdog);
-        watchdog = setTimeout(() => controller.abort(), WATCHDOG_MS);
-        watchdog.unref?.();
-      };
       armWatchdog();
 
       const decoder = new TextDecoder();
@@ -487,8 +619,8 @@ export class RelayLink {
       throw new Error("the relay closed the line");
     } catch (e) {
       if (!alive()) return;
-      const problem = e instanceof Error ? e.message : "relay link failed";
-      this.setState({ connected: false, spaceId: null, since: null, problem });
+      const problem = heard ? lineProblem(e) : `Bloks Cloud could not be reached from ${thisMachine()}: ${lineProblem(e)}`;
+      this.setState({ connected: false, delivering: false, spaceId: null, since: null, problem });
       this.schedule();
     } finally {
       clearTimers();
@@ -533,12 +665,16 @@ export class RelayLink {
       if (!fresh || this.seenNonces.has(request.nonce!)) {
         return void this.answer(id, 409, { error: "stale or replayed request" }, replyKey, device.id);
       }
-      this.rememberNonce(request.nonce!);
+      this.seenNonces.remember(request.nonce!, request.ts!);
     }
     // Only our own API, and never a path that climbs out of it.
     if (!request.path.startsWith("/api/") || request.path.includes("..")) {
       return void this.answer(id, 404, { error: "no such route" }, replyKey, device.id);
     }
+    // Only a request that opened with this device's key and cleared the
+    // checks above counts as the device being here. Without this, a phone
+    // that only ever came through Bloks Cloud never had a last seen time.
+    markSeen(device.id);
 
     if (request.raw) return void this.serveRaw(id, request, replyKey, device.id);
     try {
@@ -549,6 +685,7 @@ export class RelayLink {
           origin: `http://127.0.0.1:${this.port}`,
           [RELAY_HEADER]: INTERNAL,
           [DEVICE_HEADER]: device.id,
+          ...clientHeader(request),
         },
         body: request.body === undefined ? undefined : JSON.stringify(request.body),
         signal: AbortSignal.timeout(15_000),
@@ -593,7 +730,7 @@ export class RelayLink {
       if (!fresh || this.seenNonces.has(request.nonce!)) {
         return void this.answer(id, 409, { error: "stale or replayed request" }, replyKey, inviteId);
       }
-      this.rememberNonce(request.nonce!);
+      this.seenNonces.remember(request.nonce!, request.ts!);
     }
     try {
       const res = await fetch(`http://127.0.0.1:${this.port}${request.path}`, {
@@ -641,6 +778,7 @@ export class RelayLink {
           origin: `http://127.0.0.1:${this.port}`,
           [RELAY_HEADER]: INTERNAL,
           [DEVICE_HEADER]: deviceId,
+          ...clientHeader(request),
         },
         body,
         signal: AbortSignal.timeout(60_000),
@@ -661,12 +799,11 @@ export class RelayLink {
   private answerRaw(id: string, status: number, type: string, z: string, key: Buffer, deviceId: string) {
     if (!this.config) return;
     const payload = seal(key, deviceId, { status, type, z });
-    void fetch(`${this.config.url}/space/agent/result`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ id, status, payload }),
-      signal: AbortSignal.timeout(30_000),
-    }).catch(() => {});
+    const post = JSON.stringify({ id, status, payload });
+    if (post.length > MAX_RESULT_POST) {
+      return this.answer(id, 413, { error: "too large to open through Bloks Cloud" }, key, deviceId);
+    }
+    void this.deliver(post, 15_000);
   }
 
   /**
@@ -691,7 +828,7 @@ export class RelayLink {
       request.nonce.length > 0 &&
       !this.seenNonces.has(request.nonce);
     if (!fresh) return void this.answer(id, 409, { error: "stale or replayed request" }, replyKey, linkId);
-    this.rememberNonce(request.nonce!);
+    this.seenNonces.remember(request.nonce!, request.ts!);
     const claimed = this.pairClaim(linkId, request.body);
     if (!claimed) return void this.answer(id, 410, { error: "this pairing link was already used or has expired" }, replyKey, linkId);
     this.answer(id, 200, claimed, replyKey, linkId);
@@ -713,14 +850,75 @@ export class RelayLink {
     this.answer(id, status, null, null, null);
   }
 
-  private answer(id: string, status: number, body: unknown, key: Buffer | null, deviceId: string | null) {
+  private answer(id: string, status: number, body: unknown, key: Buffer | null, deviceId: string | null): void {
     if (!this.config) return;
     const payload = key && deviceId ? seal(key, deviceId, { status, body }) : "";
-    void fetch(`${this.config.url}/space/agent/result`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ id, status, payload }),
-      signal: AbortSignal.timeout(10_000),
-    }).catch(() => {});
+    const post = JSON.stringify({ id, status, payload });
+    // Too big for the relay: sending it would only be cut off, retried
+    // and cut off again while the phone waits. Say so in a few bytes
+    // instead, so the phone hears why rather than "did not answer".
+    if (post.length > MAX_RESULT_POST && status !== 413) {
+      return this.answer(id, 413, { error: "too large to send through Bloks Cloud" }, key, deviceId);
+    }
+    void this.deliver(post, 8_000);
+  }
+
+  /**
+   * Hand one answer to the relay, and keep at it while the phone is still
+   * waiting. Safe to repeat: the relay settles an ask once and answers any
+   * later copy with a 202. Only a refusal (a 4xx other than a timeout or
+   * a rate limit) stops early, since sending it again changes nothing.
+   */
+  private async deliver(body: string, attemptMs: number): Promise<boolean> {
+    const config = this.config;
+    if (!config) return false;
+    const deadline = Date.now() + ANSWER_BUDGET_MS;
+    for (let attempt = 0; ; attempt++) {
+      const left = deadline - Date.now();
+      // pointed elsewhere or switched off since: this answer belongs to
+      // a line that no longer exists
+      if (left <= 0 || this.config !== config) break;
+      try {
+        const res = await fetch(`${config.url}/space/agent/result`, {
+          method: "POST",
+          headers: this.headers(),
+          body,
+          signal: AbortSignal.timeout(Math.min(attemptMs, left)),
+        });
+        if (res.ok) {
+          this.noteOutbound(true);
+          return true;
+        }
+        if (res.status < 500 && res.status !== 408 && res.status !== 429) break;
+      } catch {
+        // lost on the way; the next attempt may not be
+      }
+      const wait = Math.min(500 * 2 ** attempt, deadline - Date.now());
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait).unref?.());
+    }
+    // A phone just went without its answer. That is not noise to average
+    // away: say so now, and let the next posts that land clear it.
+    if (this.config === config) this.noteOutbound(false, true);
+    return false;
+  }
+
+  /** Keep `delivering` honest. It drops when half the recent posts failed,
+   * or at once when an answer was lost outright, and comes back after a
+   * short run that landed, so one lucky post does not paper over a bad
+   * line. */
+  private noteOutbound(ok: boolean, lost = false) {
+    this.outbound.push(ok);
+    if (this.outbound.length > OUTBOUND_WINDOW) this.outbound.shift();
+    if (!this.state.connected) return;
+    const failed = this.outbound.filter((x) => !x).length;
+    const recent = this.outbound.slice(-OUTBOUND_RECOVER);
+    const delivering = this.state.delivering
+      ? !lost && failed * 2 < OUTBOUND_WINDOW
+      : recent.length === OUTBOUND_RECOVER && recent.every(Boolean);
+    if (delivering === this.state.delivering) return;
+    this.setState({
+      delivering,
+      problem: delivering ? (this.state.problem === NOT_DELIVERING ? null : this.state.problem) : NOT_DELIVERING,
+    });
   }
 }

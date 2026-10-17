@@ -10,7 +10,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { PROVIDER_SPECS } from "../../server/providers.ts";
+
 const ENTRY = fileURLToPath(new URL("../../server/index.ts", import.meta.url));
+
+/** Every provider's key variable (config.ts envVarFor), blanked: a key
+ * there connects that provider, and a test must never reach a real one. */
+const NO_PROVIDER_KEYS = Object.fromEntries(
+  PROVIDER_SPECS.map((spec) => [`${spec.kind.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY`, ""]),
+);
 
 export interface Harness {
   url: string;
@@ -25,12 +33,15 @@ export interface Harness {
    * this drops to node:http, which will. */
   fetchRemote(
     path: string,
-    init?: { method?: string; body?: string; token?: string; origin?: string; host?: string },
+    init?: { method?: string; body?: string; token?: string; origin?: string; host?: string; headers?: Record<string, string> },
   ): Promise<{ status: number; body: any }>;
   /** Everything the harness has printed. A test that cares whether a
    * credential leaked has to look where a leak would actually land. */
   logs(): string;
   stop(): Promise<void>;
+  /** Gone with no chance to tidy up, the way a crash or a force quit
+   * ends it. Whatever the server had on disk stays as it was. */
+  crash(): Promise<void>;
 }
 
 /** `extraEnv` lets one test point the harness somewhere of its own, e.g.
@@ -71,10 +82,20 @@ export async function startHarness(extraEnv: Record<string, string> = {}): Promi
         USERPROFILE: home,
         BLOKS_PORT: String(port),
         // no inherited credentials: a test must never reach a real provider
+        ...NO_PROVIDER_KEYS,
         XAI_API_KEY: "",
         GEMINI_API_KEY: "",
         COMPOSIO_KEY: "",
         BOX_TOKEN: "",
+        BLOKS_COMPOSIO_KEY: "",
+        BLOKS_BOX_TOKEN: "",
+        OPENAI_API_KEY: "",
+        ANTHROPIC_API_KEY: "",
+        // a test run from inside a Bloks agent would otherwise act as it
+        BLOKS_TOKEN: "",
+        // tests speak as the dev UI (origin :5199), which a server serving
+        // its own page does not trust
+        BLOKS_STATIC_DIR: "",
         PATH: "/nonexistent",
         // widenPath adds $npm_config_prefix/bin, which npx exports, and a
         // claude or codex there would make a test's engine real
@@ -83,6 +104,12 @@ export async function startHarness(extraEnv: Record<string, string> = {}): Promi
         // bin/bloks-server.mjs sets this, so a test run from inside a Bloks
         // agent would inherit it and find pairing forced on
         BLOKS_LOOPBACK_ONLY: "",
+        // a failed turn is asked again after a wait (GitHub 284), and a
+        // minute is longer than most tests wait for a turn to settle
+        BLOKS_RETRY_WAIT_MS: "50",
+        // a test file the runner kills mid-run never calls stop(), so the
+        // server watches this process and goes when it does
+        BLOKS_TEST_PARENT_PID: String(process.pid),
         ...extraEnv,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -125,10 +152,21 @@ export async function startHarness(extraEnv: Record<string, string> = {}): Promi
     logs: () => io.out + io.err,
     async stop() {
       child.kill("SIGTERM");
-      await new Promise((r) => {
-        child.once("exit", r);
-        setTimeout(r, 3_000);
+      // Really gone before this returns: a test that starts another
+      // server on the same home would otherwise find this one still
+      // holding the data folder (server/data-lock.ts).
+      const gone = await new Promise<boolean>((r) => {
+        if (child.exitCode !== null || child.signalCode !== null) return r(true);
+        child.once("exit", () => r(true));
+        setTimeout(() => r(false), 10_000);
       });
+      if (!gone) {
+        child.kill("SIGKILL");
+        await new Promise((r) => {
+          child.once("exit", r);
+          setTimeout(r, 2_000);
+        });
+      }
       // The harness can outlive SIGTERM by a moment: a sandbox teardown,
       // a helper, a last write of a store on its way out. Removing the
       // home while one of those is still writing raises ENOTEMPTY, which
@@ -146,6 +184,13 @@ export async function startHarness(extraEnv: Record<string, string> = {}): Promi
         }
       }
     },
+    async crash() {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const gone = new Promise((r) => child.once("exit", r));
+      child.kill("SIGKILL");
+      await gone;
+      rmSync(home, { recursive: true, force: true });
+    },
     fetchRemote(path, init = {}) {
       return new Promise((resolve, reject) => {
         const headers: Record<string, string> = {
@@ -155,6 +200,7 @@ export async function startHarness(extraEnv: Record<string, string> = {}): Promi
         };
         if (init.token) headers.authorization = `Bearer ${init.token}`;
         if (init.origin) headers.origin = init.origin;
+        Object.assign(headers, init.headers);
         const req = httpRequest(
           { host: "127.0.0.1", port, path, method: init.method ?? "GET", headers },
           (res) => {

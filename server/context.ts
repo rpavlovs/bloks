@@ -36,12 +36,15 @@ const LIMITS: Array<[RegExp, number]> = [
   [/^claude-fable-5-1(?:$|-)/i, 1_000_000],
   [/^claude-opus-5-5(?:$|-)/i, 1_000_000],
   [/^claude/i, 200_000],
+  // Claude Code's aliases for the newest model in a family; the safe guess
+  [/^(opus|sonnet|haiku)$/i, 200_000],
   [/^gemini/i, 1_000_000],
   [/^grok/i, 131_072],
   [/^(gpt-4o|gpt-4\.1|o[134])/i, 128_000],
   [/^gpt-5/i, 400_000],
-  // Codex's default window is smaller than the GPT-6 API maximum.
-  [/^gpt-6(?:$|-)/i, 272_000],
+  // Codex's default window is smaller than the GPT-6 API maximum. Point
+  // releases count too (gpt-6.1-sol), which once fell to the default.
+  [/^gpt-6(?:$|[-.])/i, 272_000],
   [/^deepseek/i, 65_536],
   [/^kimi|^moonshot/i, 131_072],
   [/^llama/i, 131_072],
@@ -56,11 +59,209 @@ const LIMITS: Array<[RegExp, number]> = [
 export const DEFAULT_LIMIT = 32_000;
 
 export function contextLimitFor(model: string | undefined | null): number {
+  return knownLimitFor(model) ?? DEFAULT_LIMIT;
+}
+
+/** The table's number for a model, or null when the name says nothing.
+ * The default above is a safety margin for the fold, not a fact, so a
+ * decision that would act on a guess (compacting a session before a
+ * turn) asks this instead. */
+export function knownLimitFor(model: string | undefined | null): number | null {
   const name = (model ?? "").trim();
   for (const [pattern, limit] of LIMITS) {
     if (pattern.test(name)) return limit;
   }
-  return DEFAULT_LIMIT;
+  return null;
+}
+
+// ── what the engine itself says ────────────────────────────────────────
+//
+// The table is a guess, and the engines that keep their own session know
+// better: Claude Code reports each request's prompt and, in its result,
+// the model's window; Codex reports the latest request and the window it
+// is using right now (which is not fixed per model); an ACP agent can
+// send both as a `usage_update`. Their word wins over the table.
+//
+// A reading belongs to the engine and model that made it. A conversation
+// moved to another engine has not been measured there yet, and showing
+// Codex's numbers against Claude's window (or the other way round) is a
+// claim nobody made.
+
+/** One engine's latest word on how full a lane's session is. */
+export interface Reading {
+  /** The size of the latest request, in tokens. */
+  used: number;
+  /** The window the engine reported, when it did. */
+  window: number | null;
+  instanceId: string;
+  model: string | null;
+  at: number;
+}
+
+/** The reading, if it was made by the engine and model about to use it. */
+export function readingFor(
+  reading: Reading | null | undefined,
+  selection: { instanceId: string; model?: string | null },
+): Reading | null {
+  if (!reading || reading.instanceId !== selection.instanceId) return null;
+  if ((reading.model ?? null) !== (selection.model ?? null)) return null;
+  return reading;
+}
+
+/**
+ * How full a lane is for the engine and model it is on now.
+ *
+ * Its own engine's reading first, with the engine's window when it gave
+ * one and the table's otherwise. A reading from another engine or model
+ * counts as nothing measured. Old per-turn sums and the default fold
+ * margin are not measurements. Keep numeric zeroes on the wire for
+ * older clients, with an explicit flag for clients that know the difference.
+ * With before-turn compaction on, its lower line is the display limit;
+ * keep the full model window alongside it for the card.
+ */
+export function laneFill(
+  reading: Reading | null | undefined,
+  selection: { instanceId: string; model?: string | null },
+  beforeTurn: Pick<TurnStartLane, "at" | "ceiling"> = { ceiling: 0 },
+): Pressure & { measured: boolean; window: "engine" | "table"; modelLimit?: number; limitApproximate?: boolean } {
+  const own = readingFor(reading, selection);
+  const window = own?.window && Number.isInteger(own.window) && own.window > 0 ? own.window : null;
+  const limit = window ?? knownLimitFor(selection.model);
+  if (!own || !Number.isFinite(own.used) || own.used <= 0 || limit === null) {
+    return { used: 0, limit: 0, fraction: 0, measured: false, window: "table" };
+  }
+  const line = beforeTurn.ceiling > 0 ? beforeTurnLine({ window: limit, ...beforeTurn }) : limit;
+  const budget = line > 0 && line < limit;
+  return {
+    ...pressure(own.used, budget ? line : limit),
+    // Keep the wire share capped for existing clients. Text can use used
+    // and limit for the real share, including a turn past the line.
+    ...(budget ? { modelLimit: limit, limitApproximate: !window && line < beforeTurn.ceiling } : {}),
+    measured: true,
+    window: window ? "engine" : "table",
+  };
+}
+
+// ── compacting before a turn ───────────────────────────────────────────
+//
+// A native session (Claude Code, Codex, an ACP agent) sends its whole
+// context again on every request, and a turn with twenty tool calls is
+// twenty requests. A session at 170k turns one tool-heavy message into
+// three and a half million input tokens, cached or not, and that is what
+// emptied a five-hour limit in twenty minutes (GitHub 222, 223). So before
+// a turn starts on a session that has grown past the line, the session is
+// compacted first, by the engine's own means where it has them.
+//
+// The line is the lower of a share of the window and a ceiling in tokens.
+// The share keeps room for the turn's own growth; the ceiling is there
+// because a million-token window is a limit, not a budget, and a request
+// of 800k is expensive however well it fits.
+
+/** Past this share of the window, compact before the next turn. */
+export const BEFORE_TURN_AT = 0.6;
+
+/** And never let a request start above this many tokens. */
+export const BEFORE_TURN_CEILING = 200_000;
+
+export interface TurnStartLane {
+  /** The latest request's size, from the engine about to run the turn. */
+  used: number;
+  /** That engine's window, its own word or the table's; null when
+   * neither knows, and then only the ceiling applies. */
+  window: number | null;
+  /** The share of the window; out of range means the default. */
+  at?: number;
+  /** In tokens; 0 is off. */
+  ceiling: number;
+  /** What the lane measured when it was last compacted before a turn,
+   * while it has not since come back under the line. */
+  lastFrom?: number;
+}
+
+/** The line a lane is compacted at, in tokens. */
+export function beforeTurnLine(lane: Pick<TurnStartLane, "window" | "at" | "ceiling">): number {
+  const at = lane.at !== undefined && lane.at > 0 && lane.at < 1 ? lane.at : BEFORE_TURN_AT;
+  const share = lane.window && lane.window > 0 ? Math.floor(lane.window * at) : Infinity;
+  return Math.min(lane.ceiling, share);
+}
+
+/**
+ * Whether to compact a resumed session before this turn.
+ *
+ * A compaction that did not bring the session under the line (an engine
+ * that keeps a lot, or one that ignored the request) is not asked for
+ * again on every message: only once the session has grown a tenth past
+ * where the last one started.
+ */
+export function compactBeforeTurn(lane: TurnStartLane): boolean {
+  if (!(lane.ceiling > 0) || !(lane.used > 0)) return false;
+  if (lane.used <= beforeTurnLine(lane)) return false;
+  if (lane.lastFrom !== undefined && lane.used < lane.lastFrom * 1.1) return false;
+  return true;
+}
+
+// ── handing a conversation to a new session ────────────────────────────
+//
+// A new engine session on an old conversation (a switch of engine, a
+// backup taking over, a session that could not be resumed, a rewind) is
+// told the story so far in its first message. Told whole, a long
+// conversation was a hundred thousand characters in one message, sent
+// again with every tool call of that turn. So the story is bounded: the
+// running summary, then the most recent messages whole while they fit,
+// and a word about what was left out. Nothing is lost from the thread
+// itself, which still has every message.
+
+/** The most a handoff is given, in tokens, however big the window. */
+export const HANDOFF_MAX_TOKENS = 16_000;
+
+/** And at most this share of the window it goes to. */
+export const HANDOFF_SHARE = 0.15;
+
+export function handoffBudget(window: number | null | undefined): number {
+  const share = window && window > 0 ? Math.floor(window * HANDOFF_SHARE) : HANDOFF_MAX_TOKENS;
+  return Math.max(2_000, Math.min(HANDOFF_MAX_TOKENS, share));
+}
+
+const SUMMARY_MARK = "[Earlier in this conversation, summarised]";
+
+/** A long message cut down to its beginning and its end, which is where
+ * a request and its conclusion usually are, saying how much went. */
+export function clipText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const room = Math.max(40, max - 60);
+  const head = Math.ceil(room * 0.6);
+  const tail = room - head;
+  const gone = text.length - head - tail;
+  return `${text.slice(0, head)}\n[... ${gone} characters left out ...]\n${text.slice(text.length - tail)}`;
+}
+
+/**
+ * The part of a transcript a new session is handed, within `budget`
+ * tokens.
+ *
+ * A summary at the front is kept (clipped to a quarter of the budget),
+ * then messages from the end while they fit, each clipped to a quarter of
+ * the budget so one pasted log cannot crowd out everything else. The last
+ * exchange is always kept, clipped, however tight it is: a story that is
+ * only a summary has no thread to pull on. `left` is how many messages
+ * between the summary and what was kept are not included.
+ */
+export function boundHandoff(turns: Turn[], budget: number): { turns: Turn[]; left: number } {
+  const chars = Math.max(1, budget) * 4;
+  const each = Math.max(400, Math.floor(chars / 4));
+  const summary = turns[0]?.text.startsWith(SUMMARY_MARK) ? turns[0] : null;
+  const rest = summary ? turns.slice(1) : turns;
+  const head: Turn[] = summary ? [{ role: summary.role, text: clipText(summary.text, each) }] : [];
+  let used = head.reduce((n, t) => n + t.text.length + 16, 0);
+  const kept: Turn[] = [];
+  for (let i = rest.length - 1; i >= 0; i--) {
+    const turn = { role: rest[i].role, text: clipText(rest[i].text, each) };
+    const cost = turn.text.length + 16;
+    if (kept.length >= 2 && used + cost > chars) break;
+    kept.unshift(turn);
+    used += cost;
+  }
+  return { turns: [...head, ...kept], left: rest.length - kept.length };
 }
 
 /**
@@ -143,12 +344,41 @@ export function planCompaction(turns: Turn[], budget: number, minKeep = 6): Plan
   return { fold: turns.slice(0, turns.length - keep.length), keep };
 }
 
+/** What every summary carries forward, whichever way it is made. The
+ * person's standing instructions come first and by name: a summary that
+ * kept "how the person wants to be worked with" still let "only these two
+ * sites" or "not that company" fade, and the agent went back to doing
+ * what it was told not to (GitHub 277). */
+const KEEP = [
+  "Keep: every standing instruction they gave, in their own words where it is short: what to use or not use, what to leave out, which sources, sites or tools to rely on, what they are not interested in. Keep these even when nothing lately used them; they hold until the person says otherwise.",
+  "Also keep: decisions made, facts established, anything asked for that is not finished, names, numbers, file paths, and how the person wants to be worked with.",
+];
+
+/** How much of the conversation a summary request carries. */
+const SUMMARY_INPUT_CHARS = 40_000;
+
+/** The part being folded, as the summary request reads it. It used to be
+ * cut at its first 40,000 characters, so in a long stretch whatever the
+ * person said after that never reached the summary at all, and a
+ * requirement they gave late in it was gone once it was folded
+ * (GitHub 277). Their own words are what a summary must not lose, so the
+ * agent's long replies are shortened first, and only then, if it is
+ * still too long, is the middle left out rather than the end. */
+function foldedText(fold: Turn[]): string {
+  const line = (turn: Turn, cap = Infinity) => {
+    const text = turn.role === "assistant" && turn.text.length > cap ? `${turn.text.slice(0, cap)} [...]` : turn.text;
+    return `${turn.role === "user" ? "Them" : "You"}: ${text}`;
+  };
+  let text = fold.map((turn) => line(turn)).join("\n\n");
+  if (text.length > SUMMARY_INPUT_CHARS) text = fold.map((turn) => line(turn, 600)).join("\n\n");
+  if (text.length <= SUMMARY_INPUT_CHARS) return text;
+  const head = Math.floor(SUMMARY_INPUT_CHARS / 4);
+  return `${text.slice(0, head)}\n\n[...]\n\n${text.slice(text.length - (SUMMARY_INPUT_CHARS - head))}`;
+}
+
 /** What the model is asked, when it is asked to summarise. */
 export function summaryPrompt(existing: string | null, fold: Turn[]): string {
-  const conversation = fold
-    .map((turn) => `${turn.role === "user" ? "Them" : "You"}: ${turn.text}`)
-    .join("\n\n")
-    .slice(0, 40_000);
+  const conversation = foldedText(fold);
   return [
     existing
       ? "Here is a summary of a conversation so far, and the part that came after it. Produce one summary covering both."
@@ -158,7 +388,7 @@ export function summaryPrompt(existing: string | null, fold: Turn[]): string {
     "The conversation:",
     conversation,
     "",
-    "Keep: decisions made, facts established, anything asked for that is not finished, names, numbers, file paths, and how the person wants to be worked with.",
+    ...KEEP,
     "Drop: pleasantries, restatements, and anything already superseded.",
     "Write it as notes to yourself, in the second person about them. Under 400 words. No preamble.",
   ].join("\n");
@@ -175,10 +405,102 @@ export function summaryTurn(summary: string): Turn {
 
 /** What people see in the thread when it happens. Compaction is a normal
  * state, so it says what it did rather than apologising. */
-export function compactionNotice(folded: number): string {
+export function compactionNotice(folded: number, why: "limit" | "handoff" = "limit"): string {
+  const because =
+    why === "handoff"
+      ? "This conversation went to a new session, which is told a shortened version"
+      : "This conversation reached the model's limit";
   return folded === 1
-    ? "This conversation reached the model's limit, so the earliest message was summarised. Everything since is intact, and the summary carries forward what mattered."
-    : `This conversation reached the model's limit, so the earliest ${folded} messages were summarised. Everything since is intact, and the summary carries forward what mattered.`;
+    ? `${because}, so the earliest message was summarised. Everything since is intact, and the summary carries forward what mattered.`
+    : `${because}, so the earliest ${folded} messages were summarised. Everything since is intact, and the summary carries forward what mattered.`;
+}
+
+/** A token count the way the marker shows it: 320k, 1.2M. */
+export function shortTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return String(Math.max(0, Math.round(n)));
+}
+
+/**
+ * The marker for an engine compacting its own session, in the place it
+ * happened. Short on purpose: it is a fact about the conversation, like
+ * a date line, not something to read. Whatever the engine did not report
+ * is left out rather than guessed.
+ */
+export function compactedNotice(c: { before: number | null; after: number | null; idle?: boolean }): string {
+  const what = c.idle ? "Compacted while idle" : "Compacted";
+  if (c.before !== null && c.after !== null) return `${what} · ${shortTokens(c.before)} → ${shortTokens(c.after)}`;
+  if (c.before !== null) return `${what} · from ${shortTokens(c.before)}`;
+  if (c.after !== null) return `${what} · now ${shortTokens(c.after)}`;
+  return what;
+}
+
+// ── compacting before the cache goes cold ──────────────────────────────
+//
+// A Claude Code session is cached by the provider for an hour after its
+// last request. A conversation that goes quiet for longer pays to write
+// its whole context to the cache again on the next message, which for a
+// long-lived agent is about 170k tokens at twice the input price. Asking
+// the session to compact a few minutes before the hour is up reads that
+// context while it is still cached, and the next message writes a third
+// of it instead (GitHub 162).
+//
+// The hour is Claude Code's choice, not ours: Bloks sets no cache
+// lifetime and signs the CLI in with the person's own account, which
+// caches for an hour. With an API key it caches for five minutes, and
+// compacting a conversation every time someone pauses for four would
+// cost detail for nothing, so a lane is only compacted when its last
+// cache write says it was an hour (`cacheTtl` on the usage event).
+
+/** How long the provider keeps the prompt cached after a request. */
+export const CACHE_LIFETIME_MS = 60 * 60_000;
+
+/** Below this a conversation is cheap to write again anyway. Replaying a
+ * month of agents showed the saving flat from 60k to 150k. */
+export const IDLE_COMPACT_MIN_TOKENS = 100_000;
+
+export interface IdleLane {
+  /** The idle compaction setting. */
+  enabled: boolean;
+  now: number;
+  /** When the lane's session last made a request, if known. */
+  lastRequestAt: number | null;
+  /** How big that request's prompt was. */
+  context: number;
+  /** The cache lifetime that request wrote with, if it said. */
+  cacheTtl?: "5m" | "1h";
+  /** A turn running, or starting. */
+  busy: boolean;
+  /** Messages waiting for the lane, or an editor holding them. */
+  queued: boolean;
+  /** A question or approval card still open. */
+  waiting: boolean;
+  /** Archived, held, or otherwise not to be woken. */
+  paused: boolean;
+  /** The cache lifetime; tests shorten it. */
+  lifetime?: number;
+}
+
+/**
+ * Whether to compact a quiet lane now.
+ *
+ * The window opens five minutes before the cache expires and closes two
+ * and a half minutes before. A compaction takes about a minute, and the
+ * request that reads the context has to reach the provider before the
+ * hour is up; one that starts late pays the full rewrite and the summary
+ * both, which is worse than leaving it alone. So a lane whose window has
+ * passed (the computer slept, too many lanes went quiet at once) is
+ * skipped, not caught up.
+ */
+export function idleCompactionDue(lane: IdleLane): boolean {
+  if (!lane.enabled || lane.lastRequestAt === null) return false;
+  if (lane.cacheTtl !== "1h") return false;
+  if (lane.context < IDLE_COMPACT_MIN_TOKENS) return false;
+  if (lane.busy || lane.queued || lane.waiting || lane.paused) return false;
+  const lifetime = lane.lifetime ?? CACHE_LIFETIME_MS;
+  const idle = lane.now - lane.lastRequestAt;
+  return idle >= lifetime * (55 / 60) && idle < lifetime * (57.5 / 60);
 }
 
 // ── paying the same bill in instalments ────────────────────────────────
@@ -276,7 +598,7 @@ export function defragPrompt(summary: string): string {
     "",
     summary,
     "",
-    "Keep: decisions made, facts established, anything asked for that is not finished, names, numbers, file paths, and how the person wants to be worked with.",
+    ...KEEP,
     "Write it as notes to yourself, in the second person about them. Under 400 words. No preamble.",
   ].join("\n");
 }
@@ -292,7 +614,7 @@ export function absorbPrompt(existing: string | null, one: Turn): string {
     "Newly said:",
     `${one.role === "user" ? "Them" : "You"}: ${one.text.slice(0, 20_000)}`,
     "",
-    "Keep: decisions made, facts established, anything asked for that is not finished, names, numbers, file paths, and how the person wants to be worked with.",
+    ...KEEP,
     "Drop: pleasantries, restatements, and anything already superseded.",
     "Write it as notes to yourself, in the second person about them. Under 400 words. No preamble.",
   ].join("\n");

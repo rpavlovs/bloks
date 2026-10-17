@@ -16,9 +16,10 @@
 // cannot fail: an offer is a proposal the agent gets to refuse, so the
 // consequence of ranking badly is one wasted turn rather than a wrong
 // answer.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { readSaved, writeFileAtomic } from "./atomic-write.ts";
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
 
@@ -48,6 +49,10 @@ export interface Job {
   finishedAt?: number;
   /** The agent's own account of what it did, or why it could not. */
   result?: string;
+  /** Posted from an agent's turn: the place in a chain of agents'
+   * messages its taker's turn would take (MAX_AGENT_CHAIN in
+   * server/index.ts). Absent when the person posted or offered it. */
+  chain?: number;
 }
 
 export const MAX_JOBS = 200;
@@ -209,12 +214,7 @@ export class JobStore {
   jobs: Job[] = [];
 
   constructor() {
-    try {
-      const parsed = JSON.parse(readFileSync(JOBS_FILE, "utf8"));
-      if (Array.isArray(parsed)) this.jobs = parsed.filter((job) => job?.id && job?.title);
-    } catch {
-      /* no board yet */
-    }
+    this.jobs = readSaved<Job[]>(JOBS_FILE, [], Array.isArray).filter((job) => job?.id && job?.title);
     // Work that was running when the app stopped did not carry on
     // running. Saying so beats a job that claims to be in progress
     // forever with nobody doing it.
@@ -230,7 +230,7 @@ export class JobStore {
   private save() {
     try {
       mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-      writeFileSync(JOBS_FILE, JSON.stringify(this.jobs, null, 2), { mode: 0o600 });
+      writeFileAtomic(JOBS_FILE, JSON.stringify(this.jobs, null, 2), 0o600);
     } catch {
       /* a board that cannot be written is still a board for this session */
     }
@@ -244,7 +244,7 @@ export class JobStore {
     return this.jobs.find((job) => job.id === id) ?? null;
   }
 
-  post(input: { title: string; brief: string; now: number }): Job {
+  post(input: { title: string; brief: string; now: number; chain?: number }): Job {
     const job: Job = {
       id: newId(),
       title: input.title.trim().slice(0, MAX_TITLE),
@@ -252,6 +252,7 @@ export class JobStore {
       postedAt: input.now,
       state: "open",
       offers: [],
+      ...(input.chain ? { chain: input.chain } : {}),
     };
     this.jobs.unshift(job);
     if (this.jobs.length > MAX_JOBS) this.jobs.length = MAX_JOBS;
@@ -288,6 +289,11 @@ export class JobStore {
     if (!job) return null;
     const last = job.offers[job.offers.length - 1];
     if (last) last.passed = because.slice(0, MAX_RESULT);
+    // taken off the board while they were deciding: it stays off
+    if (job.state === "cancelled") {
+      this.save();
+      return job;
+    }
     job.state = "open";
     job.claimedBy = undefined;
     job.claimedName = undefined;
@@ -341,7 +347,9 @@ export class JobStore {
   releaseAgent(botId: string, _now: number, why = "The agent that took this was deleted.") {
     let touched = false;
     for (const job of this.jobs) {
-      if (job.claimedBy !== botId) continue;
+      // claimedBy outlives the claim, so a job this agent finished, or
+      // one that was cancelled under it, still names it
+      if (job.claimedBy !== botId || job.state !== "claimed") continue;
       job.state = "open";
       job.claimedBy = undefined;
       job.claimedName = undefined;

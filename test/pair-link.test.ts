@@ -2,7 +2,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,6 +35,24 @@ test("an expired link opens nothing", () => {
   const { id } = pairing.createPairLink(-1);
   assert.equal(pairing.pairLinkSecret(id), null);
   assert.equal(pairing.claimPairLink(id, "Late", digest("x")), null);
+});
+
+test("a link made by another Bloks on the same folder can be spent here", () => {
+  // The app and bloks-server often share one ~/.bloks. \`bloks-server pair\`
+  // asks one of them for the link while the relay hands the claim to the
+  // other, and a link known only in memory read as "already used".
+  const file = join(home, ".bloks", "pair-links.json");
+  const secret = "made-by-the-other-process";
+  const id = "pair_otherprocess1";
+  const existing = JSON.parse(readFileSync(file, "utf8"));
+  writeFileSync(file, JSON.stringify([...existing, { id, secretHash: digest(secret), expiresAt: Date.now() + 60_000 }]));
+  assert.equal(pairing.pairLinkSecret(id), digest(secret));
+  assert.ok(pairing.claimPairLink(id, "Phone", digest("phone token")));
+  // spent for everyone sharing the folder, not just this process
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).some((l: { id: string }) => l.id === id), false);
+  // and the file holds digests only, never a link's secret
+  const { secret: kept } = pairing.createPairLink();
+  assert.equal(readFileSync(file, "utf8").includes(kept), false);
 });
 
 test("only a real digest is accepted as the device's", () => {

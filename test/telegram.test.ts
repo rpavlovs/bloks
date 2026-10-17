@@ -2,15 +2,39 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
+import { sniffImage } from "../server/attachments.ts";
+import { transcribe } from "../server/speech.ts";
 import {
+  answerPress,
+  chatAction,
   decide,
+  type Deliverable,
   describeCard,
+  download,
+  edit,
+  FILES_PER_TURN,
+  Inbox,
+  type InboxHooks,
+  type Incoming,
   interpretAnswer,
+  keepTyping,
   nextOffset,
+  notDelivered,
   pairingWord,
   parseUpdates,
+  poll,
+  post,
+  type Press,
+  Progress,
+  send,
+  sendFiles,
   type TelegramState,
+  TelegramError,
+  PROGRESS_AFTER_MS,
+  PROGRESS_EVERY_MS,
+  unbutton,
 } from "../server/telegram.ts";
+import { splitAttachments } from "../src/lib/attachments.ts";
 
 const message = (over: Partial<{ chatId: number; text: string; updateId: number }> = {}) => ({
   chatId: 42,
@@ -39,11 +63,65 @@ describe("parseUpdates", () => {
     assert.equal(out[0].text, "fixed");
   });
 
-  test("photos, stickers and joins are skipped rather than half-read", () => {
+  // These used to be skipped, and the offset moved past them, so a
+  // photo or a voice message vanished with nothing said to anybody.
+  test("voice, photos, files and stickers are kept, each with what it is", () => {
     const out = parseUpdates({
       result: [
-        { update_id: 9, message: { chat: { id: 1 }, photo: [{}] } },
+        { update_id: 1, message: { chat: { id: 1 }, voice: { file_id: "v", file_size: 900 } } },
+        {
+          update_id: 2,
+          message: {
+            chat: { id: 1 },
+            caption: " look ",
+            photo: [
+              { file_id: "big", width: 1280, height: 960, file_size: 90_000 },
+              { file_id: "small", width: 90, height: 67 },
+            ],
+          },
+        },
+        { update_id: 3, message: { chat: { id: 1 }, document: { file_id: "d", mime_type: "image/png" } } },
+        { update_id: 4, message: { chat: { id: 1 }, document: { file_id: "p", mime_type: "application/pdf" } } },
+        { update_id: 5, message: { chat: { id: 1 }, sticker: { file_id: "s" } } },
+        { update_id: 6, message: { chat: { id: 1 }, video: { file_id: "m" } } },
+        { update_id: 7, message: { chat: { id: 1 }, video_note: { file_id: "n" } } },
+        // a GIF carries a document too, and is not a file to the person who sent it
+        { update_id: 8, message: { chat: { id: 1 }, animation: { file_id: "g" }, document: { file_id: "g" } } },
+        { update_id: 9, message: { chat: { id: 1 }, document: { file_id: "h", mime_type: "image/heic" } } },
+      ],
+    });
+    assert.deepEqual(
+      out.map((m) => m.media),
+      [
+        { kind: "voice", fileId: "v", bytes: 900 },
+        { kind: "image", fileId: "big", bytes: 90_000, mime: "image/jpeg" },
+        { kind: "image", fileId: "d", bytes: 0, mime: "image/png" },
+        { kind: "file", what: "files", fileId: "p", bytes: 0, mime: "application/pdf" },
+        { kind: "other", what: "stickers", bytes: 0 },
+        { kind: "file", what: "videos", fileId: "m", bytes: 0, mime: "" },
+        { kind: "file", what: "video messages", fileId: "n", bytes: 0, mime: "" },
+        { kind: "file", what: "GIFs", fileId: "g", bytes: 0, mime: "" },
+        { kind: "other", what: "HEIC images", bytes: 0 },
+      ],
+    );
+    assert.equal(out[1].text, "look", "a caption is the photo's text");
+  });
+
+  test("photos sent as one album share its id", () => {
+    const out = parseUpdates({
+      result: [
+        { update_id: 1, message: { chat: { id: 1 }, media_group_id: "g1", photo: [{ file_id: "a" }] } },
+        { update_id: 2, message: { chat: { id: 1 }, media_group_id: "g1", photo: [{ file_id: "b" }] } },
+      ],
+    });
+    assert.deepEqual(out.map((m) => m.album), ["g1", "g1"]);
+  });
+
+  test("joins and other service messages are still skipped", () => {
+    const out = parseUpdates({
+      result: [
         { update_id: 10, message: { chat: { id: 1 }, new_chat_members: [{}] } },
+        { update_id: 11, message: { chat: { id: 1 }, pinned_message: {} } },
       ],
     });
     assert.deepEqual(out, []);
@@ -53,6 +131,36 @@ describe("parseUpdates", () => {
     for (const bad of [null, undefined, {}, { result: "no" }, { result: [null, 3] }]) {
       assert.deepEqual(parseUpdates(bad), []);
     }
+  });
+
+  test("a pressed button comes through as a press, with who pressed it and where", () => {
+    const out = parseUpdates({
+      result: [
+        {
+          update_id: 12,
+          callback_query: {
+            id: "press-1",
+            from: { id: 77, first_name: "Hamed" },
+            message: { message_id: 5, chat: { id: 42 } },
+            data: "abcdEFGH:1",
+          },
+        },
+      ],
+    });
+    assert.deepEqual(out, [
+      { chatId: 42, updateId: 12, text: "", from: "Hamed", press: { id: "press-1", data: "abcdEFGH:1", messageId: 5, fromId: 77 } },
+    ]);
+  });
+
+  test("a press that cannot say what it carried, or who made it, is nothing", () => {
+    const out = parseUpdates({
+      result: [
+        { update_id: 1, callback_query: { id: "p", from: { id: 1 }, message: { message_id: 5, chat: { id: 1 } } } },
+        { update_id: 2, callback_query: { id: "p", message: { message_id: 5, chat: { id: 1 } }, data: "x" } },
+        { update_id: 3, callback_query: { id: "p", from: { id: 1 }, inline_message_id: "i", data: "x" } },
+      ],
+    });
+    assert.deepEqual(out, []);
   });
 
   test("a very long message is cut", () => {
@@ -90,9 +198,45 @@ describe("decide", () => {
     }
   });
 
+  test("a photo captioned with the pairing word does not pair", () => {
+    const state: TelegramState = { pairing: "abc123xy", chatIds: [] };
+    const media = { kind: "image" as const, fileId: "f", bytes: 1, mime: "image/jpeg" };
+    assert.equal(decide(state, { ...message({ text: "abc123xy" }), media }).kind, "refuse");
+  });
+
+  test("a known chat's photo is delivered with what it carries", () => {
+    const media = { kind: "image" as const, fileId: "f", bytes: 1, mime: "image/jpeg" };
+    const decision = decide({ chatIds: [42] }, { ...message(), media, album: "g" });
+    assert.deepEqual(decision, { kind: "deliver", chatId: 42, text: "hello", media, album: "g" });
+  });
+
   test("an allowed chat does not need the word once paired", () => {
     const state: TelegramState = { pairing: "abc123xy", chatIds: [42] };
     assert.equal(decide(state, message({ text: "anything" })).kind, "deliver");
+  });
+
+  const press = (chatId: number, fromId: number) => ({
+    ...message({ chatId, text: "" }),
+    press: { id: "p", data: "abcdEFGH:0", messageId: 5, fromId },
+  });
+
+  test("a button pressed by the paired person, in their chat, is a press", () => {
+    assert.deepEqual(decide({ chatIds: [42] }, press(42, 42)), {
+      kind: "press",
+      chatId: 42,
+      press: { id: "p", data: "abcdEFGH:0", messageId: 5, fromId: 42 },
+    });
+  });
+
+  test("a button pressed by anyone else in a paired chat is ignored, not answered", () => {
+    // a group the bot was paired in shows its buttons to every member
+    assert.deepEqual(decide({ chatIds: [-100] }, press(-100, 7)), { kind: "ignore" });
+  });
+
+  test("a button pressed in a chat that is not paired is ignored, without a refusal", () => {
+    assert.deepEqual(decide({ chatIds: [42] }, press(9, 9)), { kind: "ignore" });
+    // not even the pairing word is read from a press
+    assert.deepEqual(decide({ chatIds: [], pairing: "abc123xy" }, { ...press(9, 9), text: "abc123xy" }), { kind: "ignore" });
   });
 });
 
@@ -146,5 +290,912 @@ describe("answering a card from a phone", () => {
     const text = describeCard({ title: "Approval needed", subtitle: "rm -rf build", options });
     assert.match(text, /^Approval needed\nrm -rf build\n\n1\. Allow\n2\. Deny/);
     assert.match(text, /yes \/ no/);
+  });
+
+  test("a card sent with buttons is only what it asks, since the choices are under it", () => {
+    assert.equal(describeCard({ title: "Approval needed", subtitle: "rm -rf build", options }, true), "Approval needed\nrm -rf build");
+    // a question with nothing to tap still asks to be typed
+    assert.match(describeCard({ title: "Your agent has a question", subtitle: "Which day?" }, true), /Reply with your answer\.$/);
+  });
+});
+
+describe("what the bot cannot pass on", () => {
+  test("every reply says the message did not arrive", () => {
+    for (const media of [
+      { kind: "voice" as const, fileId: "v", bytes: 1 },
+      { kind: "image" as const, fileId: "i", bytes: 1, mime: "image/png" },
+      { kind: "other" as const, what: "stickers" },
+    ]) {
+      assert.match(notDelivered(media), /did not reach your agent/);
+    }
+    assert.match(notDelivered({ kind: "other", what: "videos" }), /can't take videos/);
+  });
+
+  test("a captioned file says its caption went on without it", () => {
+    assert.match(notDelivered({ kind: "other", what: "files" }, true), /Your caption went to your agent without it/);
+    assert.match(notDelivered({ kind: "voice", fileId: "v", bytes: 1 }, true), /Your caption went to your agent without it/);
+    assert.doesNotMatch(notDelivered({ kind: "other", what: "files" }), /caption/);
+  });
+});
+
+// ── the inbox, with Telegram, the vendors and the disk all stood in for ──
+
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+const OGG = new Uint8Array([0x4f, 0x67, 0x67, 0x53, 9, 9]);
+
+/** An inbox whose every outside call is recorded. `over` swaps any hook. */
+function inbox(over: Partial<InboxHooks> = {}, card?: { options: string[]; permission: boolean }) {
+  const seen = {
+    sent: [] as string[],
+    delivered: [] as string[],
+    downloads: [] as string[],
+    heard: 0,
+    answers: [] as { option?: string; free?: string }[],
+    refused: 0,
+    presses: [] as Press[],
+  };
+  let waiting = card;
+  const hooks: InboxHooks = {
+    state: () => ({ chatIds: [42] }),
+    send: async (_chatId, text) => void seen.sent.push(text),
+    pair: async () => {},
+    refuse: async () => void seen.refused++,
+    download: async (fileId) => {
+      seen.downloads.push(fileId);
+      return fileId.startsWith("voice") ? OGG : PNG;
+    },
+    transcriber: () => async () => {
+      seen.heard++;
+      return "meet Siobhan at 4:15";
+    },
+    saveImage: (bytes) => {
+      if (!sniffImage(bytes)) throw new Error("only png, jpeg, gif and webp images are taken");
+      return `/home/me/.bloks/attachments/${seen.downloads.length}.png`;
+    },
+    saveVoice: () => "/home/me/.bloks/attachments/v.ogg",
+    saveFile: (_bytes, ext) => `/home/me/.bloks/attachments/f.${ext}`,
+    waiting: () => waiting,
+    answer: async (_chatId, read) => {
+      seen.answers.push(read);
+      waiting = undefined;
+    },
+    deliver: (_chatId, text) => void seen.delivered.push(text),
+    press: async (_chatId, press) => void seen.presses.push(press),
+    ...over,
+  };
+  return { box: new Inbox(hooks, 5), seen };
+}
+
+const voice = (over: Partial<Incoming> = {}): Incoming => ({
+  ...message(),
+  text: "",
+  media: { kind: "voice", fileId: "voice-1", bytes: 6 },
+  ...over,
+});
+const photo = (fileId: string, over: Partial<Incoming> = {}): Incoming => ({
+  ...message(),
+  text: "",
+  media: { kind: "image", fileId, bytes: 7, mime: "image/jpeg" },
+  ...over,
+});
+
+describe("the inbox", () => {
+  test("a press from the paired person goes to the card it is for, and a stranger's goes nowhere", async () => {
+    const { box, seen } = inbox();
+    const pressed = { id: "p1", data: "abcdEFGH:0", messageId: 5, fromId: 42 };
+    await box.take({ ...message({ text: "" }), press: pressed });
+    assert.deepEqual(seen.presses, [pressed]);
+    await box.take({ ...message({ chatId: 9, text: "" }), press: { ...pressed, fromId: 9 } });
+    assert.equal(seen.presses.length, 1);
+    assert.equal(seen.refused, 0, "a stranger's press is not even refused");
+    assert.deepEqual(seen.delivered, [], "and a press is never a message to the agent");
+  });
+
+  test("a stranger's voice and photos are never downloaded or heard", async () => {
+    const { box, seen } = inbox({ state: () => ({ chatIds: [7] }) });
+    await box.take(voice());
+    await box.take(photo("p1"));
+    await box.take(photo("p2", { album: "g" }));
+    await box.flush();
+    assert.deepEqual(seen.downloads, []);
+    assert.equal(seen.heard, 0);
+    assert.deepEqual(seen.delivered, []);
+    assert.equal(seen.refused, 3, "each goes to the same refusal as text, which the server sends once");
+  });
+
+  test("a voice message arrives as its transcript, marked, with the audio kept", async () => {
+    const { box, seen } = inbox();
+    await box.take(voice());
+    assert.deepEqual(seen.downloads, ["voice-1"]);
+    assert.equal(seen.delivered.length, 1);
+    const said = seen.delivered[0];
+    // the agent is told it was heard, so it takes care over names and numbers
+    assert.match(said, /<voice-message path="\/home\/me\/\.bloks\/attachments\/v\.ogg" note="Transcribed from a voice message\./);
+    assert.match(said, /misheard/);
+    // and the thread shows the words with the recording beside them
+    const { display, voice: audio } = splitAttachments(said);
+    assert.equal(display, "meet Siobhan at 4:15");
+    assert.deepEqual(audio, ["/home/me/.bloks/attachments/v.ogg"]);
+    assert.deepEqual(seen.sent, []);
+  });
+
+  test("with no speech key a voice message gets a refusal note", async () => {
+    const { box, seen } = inbox({ transcriber: () => null });
+    await box.take(voice());
+    assert.deepEqual(seen.delivered, ["[A voice message (6 bytes) did not arrive (there is no speech key to transcribe it).]"]);
+    assert.deepEqual(seen.downloads, [], "nothing to hear it with, so nothing is fetched");
+    assert.match(seen.sent[0], /did not reach your agent\. Add a speech key in Bloks Settings, or type it/);
+  });
+
+  test("a transcription that fails says so and why", async () => {
+    const { box, seen } = inbox({
+      transcriber: () => async () => {
+        throw new Error("OpenAI answered 401");
+      },
+    });
+    await box.take(voice());
+    assert.match(seen.delivered[0], /could not be transcribed: OpenAI answered 401/);
+    assert.match(seen.sent[0], /couldn't transcribe that voice message \(OpenAI answered 401\), so it did not reach your agent/);
+  });
+
+  test("a download that fails says so", async () => {
+    const { box, seen } = inbox({
+      download: async () => {
+        throw new Error("Telegram answered HTTP 400");
+      },
+    });
+    await box.take(voice());
+    await box.take(photo("p1"));
+    assert.equal(seen.delivered.length, 2);
+    for (const note of seen.delivered) assert.match(note, /Telegram answered HTTP 400/);
+    assert.equal(seen.sent.length, 2);
+    for (const said of seen.sent) assert.match(said, /Telegram answered HTTP 400.*did not reach your agent/);
+  });
+
+  test("silence is not sent on as an empty message", async () => {
+    const { box, seen } = inbox({ transcriber: () => async () => "  " });
+    await box.take(voice());
+    assert.match(seen.delivered[0], /no words could be made out/);
+    assert.match(seen.sent[0], /couldn't make out any words/);
+  });
+
+  test("a photo arrives like a pasted image, with its caption as the text", async () => {
+    const { box, seen } = inbox();
+    await box.take(photo("p1", { text: "what is this plant?" }));
+    assert.equal(seen.delivered.length, 1);
+    const { display, images } = splitAttachments(seen.delivered[0]);
+    assert.equal(display, "what is this plant?");
+    assert.deepEqual(images, ["/home/me/.bloks/attachments/1.png"]);
+  });
+
+  test("an image over the app's 10 MB limit is refused without a download", async () => {
+    const { box, seen } = inbox();
+    await box.take(photo("p1", { media: { kind: "image", fileId: "p1", bytes: 11 * 1024 * 1024, mime: "image/png" } }));
+    assert.deepEqual(seen.downloads, []);
+    assert.match(seen.delivered[0], /over 10 MB/);
+    assert.match(seen.sent[0], /over 10 MB/);
+  });
+
+  test("something that is not really an image is refused, not saved", async () => {
+    const { box, seen } = inbox({ download: async () => OGG });
+    await box.take(photo("p1"));
+    assert.match(seen.delivered[0], /only png, jpeg, gif and webp/);
+    assert.match(seen.sent[0], /only png, jpeg, gif and webp/);
+  });
+
+  test("an album arrives as one message, not one turn per photo", async () => {
+    const { box, seen } = inbox();
+    await box.take(photo("p1", { album: "g", text: "the kitchen, before and after" }));
+    await box.take(photo("p2", { album: "g" }));
+    // Telegram can split an album across polls; the inbox waits for it
+    assert.deepEqual(seen.delivered, []);
+    await box.take(photo("p3", { album: "g" }));
+    await box.flush();
+    assert.equal(seen.delivered.length, 1);
+    const { display, images } = splitAttachments(seen.delivered[0]);
+    assert.equal(display, "the kitchen, before and after");
+    assert.equal(images.length, 3);
+    assert.deepEqual(seen.sent, []);
+  });
+
+  test("an album lets itself go after a short wait, without being asked", async () => {
+    const { box, seen } = inbox();
+    await box.take(photo("p1", { album: "g" }));
+    await box.take(photo("p2", { album: "g" }));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(seen.delivered.length, 1);
+  });
+
+  test("an album with a refused part delivers the photos and says what was left out", async () => {
+    const { box, seen } = inbox();
+    await box.take(photo("p1", { album: "g" }));
+    await box.take({ ...message(), text: "", album: "g", media: { kind: "other", what: "videos" } });
+    await box.flush();
+    assert.equal(splitAttachments(seen.delivered[0]).images.length, 1);
+    assert.match(seen.sent[0], /1 of those 2 did not reach your agent \(I can't take videos\)/);
+  });
+
+  test("refused media gets a reply and a note without downloading", async () => {
+    const { box, seen } = inbox();
+    for (const what of ["stickers", "videos", "video messages", "files"]) {
+      await box.take({ ...message(), text: "", media: { kind: "other", what } });
+    }
+    assert.equal(seen.delivered.length, 4);
+    assert.deepEqual(seen.downloads, []);
+    assert.equal(seen.sent.length, 4);
+    assert.match(seen.sent[0], /can't take stickers here, so that did not reach your agent/);
+  });
+
+  test("a video's caption reaches the agent, marked, and the person is told", async () => {
+    const { box, seen } = inbox();
+    await box.take({ ...message(), text: "what is wrong with this hinge?", media: { kind: "other", what: "videos" } });
+    assert.deepEqual(seen.delivered, [
+      "what is wrong with this hinge?\n\n[A video came with this and did not arrive (Bloks can't take videos from Telegram).]",
+    ]);
+    assert.deepEqual(seen.sent, ["I can't take videos here. Your caption went to your agent without it."]);
+  });
+
+  test("a voice message can answer a question", async () => {
+    const { box, seen } = inbox({}, { options: [], permission: false });
+    await box.take(voice());
+    assert.deepEqual(seen.answers, [{ free: "meet Siobhan at 4:15" }]);
+    assert.deepEqual(seen.delivered, [], "an answer is not also a new message");
+    assert.deepEqual(seen.sent, ["Sent."]);
+  });
+
+  test("a voice message cannot answer an approval, and is not even sent to be heard", async () => {
+    // a misheard "no" would be a "yes" to something that runs on this machine
+    const { box, seen } = inbox({}, { options: ["Allow", "Deny"], permission: true });
+    await box.take(voice());
+    assert.deepEqual(seen.answers, []);
+    assert.equal(seen.heard, 0);
+    assert.match(seen.sent[0], /typed answer/);
+    // typing it still works
+    await box.take(message({ text: "yes" }));
+    assert.deepEqual(seen.answers, [{ option: "Allow" }]);
+  });
+
+  test("a photo is never an answer to a card; it goes to the agent", async () => {
+    const { box, seen } = inbox({}, { options: [], permission: false });
+    await box.take(photo("p1", { text: "this one" }));
+    assert.deepEqual(seen.answers, []);
+    assert.equal(seen.delivered.length, 1);
+  });
+
+  // What #210 was about: the photo timed out, and the caption, which is
+  // the part that is hard to type again on a phone, went with it.
+  test("a photo that cannot be taken still sends its caption on, saying what is missing", async () => {
+    const { box, seen } = inbox({
+      download: async () => {
+        throw new Error("timed out");
+      },
+    });
+    await box.take(photo("p1", { text: "what do you make of this?" }));
+    assert.deepEqual(seen.delivered, ["what do you make of this?\n\n[A photo came with this and did not arrive (timed out).]"]);
+    assert.deepEqual(seen.sent, ["I couldn't take that photo (timed out). Your caption went to your agent without it."]);
+  });
+
+  test("a caption whose photo is missing is a new message, never the answer to a card", async () => {
+    const { box, seen } = inbox(
+      {
+        download: async () => {
+          throw new Error("timed out");
+        },
+      },
+      { options: [], permission: false },
+    );
+    await box.take(photo("p1", { text: "yes" }));
+    assert.deepEqual(seen.answers, []);
+    assert.equal(seen.delivered.length, 1);
+  });
+
+  test("an uncaptioned photo failure sends a note and keeps the same reply", async () => {
+    const { box, seen } = inbox({
+      download: async () => {
+        throw new Error("timed out");
+      },
+    });
+    await box.take(photo("p1"));
+    assert.deepEqual(seen.delivered, ["[A photo (7 bytes) did not arrive (timed out).]"]);
+    assert.deepEqual(seen.sent, ["I couldn't take that photo (timed out), so it did not reach your agent."]);
+  });
+
+  test("the agent is told which of an album's photos did not arrive", async () => {
+    const { box, seen } = inbox({
+      download: async (fileId) => {
+        if (fileId === "p2") throw new Error("timed out");
+        return PNG;
+      },
+    });
+    await box.take(photo("p1", { album: "g", text: "the kitchen" }));
+    await box.take(photo("p2", { album: "g" }));
+    await box.take(photo("p3", { album: "g" }));
+    await box.flush();
+    const { display, images } = splitAttachments(seen.delivered[0]!);
+    assert.equal(images.length, 2);
+    assert.equal(display, "the kitchen\n\n[1 of 3 photos did not arrive (timed out).]");
+    assert.match(seen.sent[0]!, /1 of those 3 did not reach your agent \(timed out\)\. The rest did\./);
+  });
+
+  test("an album where nothing arrived still sends its caption", async () => {
+    const { box, seen } = inbox({
+      download: async () => {
+        throw new Error("timed out");
+      },
+    });
+    await box.take(photo("p1", { album: "g", text: "before and after" }));
+    await box.take(photo("p2", { album: "g" }));
+    await box.flush();
+    assert.deepEqual(seen.delivered, ["before and after\n\n[2 photos came with this and none of them arrived (timed out).]"]);
+    assert.match(seen.sent[0]!, /None of those 2 reached your agent \(timed out\)\. Your caption went without them\./);
+  });
+
+  test("a transcribed voice message keeps its caption, first", async () => {
+    const { box, seen } = inbox();
+    await box.take(voice({ text: "for the shopping list" }));
+    const { display, voice: audio } = splitAttachments(seen.delivered[0]!);
+    assert.equal(display, "for the shopping list\n\nmeet Siobhan at 4:15");
+    assert.equal(audio.length, 1);
+    assert.match(seen.delivered[0]!, /note="Typed caption first, then transcribed/);
+  });
+
+  test("a voice message that cannot be heard still sends its caption on", async () => {
+    const { box, seen } = inbox({ transcriber: () => null });
+    await box.take(voice({ text: "for the shopping list" }));
+    assert.deepEqual(seen.delivered, [
+      "for the shopping list\n\n[A voice message came with this and did not arrive (there is no speech key to transcribe it).]",
+    ]);
+    assert.match(seen.sent[0]!, /Your caption went to your agent without it/);
+  });
+
+  test("a captioned voice message while an approval waits still asks for typing, and sends nothing", async () => {
+    const { box, seen } = inbox({}, { options: ["Allow", "Deny"], permission: true });
+    await box.take(voice({ text: "go ahead" }));
+    assert.deepEqual(seen.delivered, []);
+    assert.deepEqual(seen.answers, []);
+    assert.equal(seen.sent[0], "That one needs a tap or a typed answer. Tap a button on the card, or reply yes / no.");
+  });
+
+  test("typed text still answers a card, and an unclear approval points at its buttons", async () => {
+    const { box, seen } = inbox({}, { options: ["Allow", "Deny"], permission: true });
+    await box.take(message({ text: "hmm, what does it do?" }));
+    assert.deepEqual(seen.answers, []);
+    // the card no longer numbers its choices: they are buttons on it
+    assert.deepEqual(seen.sent, ["Tap a button on the card, or reply yes / no."]);
+    // a number still answers, for anyone who types one
+    await box.take(message({ text: "2" }));
+    assert.deepEqual(seen.answers, [{ option: "Deny" }]);
+  });
+});
+
+describe("files and speech over the wire", () => {
+  test("a file is fetched by asking where it is, then from there", async (t) => {
+    const urls: string[] = [];
+    t.mock.method(globalThis, "fetch", async (url: string) => {
+      urls.push(url);
+      if (url.endsWith("/getFile")) {
+        return Response.json({ ok: true, result: { file_path: "voice/file_3.oga", file_size: 6 } });
+      }
+      return new Response(OGG);
+    });
+    const bytes = await download("T0KEN", "abc", 1_000);
+    assert.deepEqual([...bytes], [...OGG]);
+    assert.deepEqual(urls, [
+      "https://api.telegram.org/botT0KEN/getFile",
+      "https://api.telegram.org/file/botT0KEN/voice/file_3.oga",
+    ]);
+  });
+
+  test("a file bigger than allowed is not downloaded at all", async (t) => {
+    let calls = 0;
+    t.mock.method(globalThis, "fetch", async () => {
+      calls++;
+      return Response.json({ ok: true, result: { file_path: "photos/a.jpg", file_size: 50 * 1024 * 1024 } });
+    });
+    await assert.rejects(download("T", "abc", 20 * 1024 * 1024), /over 20 MB/);
+    assert.equal(calls, 1);
+  });
+
+  test("a download that times out is tried once more", async (t) => {
+    let getFile = 0;
+    t.mock.method(globalThis, "fetch", async (url: string) => {
+      if (url.endsWith("/getFile")) {
+        getFile++;
+        if (getFile === 1) throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+        return Response.json({ ok: true, result: { file_path: "photos/a.jpg", file_size: 6 } });
+      }
+      return new Response(OGG);
+    });
+    assert.deepEqual([...(await download("T", "abc", 1_000))], [...OGG]);
+    assert.equal(getFile, 2);
+  });
+
+  test("a connection that drops twice gives up, and says so plainly", async (t) => {
+    let calls = 0;
+    t.mock.method(globalThis, "fetch", async (url: string) => {
+      calls++;
+      if (url.endsWith("/getFile")) return Response.json({ ok: true, result: { file_path: "photos/a.jpg", file_size: 6 } });
+      throw new TypeError("fetch failed");
+    });
+    await assert.rejects(download("T", "abc", 1_000), (error: Error) => error.message === "the connection dropped");
+    assert.equal(calls, 4, "two tries of two calls each, and no third");
+  });
+
+  test("a file Telegram refuses is not tried again", async (t) => {
+    let calls = 0;
+    t.mock.method(globalThis, "fetch", async () => {
+      calls++;
+      return new Response("{}", { status: 400 });
+    });
+    await assert.rejects(download("T", "abc", 1_000), /HTTP 400/);
+    assert.equal(calls, 1);
+  });
+
+  test("a voice note goes to the vendor named .ogg, with the vendor's model", async (t) => {
+    const sent: { url: string; form: FormData; headers: Record<string, string> }[] = [];
+    t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+      sent.push({ url, form: init.body as FormData, headers: init.headers as Record<string, string> });
+      return Response.json({ text: " hello there ", languages: [{ code: "en" }] });
+    });
+    assert.equal(await transcribe({ speech: { openaiKey: "sk-test" } }, OGG, "voice.ogg", "audio/ogg"), "hello there");
+    assert.equal(await transcribe({ speech: { elevenlabsKey: "el-test" } }, OGG, "voice.ogg", "audio/ogg"), "hello there");
+    assert.equal(sent[0].url, "https://api.openai.com/v1/audio/transcriptions");
+    assert.equal(sent[0].form.get("model"), "gpt-transcribe");
+    assert.deepEqual([...(sent[0].form as unknown as Iterable<[string, unknown]>)].map(([key]) => key).sort(), ["file", "model"]);
+    const file = sent[0].form.get("file") as File;
+    assert.equal(file.name, "voice.ogg");
+    assert.equal(file.type, "audio/ogg");
+    assert.deepEqual(new Uint8Array(await file.arrayBuffer()), OGG);
+    assert.equal(sent[0].headers.authorization, "Bearer sk-test");
+    assert.equal(sent[1].url, "https://api.elevenlabs.io/v1/speech-to-text");
+    assert.equal(sent[1].form.get("model_id"), "scribe_v2");
+    assert.equal(sent[1].headers["xi-api-key"], "el-test");
+  });
+
+  test("a vendor that refuses is an error carrying only its status", async (t) => {
+    t.mock.method(globalThis, "fetch", async () => new Response("{\"error\":\"key sk-secret is wrong\"}", { status: 401 }));
+    await assert.rejects(transcribe({ speech: { openaiKey: "sk-test" } }, OGG, "voice.ogg", "audio/ogg"), (error: Error) => {
+      assert.equal(error.message, "OpenAI answered 401");
+      return true;
+    });
+  });
+});
+
+describe("typing while the agent works", () => {
+  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  // a loaded machine runs a 10 ms interval late, never early: wait for the
+  // ticks themselves, up to a bound, rather than for the time they should take
+  const until = async (done: () => boolean) => { for (let i = 0; i < 200 && !done(); i++) await wait(10); };
+
+  test("says typing at once, then again and again until the turn ends", async () => {
+    let said = 0;
+    const typing = keepTyping(async () => void said++, () => false, 10);
+    await wait(0);
+    assert.equal(said, 1, "at once, not one interval in");
+    await until(() => said >= 3);
+    assert.ok(said >= 3);
+    await typing.stop();
+    const stopped = said;
+    await wait(40);
+    assert.equal(said, stopped, "nothing after the turn ends");
+  });
+
+  test("goes quiet while a card waits for the person, and picks up when it is answered", async () => {
+    let said = 0;
+    let waiting = false;
+    const typing = keepTyping(async () => void said++, () => waiting, 10);
+    await wait(0);
+    waiting = true;
+    const before = said;
+    await wait(40);
+    assert.equal(said, before, "typing would say the agent is working when it is waiting on them");
+    waiting = false;
+    await until(() => said > before);
+    assert.ok(said > before, "and it comes back once the card is answered");
+    await typing.stop();
+  });
+
+  test("an answered card brings typing back at once, not a tick later", async () => {
+    let said = 0;
+    const typing = keepTyping(async () => void said++, () => false, 60_000);
+    await wait(0);
+    typing.now();
+    await wait(0);
+    assert.equal(said, 2);
+    await typing.stop();
+  });
+
+  test("a chat action that fails is ignored", async () => {
+    const typing = keepTyping(
+      async () => {
+        throw new Error("Telegram answered HTTP 403");
+      },
+      () => false,
+      10,
+    );
+    await wait(25);
+    await typing.stop();
+  });
+
+  test("stopping waits for one already on its way, so it cannot land after the answer", async () => {
+    let landed = false;
+    const typing = keepTyping(
+      async () => {
+        await wait(20);
+        landed = true;
+      },
+      () => false,
+      1_000,
+    );
+    await typing.stop();
+    assert.equal(landed, true);
+  });
+
+  test("the action is typing, to the chat that asked", async (t) => {
+    const bodies: unknown[] = [];
+    t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+      assert.match(url, /\/sendChatAction$/);
+      bodies.push(JSON.parse(String(init.body)));
+      return Response.json({ ok: true, result: true });
+    });
+    await chatAction("T", 42);
+    assert.deepEqual(bodies, [{ chat_id: 42, action: "typing" }]);
+  });
+});
+
+describe("new silent messages for a long turn's notes", () => {
+  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const until = async (done: () => boolean) => {
+    for (let i = 0; i < 400 && !done(); i++) await wait(5);
+    assert.ok(done(), "the expected progress call arrived");
+  };
+  function notes(paused = () => false, afterMs = 20, everyMs = 40) {
+    const calls: string[] = [], times: number[] = [];
+    const hold = { post: false };
+    const releases: Array<() => void> = [];
+    let nextId = 7;
+    const record = (text: string) => { calls.push(text); times.push(Date.now()); };
+    const progress = new Progress({
+      post: async (text) => {
+        const id = nextId++;
+        record("post " + text);
+        if (hold.post) await new Promise<void>((r) => releases.push(r));
+        return id;
+      },
+      remove: async (id) => record("remove " + id),
+    }, paused, afterMs, everyMs);
+    return { progress, calls, times, hold, release: () => releases.splice(0).forEach((r) => r()) };
+  }
+
+  test("the existing delay and four-second throttle remain", () => {
+    assert.equal(PROGRESS_AFTER_MS, 20_000);
+    assert.equal(PROGRESS_EVERY_MS, 4_000);
+  });
+
+  test("a quick turn posts nothing, even with a note", async () => {
+    const f = notes();
+    f.progress.note("Checking the result.");
+    await f.progress.stop();
+    await wait(50);
+    assert.deepEqual(f.calls, []);
+  });
+
+  test("no note means no message after the delay, and whitespace is skipped", async () => {
+    const f = notes();
+    f.progress.note(" \n\t ");
+    await wait(60);
+    assert.deepEqual(f.calls, []);
+    f.progress.note("The first visible note.");
+    await until(() => f.calls.length > 0);
+    assert.deepEqual(f.calls, ["post The first visible note."]);
+    await f.progress.stop();
+    assert.deepEqual(f.calls, ["post The first visible note.", "remove 7"]);
+  });
+
+  test("notes in the initial delay go together in order", async () => {
+    const f = notes();
+    f.progress.note("One."); f.progress.note("Two.");
+    await until(() => f.calls.length > 0);
+    assert.deepEqual(f.calls, ["post One.\n\nTwo."]);
+    await f.progress.stop();
+  });
+
+  test("three separated notes make three new posts, all deleted before the answer", async () => {
+    const f = notes();
+    for (const [i, word] of ["One.", "Two.", "Three."].entries()) {
+      f.progress.note(word);
+      await until(() => f.calls.length === i + 1);
+    }
+    await f.progress.stop();
+    f.calls.push("answer");
+    assert.deepEqual(f.calls, ["post One.", "post Two.", "post Three.", "remove 7", "remove 8", "remove 9", "answer"]);
+    assert.ok(f.times[1] - f.times[0] >= 38);
+    assert.ok(f.times[2] - f.times[1] >= 38);
+  });
+
+  test("rapid notes coalesce inside the throttle without replaying earlier notes", async () => {
+    const f = notes();
+    f.progress.note("One."); await until(() => f.calls.length === 1);
+    f.progress.note("Two."); f.progress.note("Three.");
+    await until(() => f.calls.length === 2);
+    assert.deepEqual(f.calls, ["post One.", "post Two.\n\nThree."]);
+    assert.ok(f.times[1] - f.times[0] >= 38);
+    await f.progress.stop();
+  });
+
+  test("a held post serializes later notes even after the throttle expires", async () => {
+    const f = notes(); f.hold.post = true;
+    f.progress.note("One."); await until(() => f.calls.length === 1);
+    try {
+      f.progress.note("Two."); f.progress.note("Three.");
+      await wait(100);
+      assert.deepEqual(f.calls, ["post One."], "a second post must wait for the first response");
+      f.hold.post = false; f.release();
+      await until(() => f.calls.length === 2);
+      assert.deepEqual(f.calls, ["post One.", "post Two.\n\nThree."]);
+    } finally { f.hold.post = false; f.release(); await f.progress.stop(); }
+  });
+
+  test("a card pauses posts without losing any pending notes", async () => {
+    let paused = true;
+    const f = notes(() => paused);
+    f.progress.note("One.");
+    await wait(60); assert.deepEqual(f.calls, []);
+    paused = false; await until(() => f.calls.length === 1);
+    paused = true; f.progress.note("Two."); f.progress.note("Three.");
+    await wait(60); assert.equal(f.calls.length, 1);
+    paused = false; await until(() => f.calls.length === 2);
+    assert.equal(f.calls[1], "post Two.\n\nThree.");
+    await f.progress.stop();
+  });
+
+  test("an overflowing batch splits at whole-note boundaries without dropping older notes", async () => {
+    const f = notes();
+    const a = "a".repeat(1_500), b = "b".repeat(1_500), c = "c".repeat(1_500);
+    f.progress.note(a); f.progress.note(b); f.progress.note(c);
+    await until(() => f.calls.length === 2);
+    assert.deepEqual(f.calls, ["post " + a + "\n\n" + b, "post " + c]);
+    assert.ok(f.calls.every((c) => c.slice(5).length <= 4_000));
+    assert.ok(f.times[1] - f.times[0] >= 38);
+    await f.progress.stop();
+  });
+
+  test("UTF-16 bounds keep an exact 4000-unit note whole and never split an emoji", async () => {
+    const f = notes();
+    f.progress.note("😀".repeat(2_000));
+    f.progress.note("😀".repeat(2_001));
+    f.progress.note("a".repeat(3_998) + "😀tail");
+    f.progress.note("Newest.");
+    await until(() => f.calls.length === 4);
+    assert.deepEqual(f.calls, ["post " + "😀".repeat(2_000), "post " + "😀".repeat(1_999) + "…", "post " + "a".repeat(3_998) + "…", "post Newest."]);
+    assert.ok(f.calls.every((c) => c.slice(5).length <= 4_000));
+    await f.progress.stop();
+  });
+
+  test("notes are plain visible text, with Markdown marks kept as typed", async () => {
+    const f = notes();
+    const note = " *A note*\nwith [a link](https://example.test) ";
+    f.progress.note(note); await until(() => f.calls.length === 1);
+    assert.equal(f.calls[0], "post " + note);
+    await f.progress.stop();
+  });
+
+  test("an uncertain post suppresses all further posts in the turn", async () => {
+    let posts = 0;
+    const progress = new Progress({
+      post: async () => { posts++; throw new Error("connection dropped"); },
+      remove: async () => assert.fail("no known message"),
+    }, () => false, 10, 20);
+    progress.note("One."); await until(() => posts === 1);
+    progress.note("Two."); progress.note("Three.");
+    await wait(80); assert.equal(posts, 1);
+    await progress.stop();
+  });
+
+  test("two acknowledged posts then an unknown failure stop further posts and delete both known ids", async () => {
+    const calls: string[] = [];
+    let posts = 0;
+    const progress = new Progress({
+      post: async (text) => {
+        calls.push("post " + text);
+        if (++posts === 3) throw new Error("connection dropped");
+        return posts;
+      },
+      remove: async (id) => void calls.push("remove " + id),
+    }, () => false, 10, 20);
+    for (const [i, word] of ["One.", "Two.", "Three."].entries()) {
+      progress.note(word); await until(() => posts === i + 1);
+    }
+    progress.note("Four."); progress.note("Five.");
+    await wait(80); assert.equal(posts, 3, "an unknown third attempt prevents a fourth");
+    await progress.stop(); calls.push("answer");
+    assert.deepEqual(calls, ["post One.", "post Two.", "post Three.", "remove 1", "remove 2", "answer"]);
+  });
+
+  test("a successful post with no message id is also never duplicated", async () => {
+    let posts = 0;
+    const progress = new Progress({
+      post: async () => { posts++; return undefined; },
+      remove: async () => assert.fail("no known message"),
+    }, () => false, 10, 20);
+    progress.note("One."); await until(() => posts === 1);
+    progress.note("Two."); await wait(60);
+    assert.equal(posts, 1); await progress.stop();
+  });
+
+  test("a refused post may post again with the next note, without an automatic retry", async () => {
+    const bodies: string[] = [], removed: number[] = [];
+    const progress = new Progress({
+      post: async (text) => { bodies.push(text); if (bodies.length === 1) throw new TelegramError(403); return 7; },
+      remove: async (id) => void removed.push(id),
+    }, () => false, 10, 20);
+    progress.note("One."); await until(() => bodies.length === 1);
+    await wait(60); assert.equal(bodies.length, 1);
+    progress.note("Two."); await until(() => bodies.length === 2);
+    await progress.stop();
+    assert.deepEqual(bodies, ["One.", "Two."]);
+    assert.deepEqual(removed, [7]);
+  });
+
+  test("a refused split batch resumes only when a new note arrives", async () => {
+    const bodies: string[] = [];
+    const progress = new Progress({
+      post: async (text) => { bodies.push(text); if (bodies.length === 1) throw new TelegramError(403); return 7; },
+      remove: async () => {},
+    }, () => false, 10, 20);
+    progress.note("a".repeat(3_000)); progress.note("b".repeat(3_000));
+    await until(() => bodies.length === 1);
+    await wait(60); assert.equal(bodies.length, 1);
+    progress.note("Next."); await until(() => bodies.length === 2);
+    assert.equal(bodies[1], "b".repeat(3_000) + "\n\nNext.");
+    await progress.stop();
+  });
+
+  test("a held post settles before cleanup, pending notes are cancelled, and stop is idempotent", async () => {
+    const f = notes(); f.hold.post = true; f.progress.note("One.");
+    await until(() => f.calls.length === 1);
+    f.progress.note("Two.");
+    const stopped = f.progress.stop();
+    assert.equal(f.progress.stop(), stopped);
+    assert.deepEqual(f.calls, ["post One."]);
+    f.hold.post = false; f.release(); await stopped;
+    f.calls.push("answer"); f.progress.note("Late."); await wait(60);
+    assert.deepEqual(f.calls, ["post One.", "remove 7", "answer"]);
+  });
+
+  test("a failed delete does not prevent the remaining deletions or the answer", async () => {
+    const calls: string[] = [];
+    let nextId = 1;
+    const progress = new Progress({
+      post: async (text) => { calls.push("post " + text); return nextId++; },
+      remove: async (id) => { calls.push("remove " + id); if (id === 1) throw new Error("delete refused"); },
+    }, () => false, 10, 20);
+    progress.note("One."); await until(() => calls.length === 1);
+    progress.note("Two."); await until(() => calls.length === 2);
+    await progress.stop(); calls.push("answer");
+    assert.deepEqual(calls, ["post One.", "post Two.", "remove 1", "remove 2", "answer"]);
+  });
+});
+
+describe("files back to the phone", () => {
+  type Upload = { method: string; chat: string | null; field: string; name: string; type: string };
+  /** Every upload, read back from its form. `refuse` answers a method
+   * with that status instead of taking it. */
+  function uploads(t: { mock: { method: (...args: any[]) => unknown } }, refuse: Record<string, number> = {}) {
+    const seen: Upload[] = [];
+    t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+      const method = url.split("/").pop()!;
+      if (refuse[method]) return Response.json({ ok: false }, { status: refuse[method] });
+      const form = init.body as FormData;
+      const field = form.has("photo") ? "photo" : "document";
+      const file = form.get(field) as File;
+      seen.push({ method, chat: form.get("chat_id") as string | null, field, name: file.name, type: file.type });
+      return Response.json({ ok: true, result: { message_id: 1 } });
+    });
+    return seen;
+  }
+  const file = (name: string, mime: string, size = 10, read?: () => void): Deliverable => ({
+    name,
+    mime,
+    size,
+    blob: async () => {
+      read?.();
+      return new Blob(["bytes"], { type: mime });
+    },
+  });
+
+  test("an image shows as a photo, anything else as a file, in the order they came", async (t) => {
+    const seen = uploads(t);
+    assert.equal(await sendFiles("T", 42, [file("chart.png", "image/png"), file("report.pdf", "application/pdf")]), "");
+    assert.deepEqual(seen, [
+      { method: "sendPhoto", chat: "42", field: "photo", name: "chart.png", type: "image/png" },
+      { method: "sendDocument", chat: "42", field: "document", name: "report.pdf", type: "application/pdf" },
+    ]);
+  });
+
+  test("an image too big for a photo, or one Telegram will not take as one, still goes as a file", async (t) => {
+    const big = uploads(t);
+    await sendFiles("T", 42, [file("scan.jpg", "image/jpeg", 11 * 1024 * 1024)]);
+    assert.deepEqual(big.map((u) => u.method), ["sendDocument"]);
+    t.mock.restoreAll();
+    const refused = uploads(t, { sendPhoto: 400 });
+    assert.equal(await sendFiles("T", 42, [file("tall.png", "image/png")]), "");
+    assert.deepEqual(refused.map((u) => u.method), ["sendDocument"]);
+  });
+
+  test("a file over Telegram's 50 MB is never read, and the person is told it is in the app", async (t) => {
+    const seen = uploads(t);
+    let read = false;
+    const note = await sendFiles("T", 42, [file("footage.mov", "video/quicktime", 51 * 1024 * 1024, () => (read = true)), file("a.txt", "text/plain")]);
+    assert.equal(read, false);
+    assert.deepEqual(seen.map((u) => u.name), ["a.txt"]);
+    assert.equal(note, "Not sent here: footage.mov (over Telegram's 50 MB). It is in the app.");
+  });
+
+  test("only a few come with an answer, and the rest are counted", async (t) => {
+    const seen = uploads(t);
+    const many = Array.from({ length: 7 }, (_, i) => file(`part-${i + 1}.txt`, "text/plain"));
+    const note = await sendFiles("T", 42, many);
+    assert.equal(FILES_PER_TURN, 5);
+    assert.deepEqual(seen.map((u) => u.name), ["part-1.txt", "part-2.txt", "part-3.txt", "part-4.txt", "part-5.txt"]);
+    assert.equal(note, "Not sent here: 2 more files (only 5 come with an answer). They are in the app.");
+  });
+
+  test("a file Telegram refuses is named, and the rest still go", async (t) => {
+    let calls = 0;
+    t.mock.method(globalThis, "fetch", async () => {
+      calls++;
+      return calls === 1 ? Response.json({ ok: false }, { status: 413 }) : Response.json({ ok: true, result: {} });
+    });
+    const note = await sendFiles("T", 42, [file("huge.zip", "application/zip"), file("b.txt", "text/plain")]);
+    assert.equal(calls, 2);
+    assert.equal(note, "Not sent here: huge.zip (Telegram answered HTTP 413). It is in the app.");
+  });
+});
+
+describe("buttons over the wire", () => {
+  /** Every call made, by method, with its body. */
+  function wire(t: { mock: { method: (...args: any[]) => unknown } }, result: unknown = true) {
+    const calls: { method: string; body: any }[] = [];
+    t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+      calls.push({ method: url.split("/").pop()!, body: JSON.parse(String(init.body)) });
+      return Response.json({ ok: true, result });
+    });
+    return calls;
+  }
+
+  test("polling asks for presses as well as messages", async (t) => {
+    const calls = wire(t, []);
+    await poll("T", 3);
+    assert.deepEqual(calls[0].body.allowed_updates, ["message", "callback_query"]);
+  });
+
+  test("a card goes with its buttons, and comes back with the id of the message it became", async (t) => {
+    const calls = wire(t, { message_id: 81 });
+    const keyboard = { inline_keyboard: [[{ text: "Allow", callback_data: "abcdEFGH:0" }]] };
+    assert.equal(await post("T", 42, "Approval needed", keyboard), 81);
+    assert.deepEqual(calls[0], { method: "sendMessage", body: { chat_id: 42, text: "Approval needed", reply_markup: keyboard } });
+  });
+
+  test("a status line is silent, but the answer still notifies", async (t) => {
+    const calls = wire(t, { message_id: 81 });
+    assert.equal(await post("T", 42, "Working...", undefined, true), 81);
+    await send("T", 42, "Here is the answer.");
+    assert.deepEqual(calls, [
+      { method: "sendMessage", body: { chat_id: 42, text: "Working...", disable_notification: true } },
+      { method: "sendMessage", body: { chat_id: 42, text: "Here is the answer." } },
+    ]);
+  });
+
+  test("an answered card is rewritten without its buttons, and the press is answered", async (t) => {
+    const calls = wire(t);
+    await edit("T", 42, 81, "Approval needed\n\nAllowed");
+    await answerPress("T", "press-1", "Allowed");
+    await unbutton("T", 42, 82);
+    assert.deepEqual(calls, [
+      { method: "editMessageText", body: { chat_id: 42, message_id: 81, text: "Approval needed\n\nAllowed", reply_markup: { inline_keyboard: [] } } },
+      { method: "answerCallbackQuery", body: { callback_query_id: "press-1", text: "Allowed" } },
+      { method: "editMessageReplyMarkup", body: { chat_id: 42, message_id: 82, reply_markup: { inline_keyboard: [] } } },
+    ]);
   });
 });

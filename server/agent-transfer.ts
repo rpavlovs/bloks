@@ -36,7 +36,9 @@ export const LIMITS = {
   topics: 50,
   topicBytes: 256 * 1024,
   skills: 40,
-  skillBytes: 16_000,
+  /** Characters, not bytes, because this is the skill library's own limit
+   * and a skill that installs here has to fit in a file going out. */
+  skillChars: 16_000,
   avatar: 2 * 1024 * 1024,
 } as const;
 
@@ -97,6 +99,9 @@ export interface PortableAgent {
   /** A wish, not a binding: the engine may not exist on the machine this
    * lands on, in which case the workspace default is used instead. */
   model?: { instanceId: string; model: string };
+  /** The engine a turn moves to when the agent's own runs out. A wish in
+   * the same way: kept only when that engine exists where it lands. */
+  backup?: { instanceId: string; model: string };
   /** Carried because how an agent sounds is part of who it is. Needs a
    * key at the other end, which the preview says out loud. */
   voice?: { provider: "elevenlabs" | "openai"; id: string; name?: string };
@@ -140,6 +145,7 @@ export interface PackInput {
     effort?: "low" | "medium" | "high";
     mascotExpression?: BlokExpression | null;
     modelSelection?: { instanceId: string; model: string };
+    backupSelection?: { instanceId: string; model: string } | null;
     voice?: { provider: "elevenlabs" | "openai"; id: string; name?: string } | null;
   };
   memory?: string;
@@ -199,6 +205,12 @@ export function packAgent(input: PackInput): AgentFile {
       model: String(bot.modelSelection.model).slice(0, 200),
     };
   }
+  if (bot.backupSelection?.instanceId && bot.backupSelection.model) {
+    agent.backup = {
+      instanceId: String(bot.backupSelection.instanceId).slice(0, 120),
+      model: String(bot.backupSelection.model).slice(0, 200),
+    };
+  }
   if (bot.voice?.id && (bot.voice.provider === "elevenlabs" || bot.voice.provider === "openai")) {
     agent.voice = {
       provider: bot.voice.provider,
@@ -231,7 +243,7 @@ export function packAgent(input: PackInput): AgentFile {
       id: slug(s.id || s.name),
       name: trim(s.name, LIMITS.name) || slug(s.id || s.name),
       description: trim(s.description, 200),
-      body: clampBytes(s.body.trim(), LIMITS.skillBytes),
+      body: [...s.body.trim()].slice(0, LIMITS.skillChars).join(""),
     }));
   if (skills.length) file.skills = skills;
 
@@ -329,6 +341,12 @@ export function parseAgentFile(value: unknown): ParseResult {
       model: raw.model.model.slice(0, 200),
     };
   }
+  if (isRecord(raw.backup) && typeof raw.backup.instanceId === "string" && typeof raw.backup.model === "string") {
+    agent.backup = {
+      instanceId: raw.backup.instanceId.slice(0, 120),
+      model: raw.backup.model.slice(0, 200),
+    };
+  }
   if (
     isRecord(raw.voice) &&
     (raw.voice.provider === "elevenlabs" || raw.voice.provider === "openai") &&
@@ -384,7 +402,7 @@ export function parseAgentFile(value: unknown): ParseResult {
       if (!isRecord(entry)) return { ok: false, error: "that agent file's skills are malformed" };
       const body = typeof entry.body === "string" ? entry.body.trim() : "";
       if (!body) continue;
-      if (bytes(body) > LIMITS.skillBytes) {
+      if ([...body].length > LIMITS.skillChars) {
         return { ok: false, error: "one of that agent's skills is too large" };
       }
       const id = slug(typeof entry.id === "string" && entry.id ? entry.id : String(entry.name ?? ""));
@@ -494,6 +512,9 @@ export function describeAgentFile(file: AgentFile, ctx: PreviewContext): AgentPr
     notes.push("Its memory comes with it, so it arrives knowing what it knew.");
   }
   notes.push("Its conversations stay behind. This is the agent, not the history.");
+  // Workspace setup that names an agent is not part of the agent, and an
+  // imported one is a new agent here, so say so before anyone relies on it.
+  notes.push("Its routines, webhooks and watchers stay behind too. Set them up again for it here if you need them.");
 
   return {
     name: file.agent.name,

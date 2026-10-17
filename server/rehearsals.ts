@@ -23,10 +23,11 @@
 // rehearsal as anywhere; the agent is told so, and approvals still ask.
 import { execFile } from "node:child_process";
 import { cp, rm } from "node:fs/promises";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { newId } from "./contracts.ts";
+import { readSaved } from "./atomic-write.ts";
 
 export type RehearsalState = "running" | "ready" | "empty" | "applied" | "discarded" | "failed";
 
@@ -87,28 +88,37 @@ export class Rehearsals {
   private readonly root: string;
   private readonly file: string;
   private list: Rehearsal[] = [];
+  /** Told when an attempt's copy is gone, so what was kept beside it
+   * (its baseline photograph, in checkpoints.ts) can go too. */
+  private readonly onSettled?: (r: Rehearsal) => void;
 
-  constructor(root: string) {
+  constructor(root: string, onSettled?: (r: Rehearsal) => void) {
     this.root = root;
     this.file = join(root, "index.json");
-    try {
-      const parsed = JSON.parse(readFileSync(this.file, "utf8"));
-      if (Array.isArray(parsed)) this.list = parsed;
-    } catch {
-      /* none yet */
-    }
+    this.onSettled = onSettled;
+    this.list = readSaved<Rehearsal[]>(this.file, [], Array.isArray);
     // a rehearsal cannot still be running across a restart: its turn died
     for (const r of this.list) if (r.state === "running") r.state = "failed";
     this.save();
   }
 
-  /** A clone of `dir` to rehearse in. The caller photographs `dir` first. */
-  async open(input: { group?: string; botId: string; taskId: string; dir: string; text: string }): Promise<Rehearsal> {
+  /**
+   * A clone of `dir` to rehearse in. `photograph` is handed the copy's
+   * path and runs before the clone is made, so every turn in it can be
+   * compared with the folder as it was copied (Checkpoints.baseline).
+   */
+  async open(input: {
+    group?: string;
+    botId: string;
+    taskId: string;
+    dir: string;
+    text: string;
+    photograph?: (copy: string) => Promise<unknown>;
+  }): Promise<Rehearsal> {
     const id = newId();
     const home = join(this.root, id);
     mkdirSync(home, { recursive: true, mode: 0o700 });
     const copy = join(home, "copy");
-    await cloneFolder(input.dir, copy);
     const rehearsal: Rehearsal = {
       id,
       group: input.group ?? id,
@@ -120,6 +130,15 @@ export class Rehearsals {
       state: "running",
       at: Date.now(),
     };
+    try {
+      await input.photograph?.(copy);
+      await cloneFolder(input.dir, copy);
+    } catch (e) {
+      // nothing of a copy that never was is kept, here or beside it
+      await rm(home, { recursive: true, force: true }).catch(() => {});
+      this.onSettled?.(rehearsal);
+      throw e;
+    }
     this.list.push(rehearsal);
     this.save();
     return rehearsal;
@@ -166,21 +185,28 @@ export class Rehearsals {
     r.settledAt = Date.now();
     this.save();
     await rm(join(this.root, r.id), { recursive: true, force: true }).catch(() => {});
+    this.onSettled?.(r);
   }
 
-  /** Clears clones left waiting too long, and forgets the oldest settled. */
-  async sweep(now = Date.now()): Promise<void> {
+  /** Clears clones left waiting too long, and forgets the oldest settled.
+   * True when it settled or forgot any. */
+  async sweep(now = Date.now()): Promise<boolean> {
+    let changed = false;
     for (const r of this.list) {
       if ((r.state === "ready" || r.state === "empty") && now - r.at > STALE_MS) await this.settle(r.id, "discarded");
       // cut off by a restart: nothing will ever come of its copy
       else if (r.state === "failed" && !r.settledAt) await this.settle(r.id, "failed");
+      else continue;
+      changed = true;
     }
     const settled = this.list.filter((r) => r.settledAt);
     if (settled.length > MAX_KEPT) {
       const drop = new Set(settled.slice(0, settled.length - MAX_KEPT).map((r) => r.id));
       this.list = this.list.filter((r) => !drop.has(r.id));
       this.save();
+      changed = true;
     }
+    return changed;
   }
 
   private save() {

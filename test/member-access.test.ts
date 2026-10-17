@@ -101,6 +101,26 @@ test("tool activity shows its kind, never its arguments", () => {
   assert.equal(toolKind("mcp__composio__GMAIL_SEND"), "Used a connected app");
 });
 
+test("members never receive command text, whatever the room's activity setting", () => {
+  const row = msg({ kind: "activity", tool: { name: "shell", command: "printf '[redacted]'", ok: false, stopped: true } });
+  const hidden = memberMessage(row, view())!;
+  assert.deepEqual(hidden.tool, { name: "Ran a command", ok: false, stopped: true });
+  assert.equal("command" in hidden.tool!, false);
+  // activity detail shares the tool's name, never the words it ran
+  const detail = memberMessage(row, view({ activityDetail: true }))!;
+  assert.deepEqual(detail.tool, { name: "shell", ok: false, stopped: true });
+  assert.equal("command" in detail.tool!, false);
+  assert.equal(row.tool!.command, "printf '[redacted]'", "the owner's own row lost its command");
+  for (const kind of ["message", "message.patch"]) {
+    const frame = { kind, threadId: ROOM, message: row };
+    for (const activityDetail of [false, true]) {
+      const shown = memberFrame(frame, () => view({ activityDetail })) as any;
+      assert.equal("command" in shown.message.tool, false, `${kind} with activity detail ${activityDetail}`);
+      assert.ok(!JSON.stringify(shown).includes("printf"), `${kind} with activity detail ${activityDetail}`);
+    }
+  }
+});
+
 test("approvals reach members without their buttons; questions keep theirs", () => {
   const approval = msg({
     kind: "options",
@@ -138,5 +158,14 @@ test("frames reach a member only for their own rooms", () => {
   assert.equal(memberFrame({ kind: "room.typing", roomId: OTHER, name: "Sam" }, viewOf), null);
   for (const kind of ["bot", "runtime", "config", "relay", "screen", "blok", "instances", "room.joinRequest", "computer"]) {
     assert.equal(memberFrame({ kind, roomId: ROOM, threadId: ROOM }, viewOf), null, kind);
+  }
+});
+
+test("stable Codex command kinds match Bash for restricted members", () => {
+  for (const command of ["curl https://example.invalid", "browser navigate https://example.invalid"]) {
+    const row = msg({ kind: "activity", tool: { name: "shell", command } });
+    assert.equal(memberMessage(row, view())!.tool!.name, "Ran a command");
+    assert.equal("command" in memberMessage(row, view())!.tool!, false);
+    assert.notEqual(toolKind(command), "Ran a command");
   }
 });

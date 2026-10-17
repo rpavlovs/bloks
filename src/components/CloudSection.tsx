@@ -21,7 +21,14 @@ const CLOUD_KEY = /^blok_live_[0-9a-f]{32}$/;
 interface RelayStatus {
   enabled: boolean;
   connected: boolean;
+  /** Missing from an older server, which could not tell. */
+  delivering?: boolean;
   spaceId: string | null;
+  /** Why the line is down, in the link's words. Never a secret. */
+  problem?: string | null;
+  /** Whether phone access is on. Cloud only dials while it is. Missing
+   * from an older server. */
+  pairing?: boolean;
 }
 
 async function api(path: string, init?: RequestInit): Promise<any> {
@@ -77,7 +84,22 @@ export function CloudSection() {
       .finally(() => setBusy(false));
   };
 
+  // Phone access is the master switch, Cloud included: turning it off is
+  // how somebody cuts every phone loose at once. So a key can be accepted
+  // while nothing dials, and the screen has to say which switch is off.
+  const turnOnPhones = () => {
+    setBusy(true);
+    setError(null);
+    api("/api/pair", { method: "PATCH", body: JSON.stringify({ enabled: true }) })
+      .then(load)
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setBusy(false));
+  };
+
   const on = status?.enabled ?? false;
+  const phonesOff = on && status?.pairing === false;
+  // green only when the answers land too, not just when the line is open
+  const working = Boolean(status?.connected) && status?.delivering !== false;
 
   return (
     <div className="mt-4 rounded-2xl border bg-card p-4">
@@ -85,7 +107,7 @@ export function CloudSection() {
         <div className="min-w-0">
           <div className="flex items-center gap-1.5">
             <Cloud size={13.5} className="shrink-0 text-brand-ink" />
-            <span className="text-[13.5px] font-semibold text-foreground">Bloks Cloud</span>
+            <span className="text-[13.5px] font-semibold text-foreground">Your plan</span>
           </div>
           <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted-foreground">
             Reaches {thisComputer()} from your phone anywhere, not just on this network, and pushes
@@ -97,12 +119,12 @@ export function CloudSection() {
           <span
             className={
               "shrink-0 rounded-full px-2 py-0.5 text-[11.5px] font-medium " +
-              (status?.connected
+              (working
                 ? "bg-success/10 text-success"
                 : "bg-warning/10 text-warning")
             }
           >
-            {status?.connected ? "Connected" : "Reconnecting"}
+            {working ? "Connected" : phonesOff ? "Paused" : status?.connected ? "Replies failing" : "Reconnecting"}
           </span>
         )}
       </div>
@@ -117,12 +139,34 @@ export function CloudSection() {
         <Loader2 size={14} className="mt-3 animate-spin text-muted-foreground" />
       ) : on ? (
         <div className="mt-3 text-[12px] leading-relaxed text-muted-foreground">
-          {status.spaceId ? (
+          {phonesOff ? (
+            <>
+              Activated, but phone access is off on {thisComputer()}, and Cloud only runs while it
+              is on. Turning phone access off is how every phone is cut loose at once, Cloud
+              included.
+              <div className="mt-2">
+                <Button size="sm" variant="brand" disabled={busy} onClick={turnOnPhones}>
+                  {busy ? <Loader2 size={13} className="animate-spin" /> : "Turn on phone access"}
+                </Button>
+              </div>
+            </>
+          ) : status.connected && status.delivering === false ? (
+            <>
+              {thisComputer()} can hear Bloks Cloud, but its replies are not getting through, so
+              your phone may say it cannot reach it. This is usually the network here. Bloks
+              keeps retrying and turns green once replies land.
+            </>
+          ) : status.spaceId ? (
             <>
               Active. Pair a phone above and it will reach {thisComputer()} from anywhere.
               <span className="ml-1 font-mono text-[11.5px] text-muted-foreground/70">
                 {status.spaceId}
               </span>
+            </>
+          ) : status.problem ? (
+            <>
+              Activated, but {thisComputer()} cannot reach Bloks Cloud yet. Bloks keeps trying.
+              <span className="mt-1 block text-[11.5px] text-muted-foreground/80">{status.problem}</span>
             </>
           ) : (
             "Activated. Waiting for the relay to answer."

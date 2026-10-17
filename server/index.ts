@@ -1,18 +1,33 @@
+import { ReplyNotifications, settledReply } from "./reply-notifications.ts";
 // Bloks server: the harness host.
 //
 // The one rule the whole shape follows: clients hold no transports. The
 // React app dispatches typed commands over HTTP and folds one SSE event
 // stream, and every provider process runs here.
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, watch, writeFileSync, renameSync } from "node:fs";
-import { createHash, randomBytes } from "node:crypto";
+
+// First, before any module below reads the data folder: a restore waiting
+// for this start is put in place (server/pending-restore.ts).
+import "./pending-restore.ts";
+import { existsSync, mkdirSync, openAsBlob, readdirSync, readFileSync, rmSync, statSync, unlinkSync, watch, writeFileSync, renameSync } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { extname, join, resolve, sep } from "node:path";
 
 import * as attachments from "./attachments.ts";
+import { agentTurnLimit, validTurnLimit, pastAgentLimit, chainName, chainExcerpt, chainLimitText, chainAgentRefusal, CHAIN_LIMIT_TITLE, MIN_AGENT_CHAIN_LIMIT, MAX_AGENT_CHAIN_LIMIT } from "./agent-chain.ts";
+import { takeBackWaiting } from "./take-back.ts";
+import { telegramReply, type TelegramText } from "./telegram-reply.ts";
+import { TurnProgress } from "./telegram-progress.ts";
+import { inboxState, legacyBinding, migrateTelegram, ownerPairing, pairedChats, replaceTelegramToken, telegramStatus, type AgentTelegram, type TelegramConfig } from "./telegram-bots.ts";
+import { isRecord, readSaved, writeFileAtomic } from "./atomic-write.ts";
+import { legacyToolTitle } from "./tool-command.ts";
 import * as box from "./box.ts";
 import * as diagnostics from "./diagnostics.ts";
+import { ENGINE_SETUP, installEngine, openSignIn, runSetupScript } from "./engine-setup.ts";
+import { ENGINE_PACKAGES, engineUpdates } from "./engine-updates.ts";
+import { FEATURES } from "./features.ts";
 import * as scout from "./scout.ts";
 import {
   ArtifactCommentStore,
@@ -29,12 +44,12 @@ import {
   customInstanceId,
   disconnectProvider,
   ensureDirs,
+  forgetSecret,
   instanceConfigs,
   loadConfig,
   saveConfig,
   AVATARS_DIR,
   EVENTS_DIR,
-  NATIVE_DIR,
   type AppConfig,
   type CustomEndpoint,
   type CustomKey,
@@ -44,14 +59,17 @@ import * as people from "./people.ts";
 import { mayApprove, memberCan, memberFrame, memberMessage, type MemberAction, type MemberView } from "./member-access.ts";
 import { CLI_PROVIDERS, CUSTOM_SPEC, PROVIDER_SPECS, normalizeCompatUrl, specFor } from "./providers.ts";
 import { callbackPage, finishOAuth, startOAuth, supportsOAuth } from "./oauth.ts";
-import type { ModelSelection, RuntimeEvent } from "./contracts.ts";
+import type { ModelSelection, PlanUsage, ProviderInstance, ProviderSnapshot, RuntimeEvent, SendTurnInput } from "./contracts.ts";
 import { newId } from "./contracts.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
+import { forgetNative, slimNativeLogs, tidyNativeLogs } from "./drivers/native.ts";
+import { DEFAULT_STALL_MINUTES, STALL_CHOICES, stallPreface } from "./drivers/stall.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
-import { MAX_TASKS, Store, type BotRecord, type Message, type NewBotProfile } from "./store.ts";
+import { MAX_TASKS, Store, type AgentNote, type BotRecord, type Message, type NewBotProfile, type RecalledNote, type TaskRecord } from "./store.ts";
 import { addressees, BlokStore, currentSpend, MAX_MEMBERS, type BlokRecord, type RoomSharing } from "./bloks.ts";
+import { cleanSectionOrder, placeAt, SidebarStore, sidebarView, upgradePlaces, type Placed } from "./sidebar.ts";
 import { extractTeamPlan, MAX_HIRES, normalizePlan, TEAM_PROTOCOL, type TeamPlan } from "./teams.ts";
 import { houseStyle, HOUSE_STYLE } from "./house-style.ts";
 import { captureFrame, clickAt, typeText } from "./browser-view.ts";
@@ -68,13 +86,16 @@ import {
   pairingStatus,
   revokeAll,
   revokeDevice,
+  noteClient,
   remoteEnabled,
   setRemoteEnabled,
   startPairing,
   createPairLink,
   pairLinkSecret,
   claimPairLink,
+  memberDevices,
 } from "./pairing.ts";
+import { checkup, filePermissions, tightenPermissions, type SecurityFacts } from "./security.ts";
 import {
   clamp,
   clampList,
@@ -83,7 +104,11 @@ import {
   MAX_CUSTOM_KEYS,
   MAX_DESCRIPTION_CHARS,
   MAX_KEY_CHARS,
+  MAX_MCP_SERVERS,
   MAX_MESSAGE_CHARS,
+  MAX_WEBHOOK_QUEUE_BYTES,
+  MAX_WEBHOOK_QUEUE_ITEMS,
+  MAX_QUEUED_RECOVERY_MS,
   MAX_MODEL_ID_CHARS,
   MAX_NAME_CHARS,
   MAX_SKILL_CHARS,
@@ -111,14 +136,16 @@ import {
   updateCount,
   type RegistryEntry,
 } from "./skill-registry.ts";
-import { AgentTokens, allows, capabilities, cliBriefing, runsAProcess } from "./agent-cli.ts";
+import { AgentTokens, allows, capabilities, cliBriefing, cliMovedNote, runsAProcess, secretHint } from "./agent-cli.ts";
 import {
+  CACHE_LIFETIME_MS,
   COMPACT_AT,
+  compactedNotice,
   compactionNotice,
   contextLimitFor,
+  idleCompactionDue,
   isContextError,
   planCompaction,
-  pressure,
   absorbPrompt,
   assembleTranscript,
   defragPrompt,
@@ -126,22 +153,56 @@ import {
   planMicro,
   shouldCompact,
   summaryPrompt,
+  BEFORE_TURN_CEILING,
+  boundHandoff,
+  compactBeforeTurn,
+  handoffBudget,
+  knownLimitFor,
+  laneFill,
+  readingFor,
+  type Reading,
   type Turn,
 } from "./context.ts";
 import { JobStore, nextFor, offerText, readClaim, type Candidate, type Job } from "./jobs.ts";
-import { identityFor, forget as forgetIdentity, signAs, statementOf } from "./identity.ts";
-import { assemble as assembleActivity, blockedOn } from "./activity.ts";
+import { identityFor, existingFingerprint, fingerprintFor, forget as forgetIdentity, signAs, statementOf } from "./identity.ts";
+import { assemble as assembleActivity, blockedOn, lastWithYou, towardYou } from "./activity.ts";
 import { splitArgs } from "./argv.ts";
 import { draftPrompt, parseDraft } from "./draft.ts";
 import { OLLAMA_URL, probeOllama, shouldAdopt } from "./local-models.ts";
 import { cookieStores, readCookies } from "./cookie-import.ts";
 import * as telegram from "./telegram.ts";
+import { CardButtons, outcomeOf, settledText, type ForwardedCard } from "./telegram-cards.ts";
+import { TelegramReturns, queuedTelegramReply, type TelegramReply } from "./telegram-returns.ts";
 import * as slack from "./slack.ts";
-import { agentCommands } from "./agent-commands.ts";
+import { agentCommands, engineCommand, type ClaudeCatalog } from "./agent-commands.ts";
+import {
+  decide as decideGoal,
+  fallbackVerdict,
+  finalReply,
+  firstGoalNote,
+  GOAL_CHECK_TIMEOUT_MS,
+  goalBlockedNotice,
+  goalDoneNotice,
+  goalInput,
+  goalOutNotice,
+  goalPausedNotice,
+  goalSetNotice,
+  goalSummary,
+  judgePrompt,
+  nextGoalNote,
+  parseGoalCommand,
+  parseVerdict,
+  type Goal,
+  type GoalCheck,
+  type GoalInput,
+  type Verdict,
+} from "./goals.ts";
+import { codexSkillNames } from "./codex-skills.ts";
+import { reservedEnvName, usableSecrets } from "./env-names.ts";
 import * as discord from "./discord.ts";
 import * as whatsapp from "./whatsapp.ts";
 import { CHAT_PLATFORMS, decide as decideChat, knockReply, outbound, PLATFORM_NAME, TurnBrake, type ChatMessage, type ChatPlatform } from "./chat-bridge.ts";
-import { launch, listTargets, Session as CdpSession } from "./cdp.ts";
+import { closeBrowser, launch, listTargets, profilePort, Session as CdpSession } from "./cdp.ts";
 import { attribution, clamped, Ledger } from "./ledger.ts";
 import {
   KINDS as COMPONENT_KINDS,
@@ -156,14 +217,14 @@ import {
   OPS as POLICY_OPS,
   PolicyStore,
   cleanRule,
-  decide,
+  decideEach,
   describe as describeRule,
   isQuestionTool,
   Wheel,
   heldRefusal,
   pausedMessage,
   refusal,
-  targetOf,
+  targetsOf,
 } from "./policy.ts";
 import {
   ProposalStore,
@@ -178,6 +239,7 @@ import {
   worthReviewing,
 } from "./proposals.ts";
 import {
+  MAX_PROJECTS,
   ProjectStore,
   briefFor,
   missingFolderMessage,
@@ -196,7 +258,7 @@ import {
   themeFrom,
 } from "./mcp-apps.ts";
 import { MAX_INPUT_BYTES, TerminalStore, clampCols, clampRows } from "./terminal.ts";
-import { WebhookStore, webhookMessage } from "./webhooks.ts";
+import { WebhookStore, cleanThread, webhookMessage } from "./webhooks.ts";
 import {
   WorkflowStore,
   clean as cleanWorkflow,
@@ -235,32 +297,81 @@ import {
   vmStop,
 } from "./local-vm.ts";
 import { widenPath } from "./path.ts";
-import { describe as describeRoutine, MAX_ROUTINES, normalize as normalizeRoutine, nextScheduledAfter, RoutineStore } from "./routines.ts";
-import { engineIsFresh, freshTurnText } from "./turn-context.ts";
+import { claimDataFolder, inUseMessage } from "./data-lock.ts";
+import { describe as describeRoutine, isQuiet as quietRoutine, isQuietReply, lastReportNote, MAX_ROUTINES, normalize as normalizeRoutine, nextScheduledAfter, lastScheduledBefore, promptTooLong, QUIET_ASK, type Routine, RoutineStore, scheduleProblem } from "./routines.ts";
+import { catchUpText, engineIsFresh, freshTurnText } from "./turn-context.ts";
+import { standingFor, type Standing, type StandingRecord } from "./standing-prompt.ts";
 import { Checkpoints, diffLines, trackable, type CheckpointRecord } from "./checkpoints.ts";
-import { Cooldowns, describeRest, outReason, REASON_WORDS, type Rest } from "./failover.ts";
-import { recall, recallText, type RecallSource } from "./recall.ts";
+import { redoCounts, redoPlan, takenBack, type RedoRefusal } from "./redo.ts";
+import { clockTime, Cooldowns, describeRest, failureOf, outReason, REASON_WORDS, restIsNews, RETRY_WAIT_MS, RETRY_INTERVAL_MS, STAY_MS, toldOf, type Rest, type Told } from "./failover.ts";
+import { agentReadiness, engineReadiness, readinessWarning, type Readiness } from "./engine-readiness.ts";
+import { indexMemory, indexMessages, mostOf, recallBlock, recallFrom, recallText, searchableText, termsOf, type IndexedSource, type RecallHit, type RecallMessage, type Speaker } from "./recall.ts";
+import { excerpt, IndexCache, rank, type TermIndex } from "./recall-index.ts";
 import { noteBriefing, ProfileNotes } from "./profile-notes.ts";
 import { briefDue, composeBrief, parseBriefTime, type Brief, type BriefWaiting } from "./brief.ts";
 import { localDate } from "./usage.ts";
 import { engineReport, TurnLogStore, type Outcome, type TurnLog } from "./engine-report.ts";
+import {
+  carryOnTarget,
+  carryOnText,
+  cutOffNotice,
+  cutOffWaitingNotice,
+  engineGoneNotice,
+  recoveryFor,
+  sessionRef,
+  TurnsInFlight,
+  type CutOffBy,
+  type TurnInFlight,
+} from "./cut-off.ts";
 import { actionItems, cleanSegment, MAX_SEGMENTS, notesPrompt, transcriptOf, type Meeting } from "./meetings.ts";
 import {
+  checkAllowed,
+  checkOutcome,
   cleanWatcher,
   describeFolderChanges,
   folderChanges,
   folderSnapshot,
   hashOf,
+  laneLimitError,
   mayFire,
   newLines,
+  orphanWatcherLanes,
   pageText,
   parseFeed,
+  runCheck,
   SETTLE_MS,
   watcherTurn,
+  WATCHING,
   type Watcher,
 } from "./watchers.ts";
-import { MemoryJournal } from "./memory-journal.ts";
+import { MemoryJournal, readMemoryText } from "./memory-journal.ts";
+import { applyImport, detectSetup, ImportRecord, reviewOf, type ImportDeps, type McpEntry } from "./setup-import.ts";
 import { Rehearsals, type Rehearsal } from "./rehearsals.ts";
+import { RoomTagQueues } from "./room-tags.ts";
+import { MAX_AGENT_HOPS, heldMention, hopsNotice } from "./room-hops.ts";
+import { RepeatWatch } from "./repeats.ts";
+import { Drain, DRAIN_GRACE_MS, DRAINING_TEXT, drainWindow } from "./drain.ts";
+import {
+  AUTO_KEEP,
+  autoBackupDue,
+  BackupError,
+  backupPath,
+  backupsDirFor,
+  checkBackup,
+  createBackup,
+  deleteBackup,
+  lastRestore,
+  listBackups,
+  newestAutomatic,
+  pendingRestore,
+  pruneAutomatic,
+  revealBackup,
+  shownPath,
+  stageRestore,
+  verifyBackup,
+  type BackupInfo,
+  type CreateOptions,
+} from "./backup.ts";
 import { summarize, UsageStore } from "./usage.ts";
 import { TeamLibrary } from "./team-library.ts";
 import { GALLERY_MAX_BYTES, GALLERY_URL, parseGallery, parseTeamFile, TeamFileError, teamFromManifest, writeTeamFile, type GalleryTeam } from "./team-file.ts";
@@ -269,7 +380,20 @@ import * as workspace from "./workspace.ts";
 import * as speech from "./speech.ts";
 import { speakable } from "./speech-text.ts";
 
-const PORT = Number(process.env.BLOKS_PORT || 8799);
+// BLOKS_PORT first (the desktop app always sets it), then a port chosen in
+// config.json, then the usual one
+const PORT = Number(process.env.BLOKS_PORT || loadConfig().port || 8799);
+
+// One server per data folder, claimed before any store below reads or
+// writes it (server/data-lock.ts, GitHub 140).
+{
+  mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+  const claim = claimDataFolder(DATA_DIR, PORT);
+  if (!claim.ok) {
+    console.error(inUseMessage(DATA_DIR, claim.holder));
+    process.exit(3);
+  }
+}
 const STATIC_DIR = process.env.BLOKS_STATIC_DIR || null;
 const MIME: Record<string, string> = {
   ".html": "text/html",
@@ -303,6 +427,10 @@ const SECURITY_HEADERS = {
   "referrer-policy": "no-referrer",
 };
 
+/** App icons already fetched for the plugin grid, by source URL. Small
+ * images, bounded in count, gone on restart. */
+const iconCache = new Map<string, { type: string; bytes: Buffer }>();
+
 // Before anything spawns a CLI: a Finder-launched app inherits a PATH
 // that has never heard of npm. See server/path.ts.
 widenPath();
@@ -311,7 +439,7 @@ const cfg = loadConfig();
 const registry = new ProviderRegistry(BUILT_IN_DRIVERS);
 await registry.load(instanceConfigs(cfg));
 
-const bus = new EventBus();
+const bus = new EventBus(redactSecrets);
 bus.attach(registry.instances());
 
 // What a brand new agent thinks with: whichever engine is actually
@@ -319,13 +447,22 @@ bus.attach(registry.instances());
 async function defaultSelection() {
   const described = await registry.describe();
   const available = described.filter((d) => d.snapshot.state === "available");
-  const pick = available.find((d) => d.driverKind === "claudeAgent") ?? available[0] ?? described[0];
+  // Signed in beats merely installed: a new agent on a CLI nobody has
+  // logged in to fails its first message, which is the first-run problem
+  // in one line. Claude Code first among equals, as before.
+  const ready = available.filter((d) => d.snapshot.authenticated !== false);
+  const pick =
+    ready.find((d) => d.driverKind === "claudeAgent") ??
+    ready[0] ??
+    available.find((d) => d.driverKind === "claudeAgent") ??
+    available[0] ??
+    described[0];
   return { instanceId: pick?.instanceId ?? "claude", model: pick?.models.default || "claude-sonnet-5" };
 }
 
 type Approvals = NonNullable<BotRecord["approvals"]>;
 // From least to most an agent may do without asking.
-const APPROVALS: Approvals[] = ["ask", "edits", "auto"];
+const APPROVALS: Approvals[] = ["ask", "edits", "auto", "full"];
 const lesserApprovals = (a: Approvals, b: Approvals) => (APPROVALS.indexOf(a) <= APPROVALS.indexOf(b) ? a : b);
 
 // The settings a new agent is born with, applied before its first turn
@@ -348,8 +485,31 @@ async function newAgentSettings(hiredBy?: Approvals): Promise<Partial<BotRecord>
   return out;
 }
 let bootSelection = { instanceId: "claude", model: "claude-sonnet-5" };
+// Membership is used in broadcasts after writes. Load it before serving
+// requests so a failed first read cannot make a saved action look failed.
+people.people();
 const store = new Store(() => bootSelection);
+const migratedTelegram = migrateTelegram(cfg.telegram, store.bots);
+if (migratedTelegram !== cfg.telegram) {
+  // With no bot configured there is nothing to migrate on disk. An
+  // unrelated startup must not rewrite the workspace's config.
+  if (cfg.telegram?.token || Object.keys(cfg.telegram?.bots ?? {}).length) saveConfig({ telegram: migratedTelegram });
+  cfg.telegram = migratedTelegram;
+  const id = migratedTelegram.migratedBotId;
+  const generation = id ? migratedTelegram.bots?.[id]?.generation : undefined;
+  if (id && generation) for (const lane of store.bot(id)?.tasks ?? []) {
+    for (const message of store.messagesFor(lane.id)) {
+      if (!message.queued || (!message.fromTelegram && !message.telegramReply)) continue;
+      store.patchMessage(lane.id, message.id, {
+        telegramBinding: { botId: id, generation },
+        ...(message.telegramReply ? { telegramReply: { ...message.telegramReply, botId: id, generation } } : {}),
+      });
+    }
+  }
+}
 const bloks = new BlokStore();
+// the order of the sidebar's headings; pins and activity live on the rows
+const sidebar = new SidebarStore();
 const webhooks = new WebhookStore();
 const artifactComments = new ArtifactCommentStore();
 // Consequential actions, hash-chained. Nothing waits on it and nothing
@@ -392,6 +552,14 @@ const workflows = new WorkflowStore();
 const proposals = new ProposalStore();
 // Every finished turn, with the engine that ran it (server/engine-report.ts).
 const turnLog = new TurnLogStore(join(DATA_DIR, "engine-turns.json"));
+// Every turn while it runs, so one cut off by Bloks stopping is picked up
+// when it starts again (server/cut-off.ts).
+const cutOff = new TurnsInFlight(join(DATA_DIR, "turns-in-flight.json"));
+setInterval(() => cutOff.touch(), 5 * 60_000).unref?.();
+// Before a planned restart: nothing new starts, what is running finishes
+// (server/drain.ts). In memory; a restart ends it, and so does its own
+// deadline long past. Tests shorten that grace through the environment.
+const drain = new Drain(Number(process.env.BLOKS_DRAIN_GRACE_MS) || DRAIN_GRACE_MS);
 // Notes about the person, suggested by agents and kept by them
 // (server/profile-notes.ts), and how many each running turn has offered.
 const profileNotes = new ProfileNotes(join(DATA_DIR, "profile-notes.json"));
@@ -422,14 +590,56 @@ function standingOf(project: Project): ProjectStanding {
 // itself. See server/agent-cli.ts for what that means and what it does
 // not mean.
 const agentTokens = new AgentTokens();
-setInterval(() => agentTokens.sweep(Date.now()), 5 * 60_000).unref?.();
+/** A turn is alive while it has started and not ended, and its lane still
+ * says it is working. A turn whose engine died without saying so ends the
+ * same way (the drivers end a turn when its process exits), so this never
+ * keeps a finished turn's credential going. */
+const turnAlive = (taskId: string) => turnStarted.has(taskId) && Boolean(store.taskByThread(taskId)?.task.busy);
+setInterval(() => agentTokens.sweep(Date.now(), turnAlive), 5 * 60_000).unref?.();
 const AGENT_CLI = fileURLToPath(new URL("../bin/bloks.mjs", import.meta.url));
+/** How an agent with a shell is told to run the CLI. The path is wherever
+ * this copy of Bloks is installed, and that changes: a standalone server
+ * gives way to the app, a download lands in another folder. An engine
+ * session outlives the move, and an agent reaches first for commands it
+ * has already run, so a written-out path goes on reaching the old copy
+ * long after the instructions say otherwise (GitHub 150). BLOKS_CLI is set
+ * fresh on every turn, so a command that names it stays right wherever
+ * Bloks goes. Not on Windows, where an engine's shell may be PowerShell,
+ * which reads "$BLOKS_CLI" as a variable of its own. */
+const CLI_COMMAND = process.platform === "win32" ? `node "${AGENT_CLI}"` : `node "$BLOKS_CLI"`;
 /** Bloks as an MCP server for other AI apps (bin/bloks-mcp.mjs). */
 const MCP_CLI = fileURLToPath(new URL("../bin/bloks-mcp.mjs", import.meta.url));
 
-/** The agent browser's debugging port. One browser serves every agent
- * that has one; profiles keep their sessions apart. */
-const BROWSER_PORT = Number(process.env.BLOKS_BROWSER_PORT || 9222);
+/** The browser profile each agent's latest turn was handed: its own, or
+ * a shared room's, which is never signed in as the owner. Each profile is
+ * a browser on a port of its own (cdp.ts), and this is the one the
+ * preview shows and the chat's clicks reach. */
+const browserProfiles = new Map<string, string>();
+
+function browserProfile(botId: string): string {
+  return browserProfiles.get(botId) ?? join(DATA_DIR, "browser", botId);
+}
+
+/** The port of the browser an agent is using, which is only known once
+ * that browser is running. */
+async function browserPortOf(botId: string): Promise<number> {
+  const port = await profilePort(browserProfile(botId));
+  if (!port) throw new Error("the agent's browser is not open");
+  return port;
+}
+
+/** Every agent and room browser still open, closed as Bloks quits: one
+ * per profile is too many to leave behind. Their sign-ins stay in the
+ * profiles for next time. */
+async function closeBrowsers(): Promise<void> {
+  let names: string[];
+  try {
+    names = readdirSync(join(DATA_DIR, "browser"));
+  } catch {
+    return;
+  }
+  await Promise.allSettled(names.map((name) => closeBrowser(join(DATA_DIR, "browser", name))));
+}
 
 /**
  * The skill catalog, fetched and kept for a while.
@@ -473,6 +683,12 @@ function rehearsalDir(bot: BotRecord): string | null {
   return dir;
 }
 
+/** An agent working in its own workspace writes its memory there; that
+ * has its own journal, so it is not a change for a card to undo. */
+function memoryPaths(botId: string, dir: string | null | undefined): string[] {
+  return dir === workspace.workspaceDir(botId) ? ["MEMORY.md", "memory/"] : [];
+}
+
 /** A rehearsal's turn is over: its card, or a note that nothing changed. */
 async function settleRehearsalTurn(
   r: Rehearsal,
@@ -502,14 +718,19 @@ async function settleRehearsalTurn(
   broadcast({ kind: "rehearsals" });
 }
 
-/** A rehearsal card, redrawn after its decision. */
+/** A change card, redrawn after Undo, rewind or a rehearsal decision. */
 function patchChangesCard(record: CheckpointRecord, extra: Partial<NonNullable<Message["changes"]>> = {}) {
   if (!record.card) return;
   const current = store.messagesFor(record.card.threadId).find((msg) => msg.id === record.card!.messageId);
   if (!current?.changes) return;
-  const patched = store.patchMessage(record.card.threadId, record.card.messageId, {
-    changes: { ...current.changes, ...checkpoints.summary(record), ...extra },
-  });
+  const summary = checkpoints.summary(record);
+  // A card from before own files alone were listed, for a turn with none,
+  // keeps its old summary; only what is said about it changes.
+  const redraw = Boolean(record.rehearsal) || summary.total > 0;
+  if (!redraw && !Object.keys(extra).length) return;
+  const changes = { ...current.changes, ...(redraw ? summary : {}), ...extra };
+  if (redraw && !summary.shared) delete changes.shared;
+  const patched = store.patchMessage(record.card.threadId, record.card.messageId, { changes });
   if (patched) broadcast({ kind: "message.patch", threadId: record.card.threadId, message: patched });
 }
 
@@ -522,16 +743,6 @@ async function discardSiblings(r: Rehearsal) {
       if (record) patchChangesCard(record);
     }
     await rehearsals.settle(other.id, "discarded");
-  }
-}
-
-/** A file's text, or null when it is not there. */
-function readRaw(path: string | null): string | null {
-  if (!path) return null;
-  try {
-    return readFileSync(path, "utf8");
-  } catch {
-    return null;
   }
 }
 
@@ -577,16 +788,106 @@ const checkpoints = new Checkpoints(join(DATA_DIR, "checkpoints"));
 
 // Backup engines (server/failover.ts). Engines resting after running
 // out, the engine each running lane is on, what went wrong in each
-// lane's turn so far, the lanes whose turn already fell back once (it
-// falls back once: a backup that is also out is reported, not chased),
-// and the rest each lane has already been told about.
+// lane's turn so far, and the rest each lane has already been told about.
 const cooldowns = new Cooldowns();
 const laneEngine = new Map<string, ModelSelection>();
 const turnErrors = new Map<string, string[]>();
-const fellBack = new Set<string>();
-const toldOfRest = new Map<string, number>();
-/** Errors kept off the chat while a backup might take over. */
-const heldErrors = new Map<string, string>();
+const toldOfRest = new Map<string, Told>();
+/** Errors kept off the chat while the turn might be asked again or
+ * taken by a backup, which says them in its own notice. */
+const heldErrors = new Map<string, string[]>();
+
+// A failed turn asked again (GitHub 284). What each running solo turn was
+// asked, as it was asked, so the same words can go again; the lanes whose
+// running turn started a new session rather than resuming one; and the
+// message each lane is recovering, with what has been tried for it, so it
+// is asked again once and handed over once and never more.
+interface Asked {
+  text: string;
+  /** When what it answers begins in the conversation (turnSince). */
+  since: number;
+  byYou: boolean;
+  from?: { botId: string; name: string };
+  routine?: Message["routine"];
+  replyTo?: ReplyRef;
+  answering?: { peerId: string; peerName: string };
+}
+interface Recovery {
+  asked: Asked;
+  /** The attempt waiting to start or running now. */
+  stage: "retry" | "backup";
+  /** Each attempt that failed, on what, when, and with what words. */
+  tried: Array<{ selection: ModelSelection; at: number; said: string }>;
+  timer?: ReturnType<typeof setTimeout>;
+}
+const turnAsked = new Map<string, Asked>();
+const newSessionTurns = new Set<string>();
+const recoveries = new Map<string, Recovery>();
+/** When each lane's running turn was sent on its way, so an answer that
+ * was under way before its engine ran out does not end that rest. */
+const engineAskedAt = new Map<string, number>();
+/** The line each lane's next turn opens with after a failure: what
+ * failed, when, on which engine and model, and what Bloks did about it
+ * (failureLine). In the turn's words, never the system prompt, so the
+ * agent can tell the person, check what the failed attempt already did,
+ * and report it if that is how it works. */
+const failureNotes = new Map<string, { text: string }>();
+type PrimaryTry = { reservation: NonNullable<ReturnType<Cooldowns["reserve"]>>; returned?: () => void };
+const primaryTries = new Map<string, PrimaryTry>();
+function cancelPrimaryTry(laneId: string, trying = primaryTries.get(laneId)) {
+  if (trying?.reservation.cancel() && primaryTries.get(laneId) === trying) primaryTries.delete(laneId);
+}
+/** The wait before a failed turn is asked again, shorter in tests. */
+const RETRY_WAIT = Number(process.env.BLOKS_RETRY_WAIT_MS) || RETRY_WAIT_MS;
+const RETRY_INTERVAL = Number(process.env.BLOKS_RETRY_INTERVAL_MS) || RETRY_INTERVAL_MS;
+
+// After the backup answers, the conversation stays on it for a while
+// (until the own engine's rest ends, when it rests), so the next message
+// does not try an engine that just failed. Then the own engine resumes
+// its own session, which is still stored, and is told what it missed,
+// rather than starting a new one told the story (GitHub 284). Both in
+// memory: after a restart the own engine is simply tried again, and a
+// session it comes back to is told the story as any engine switch is.
+interface Stay {
+  own: ModelSelection;
+  backup: ModelSelection;
+  until: number;
+}
+const stays = new Map<string, Stay>();
+/** The own session's catch-up starts during preparation, as before,
+ * even when that preparation is stopped before the backup hears it. */
+const catchups = new Map<string, { instanceId: string; since: number; by: string }>();
+/** A reason is heard only when a turn dispatches, per agent and room. */
+const away = new Map<string, { own: ModelSelection; backup: ModelSelection; at: number; rest?: Told; note: string; switched: boolean }>();
+/** How long a conversation stays on its backup, shorter in tests. */
+const STAY = Number(process.env.BLOKS_BACKUP_STAY_MS) || STAY_MS;
+
+const sameSelection = (a: ModelSelection | null | undefined, b: ModelSelection | null | undefined) =>
+  Boolean(a && b && a.instanceId === b.instanceId && (a.model ?? null) === (b.model ?? null));
+
+/** The stay a lane is on, or undefined once it is over: its time is up,
+ * or the person changed the agent's engine or its backup, and their
+ * choice wins. */
+function stayOf(bot: BotRecord, laneId: string, now = Date.now()): Stay | undefined {
+  const stay = stays.get(laneId);
+  if (!stay) return undefined;
+  if (stay.until <= now || !sameSelection(stay.own, bot.modelSelection) || !sameSelection(stay.backup, bot.backupSelection)) {
+    stays.delete(laneId);
+    return undefined;
+  }
+  return stay;
+}
+
+/** A handover belongs to the engine choices that made it. A later
+ * explicit choice must not receive an old automatic-return reason. */
+function awayOf(bot: BotRecord, laneId: string) {
+  const pending = away.get(laneId);
+  if (pending && (!sameSelection(pending.own, bot.modelSelection) || !sameSelection(pending.backup, bot.backupSelection))) {
+    away.delete(laneId);
+    return undefined;
+  }
+  return pending;
+}
 
 // ── cloud computers sleep when nobody is using them ──────────────────
 // A box bills while it is awake. Once an agent has not used its computer
@@ -624,6 +925,26 @@ function engineUsable(selection: ModelSelection | null | undefined): selection i
   return Boolean(instance && instance.enabled !== false && !cooldowns.of(selection.instanceId));
 }
 
+/** Which engine a turn on this agent runs on: its own, unless it is resting
+ * after running out (or gone) and it has a backup that is not. startTurn and
+ * the webhook receiver both ask here, so they cannot disagree about it. A
+ * turn handed to the backup (`fallback`) may also go to another model on
+ * the agent's own engine, which cannot stand in while that engine rests. */
+function selectEngine(bot: BotRecord, fallback = false, laneId?: string): ModelSelection {
+  const own = bot.modelSelection;
+  if (fallback && engineUsable(bot.backupSelection)) return bot.backupSelection;
+  // a conversation staying on the backup that answered it
+  if (laneId && stayOf(bot, laneId) && engineUsable(bot.backupSelection)) return bot.backupSelection;
+  const backup = bot.backupSelection && bot.backupSelection.instanceId !== own.instanceId ? bot.backupSelection : null;
+  const ownRest = cooldowns.of(own.instanceId);
+  const ownMissing = !registry.get(own.instanceId);
+  return (ownRest || ownMissing) && engineUsable(backup) ? backup : own;
+}
+
+function unavailableEngineMessage(instanceId: string): string {
+  return `provider instance "${instanceId}" is unavailable, pick another model in settings`;
+}
+
 /**
  * The engine running a lane's turn right now, which is where anything
  * about that turn (an answer, an approval, an interrupt) has to go. Not
@@ -641,16 +962,138 @@ function engineName(selection: ModelSelection): string {
   const name = instance?.displayName ?? instance?.driverKind ?? selection.instanceId;
   return label && label !== name ? `${name} (${label})` : name;
 }
+
+/** What each engine last said of itself, kept half a minute: asking runs
+ * its CLI, and an agent listing the workspace must not run one for every
+ * teammate (GitHub 239). A probe that throws reads as unavailable, as it
+ * does in the model picker. */
+const SNAPSHOT_FRESH_MS = 30_000;
+const snapshotsSeen = new Map<string, { at: number; snapshot: Promise<ProviderSnapshot> }>();
+function recentSnapshot(instance: ProviderInstance): Promise<ProviderSnapshot> {
+  const seen = snapshotsSeen.get(instance.instanceId);
+  if (seen && Date.now() - seen.at < SNAPSHOT_FRESH_MS) return seen.snapshot;
+  const snapshot = instance.snapshot().catch((): ProviderSnapshot => ({ state: "unavailable" }));
+  snapshotsSeen.set(instance.instanceId, { at: Date.now(), snapshot });
+  return snapshot;
+}
+
+/** Whether this agent's engine can answer it now, for another agent to
+ * read (server/engine-readiness.ts): its own engine, or its backup when
+ * that is where the turn would go. `engine` is the one that decided it,
+ * by the name the app shows, when it is there to have one. */
+async function readinessOf(bot: BotRecord): Promise<{ readiness: Readiness; engine?: string }> {
+  const one = async (selection: ModelSelection) => {
+    const instance = registry.get(selection.instanceId);
+    const rest = cooldowns.of(selection.instanceId);
+    const present = Boolean(instance && instance.enabled !== false);
+    const readiness = engineReadiness({
+      present,
+      rest,
+      snapshot: present && !rest ? await recentSnapshot(instance!) : null,
+    });
+    return { readiness, ...(instance ? { engine: instance.displayName ?? engineName(selection) } : {}) };
+  };
+  const own = await one(bot.modelSelection);
+  const backup =
+    own.readiness.state !== "ready" && bot.backupSelection && bot.backupSelection.instanceId !== bot.modelSelection.instanceId
+      ? await one(bot.backupSelection)
+      : null;
+  return backup && agentReadiness(own.readiness, backup.readiness) === backup.readiness ? backup : own;
+}
 // What each agent remembered, and when, with a way back per change.
 const memoryJournal = new MemoryJournal(join(DATA_DIR, "memory-journal"), workspace.workspaceDir);
+// What was brought over from other agent tools, and where it went, so a
+// second import updates the first (server/setup-import.ts).
+const setupRecord = new ImportRecord(join(DATA_DIR, "setup-import.json"));
+
+/**
+ * The import's way into the rest of the workspace. Every write goes the
+ * way the person's own edit would: instructions through the agent record,
+ * memory through the journal so each change can be undone, skills into
+ * the library unattached, servers into the registry on no agent, rules
+ * through the policy's own checks, and facts as suggestions.
+ *
+ * `settings` are a new agent's starting settings, worked out once before
+ * the import because finding the default engine has to wait on the
+ * registry and the import itself does not.
+ */
+function setupImportDeps(settings: Partial<BotRecord> = {}): ImportDeps {
+  return {
+    agent(id) {
+      const bot = store.bot(id);
+      if (!bot || bot.archivedAt) return null;
+      return { id: bot.id, name: bot.name, description: bot.description ?? "", busy: bot.tasks.some((t) => t.busy) };
+    },
+    createAgent({ name, title }) {
+      const bot = store.createBot({ name: name.slice(0, MAX_NAME_CHARS), title: title.slice(0, MAX_TITLE_CHARS) });
+      store.patchBot(bot.id, { ...settings, activeWithYouAt: Date.now() });
+      record({
+        at: Date.now(),
+        kind: "agent.created",
+        actor: "you",
+        summary: `Made ${bot.name}, ${bot.title}`,
+        detail: { agent: bot.name },
+      });
+      return bot.id;
+    },
+    setInstructions(botId, text) {
+      store.patchBot(botId, { description: text.slice(0, MAX_DESCRIPTION_CHARS) });
+    },
+    readMemory(botId, file) {
+      const path = memoryJournal.pathOf(botId, file);
+      if (!path) throw new Error("not a memory file");
+      return readMemoryText(path, file);
+    },
+    writeMemory(botId, file, before, after) {
+      memoryJournal.record(botId, file, "you", before, after, undefined, () => {
+        const written =
+          file === "MEMORY.md" ? workspace.writeMemoryFile(botId, after) : workspace.writeMemoryTopic(botId, file.slice("memory/".length), after);
+        if (!written) throw new Error(`${file} is a link to somewhere else now, so it was not written. Look at the agent's workspace.`);
+      });
+    },
+    skills: () => listSkills().map((skill) => ({ id: skill.id, source: skill.source })),
+    installSkill: (input) => installSkill(input).id,
+    mcpServers: () => (cfg.mcpServers ?? []) as McpEntry[],
+    saveMcpServers(list) {
+      // a connection the app holds open was made with the old settings
+      const before = new Map((cfg.mcpServers ?? []).map((server) => [server.id, JSON.stringify(server)]));
+      for (const server of list) if (before.has(server.id) && before.get(server.id) !== JSON.stringify(server)) mcp.close(server.id);
+      Object.assign(cfg, saveConfig({ mcpServers: list } as Partial<AppConfig>));
+    },
+    newId: () => randomBytes(8).toString("hex"),
+    rules: () => policy.list(),
+    addRule: (rule) => policy.add(rule, Date.now()),
+    notes: () => profileNotes.list(),
+    suggestNote: (text, by) => profileNotes.suggest(text, by),
+  };
+}
 // An agent doing the work on a clone of its folder, for you to apply or not.
-const rehearsals = new Rehearsals(join(DATA_DIR, "rehearsals"));
-void rehearsals.sweep().catch(() => {});
+const rehearsals = new Rehearsals(join(DATA_DIR, "rehearsals"), (r) => {
+  checkpoints.forgetBaseline(r.copy);
+  // Settled any way but applied, its card stops offering Apply: with the
+  // copy gone, an Apply would bring in what the store kept and quietly
+  // skip the rest.
+  if (r.state !== "applied" && r.checkpointId && checkpoints.discard(r.checkpointId)) {
+    const record = checkpoints.get(r.checkpointId);
+    if (record) patchChangesCard(record);
+  }
+});
 /** Rehearsal lanes may go this far past the lane cap. */
 const REHEARSAL_LANES = 3;
 /** Lanes whose last changes were undone since the agent last spoke: its
  * next turn is told, or it would carry on from files that are gone. */
 const undoneSince = new Map<string, string[]>();
+/** Lanes whose last turn Bloks stopped because a tool call went silent,
+ * with what the person was told: the agent hears it at the start of its
+ * next turn, so it does not walk back into the same wait (GitHub 146). */
+const stalledSince = new Map<string, string>();
+
+/** How long a tool call may go without a word before its turn is
+ * stopped; 0 is never. The person's choice, in Settings. */
+function stallLimitMs(): number {
+  const minutes = cfg.turns?.stallMinutes;
+  return (typeof minutes === "number" && Number.isFinite(minutes) && minutes >= 0 ? minutes : DEFAULT_STALL_MINUTES) * 60_000;
+}
 const teamLibrary = new TeamLibrary();
 // A model server already running here is one nobody should have to go
 // and connect by hand. Looked for once, never written over an entry that
@@ -658,8 +1101,7 @@ const teamLibrary = new TeamLibrary();
 {
   const found = await probeOllama();
   if (shouldAdopt(cfg, found)) {
-    saveConfig({ providers: { ...(cfg.providers ?? {}), ollama: { url: `${OLLAMA_URL}/v1` } } });
-    Object.assign(cfg, loadConfig());
+    Object.assign(cfg, saveConfig({ providers: { ...(cfg.providers ?? {}), ollama: { url: `${OLLAMA_URL}/v1` } } }));
     console.log(`[bloks] found Ollama running here with ${found.models.length} model(s); connected it`);
   }
 }
@@ -708,6 +1150,215 @@ function normalizeSection(
   return { ok: true, section: name };
 }
 
+/** Every row the sidebar shows, as placing one needs it: agents still in
+ * service and rooms not archived. */
+function sidebarRows(): Placed[] {
+  return [
+    ...bloks.bloks
+      .filter((room) => !room.archived)
+      .map((room) => ({
+        id: room.id,
+        kind: "room" as const,
+        name: room.name,
+        section: room.section ?? null,
+        pinned: room.pinned,
+        pinOrder: room.pinOrder,
+        createdAt: room.createdAt,
+      })),
+    ...store.bots
+      .filter((bot) => !bot.hidden && !bot.archivedAt)
+      .map((bot) => ({
+        id: bot.id,
+        kind: "agent" as const,
+        name: bot.name,
+        section: bot.section ?? null,
+        pinned: bot.pinned,
+        pinOrder: bot.pinOrder,
+        createdAt: bot.createdAt,
+      })),
+  ];
+}
+
+/** The fields that say where a row sits in the sidebar, which is all one
+ * agent may change about another. */
+const SIDEBAR_FIELDS = new Set(["section", "pinned", "position"]);
+
+/** Where a row was asked to go. Each part left out is left as it is. */
+interface Arrangement {
+  section?: string | null;
+  pinned?: boolean;
+  /** Its place among the pins of its section, 1 the top; past the end
+   * means the end. Implies pinned. */
+  position?: number;
+}
+
+/** The section, pin and place a request body asks for, checked. One
+ * reading for agents and rooms, for the person and for agents, and for
+ * a hire, so they cannot come to mean different things. */
+function readArrangement(body: Record<string, unknown>): { ok: true; ask: Arrangement } | { ok: false; error: string } {
+  const ask: Arrangement = {};
+  if (body.section !== undefined) {
+    const named = normalizeSection(body.section);
+    if (!named.ok) return named;
+    ask.section = named.section;
+  }
+  if (body.pinned !== undefined) {
+    if (typeof body.pinned !== "boolean") return { ok: false, error: "pinned is true or false" };
+    ask.pinned = body.pinned;
+  }
+  if (body.position !== undefined) {
+    const position = body.position;
+    if (typeof position !== "number" || !Number.isInteger(position) || position < 1 || position > 10_000) {
+      return { ok: false, error: "position is a place among the pins of a section, 1 at the top" };
+    }
+    if (ask.pinned === false) return { ok: false, error: "a position is a place among the pins, so it cannot come with pinned: false" };
+    ask.position = position;
+  }
+  return { ok: true, ask };
+}
+
+/**
+ * Puts one agent or room where it was asked to go: into a section, held
+ * or not, and at a place among the pins, numbering the pins around it
+ * again. Without a place, a pin keeps the one it has, and one that is
+ * new to its pins (just pinned, or just filed elsewhere) goes after them.
+ * Unpinning lets go of the place, so pinning it later starts at the end.
+ *
+ * Everything that moved is broadcast, except `except`, which the caller
+ * is about to send itself with the rest of what it changed.
+ */
+function arrange(kind: "agent" | "room", id: string, ask: Arrangement, except?: string): boolean {
+  const record = kind === "agent" ? store.bot(id) : bloks.get(id);
+  if (!record) return false;
+  const was = { section: record.section ?? null, pinned: Boolean(record.pinned) };
+  const section = ask.section !== undefined ? ask.section : was.section;
+  const pinned = ask.position !== undefined ? true : (ask.pinned ?? was.pinned);
+  const own: { section?: string | null; pinned: boolean; pinOrder?: number | null } = { pinned };
+  if (ask.section !== undefined) own.section = section;
+  const neighbours: Array<{ id: string; kind: "agent" | "room"; pinOrder: number }> = [];
+  if (!pinned) {
+    own.pinOrder = null;
+  } else if (ask.position !== undefined) {
+    // the section as it will be, with this row already standing in it
+    const rows: Placed[] = [
+      ...sidebarRows().filter((row) => row.id !== id),
+      { id, kind, name: record.name, section, pinned: true, pinOrder: record.pinOrder, createdAt: record.createdAt },
+    ];
+    for (const place of placeAt(rows, id, section, ask.position)) {
+      if (place.id === id) own.pinOrder = place.pinOrder;
+      else neighbours.push(place);
+    }
+  } else if (section !== was.section || !was.pinned) {
+    own.pinOrder = null;
+  }
+  type Move = { id: string; patch: { section?: string | null; pinned?: boolean; pinOrder?: number | null } };
+  const agents: Move[] = neighbours.filter((n) => n.kind === "agent").map((n) => ({ id: n.id, patch: { pinOrder: n.pinOrder } }));
+  const rooms: Move[] = neighbours.filter((n) => n.kind === "room").map((n) => ({ id: n.id, patch: { pinOrder: n.pinOrder } }));
+  (kind === "agent" ? agents : rooms).push({ id, patch: own });
+  for (const bot of store.patchBots(agents)) if (bot.id !== except) broadcast({ kind: "bot", bot: clientBot(bot) });
+  for (const room of bloks.arrange(rooms)) if (room.id !== except) broadcast({ kind: "blok", blok: room });
+  return true;
+}
+
+/** The lanes an agent's background work runs in: routines, jobs,
+ * webhooks, watchers, and its lanes for shared rooms. What lands there
+ * was not the person talking to it, whatever it looks like. */
+function backgroundLanes(bot: BotRecord): Set<string> {
+  const titles = new Set([
+    "Routines",
+    "Jobs",
+    "Webhooks",
+    ...routines.routines.filter((r) => r.targetId === bot.id && r.thread).map((r) => r.thread!),
+  ]);
+  const lanes = new Set<string>([
+    ...watchers.filter((w) => w.botId === bot.id && w.laneId).map((w) => w.laneId!),
+    ...bloks.roomsFor(bot.id).map((r) => r.lanes?.[bot.id]).filter((lane): lane is string => Boolean(lane)),
+  ]);
+  for (const task of bot.tasks) if (titles.has(task.title)) lanes.add(task.id);
+  return lanes;
+}
+
+/**
+ * A workspace from before the sidebar kept its order with the rows,
+ * brought up to it on the first start, so the list means something the
+ * moment the update lands rather than once everything has been talked to
+ * again. Rooms become pinned in the order they were listed and pinned
+ * agents keep theirs (server/sidebar.ts, upgradePlaces); every agent and
+ * room is given the last time it had something to do with the person, as
+ * well as its transcripts can say. Each part only touches records that
+ * do not have it yet, so later starts find nothing to do.
+ */
+function settleSidebar() {
+  const placed = (rows: Array<BotRecord | BlokRecord>, kind: "agent" | "room"): Placed[] =>
+    rows.map((row) => ({
+      id: row.id,
+      kind,
+      name: row.name,
+      section: row.section ?? null,
+      pinned: row.pinned,
+      pinOrder: row.pinOrder,
+      createdAt: row.createdAt,
+    }));
+  const upgrade = upgradePlaces(placed(bloks.bloks, "room"), placed(store.bots, "agent"));
+  bloks.arrange(upgrade.rooms.map((p) => ({ id: p.id, patch: { pinned: true, pinOrder: p.pinOrder } })));
+  store.patchBots(upgrade.agents.map((p) => ({ id: p.id, patch: { pinOrder: p.pinOrder } })));
+
+  store.patchBots(
+    store.bots
+      .filter((bot) => typeof bot.activeWithYouAt !== "number")
+      .map((bot) => {
+        const background = backgroundLanes(bot);
+        const at = Math.max(0, ...bot.tasks.filter((t) => !background.has(t.id)).map((t) => lastWithYou(store.messagesFor(t.id))));
+        return { id: bot.id, patch: { activeWithYouAt: at } };
+      }),
+  );
+  bloks.arrange(
+    bloks.bloks
+      .filter((room) => typeof room.activeWithYouAt !== "number")
+      .map((room) => ({ id: room.id, patch: { activeWithYouAt: lastWithYou(store.messagesFor(room.id)) } })),
+  );
+}
+
+/** How much transcript one answer through Bloks Cloud may carry, as JSON.
+ * The relay takes 2 MB a payload and sealing grows a body by about 1.8x,
+ * so a list of every conversation in full stops arriving once a few of
+ * them get long. Local and same-network callers are not limited. */
+const RELAY_TRANSCRIPT_BUDGET = 700_000;
+const RELAY_TAIL = 100;
+
+/** The newest messages of one transcript that fit in `bytes`, and how many
+ * older ones were left for the client to ask for. */
+function tailWithin(list: Message[], count: number, bytes: number): { messages: Message[]; olderMessages: number } {
+  let used = 0;
+  let start = list.length;
+  while (start > 0 && list.length - start < count) {
+    const size = JSON.stringify(list[start - 1]).length;
+    if (used + size > bytes) break;
+    used += size;
+    start--;
+  }
+  return { messages: list.slice(start), olderMessages: start };
+}
+
+/** Several transcripts in one relayed answer: each gets the same share,
+ * halved until the whole answer fits, so one long conversation cannot
+ * crowd out every other agent's latest words. */
+function fitTranscripts(lists: Message[][], tail = RELAY_TAIL): Array<{ messages: Message[]; olderMessages: number }> {
+  for (let share = 200_000; ; share = Math.floor(share / 2)) {
+    const cut = lists.map((list) => tailWithin(list, tail, share));
+    const total = cut.reduce((n, c) => n + JSON.stringify(c.messages).length, 0);
+    if (total <= RELAY_TRANSCRIPT_BUDGET || share <= 4_000) return cut;
+  }
+}
+
+/** How many turns each lane has started since Bloks did. A goal's verdict
+ * is acted on only while no other turn has started in its lane since the
+ * one it judged (judgeGoal), so a judge that took a minute never starts a
+ * turn behind the person's back, or on a reply no longer the latest. */
+const laneTurns = new Map<string, number>();
+/** Lanes whose goal is being judged right now, for the chip to say so. */
+const goalJudging = new Set<string>();
+
 function clientBot(bot: BotRecord | null) {
   if (!bot) return bot;
   const { resumeCursors: _cursors, tasks, ...visible } = bot;
@@ -715,7 +1366,7 @@ function clientBot(bot: BotRecord | null) {
     ...visible,
     // The public half of its key. Only ever the public half: the private
     // one never leaves this machine, and nothing in the app displays it.
-    fingerprint: identityFor(bot.id).fingerprint,
+    fingerprint: fingerprintFor(bot.id),
     // Somebody is driving this one. On the agent rather than behind a
     // second poll, so every surface knows at the same moment and can say
     // so before the person hits a refusal they could have been shown
@@ -734,28 +1385,58 @@ function clientBot(bot: BotRecord | null) {
       // reading as idle in one place and blocked in another, which is
       // exactly what a workflow gate used to do: it parks on a card with
       // no request behind it, so the old test here called it idle.
+      // A goal that is blocked waits on the person as much as a card
+      // does: nothing moves in that lane until they say something.
       const state = blockedOn(store.messagesFor(task.id), liveCards())
         ? "needs-you"
         : task.busy
           ? "working"
-          : "idle";
-      // How full this lane is. The last turn's input tokens are the
-      // closest thing a provider tells us, and the limit is what the
-      // model will take: see server/context.ts.
-      const limit = contextLimitFor(bot.modelSelection?.model);
-      const fill = pressure(task.lastInput ?? 0, limit);
+          : task.goal?.status === "blocked"
+            ? "needs-you"
+            : "idle";
+      // How full this lane is: the engine's own reading of its latest
+      // request against its before-turn line, or the window when off.
+      // Keep the engine's window when given and the table's otherwise;
+      // only a reading from its current engine counts. See context.ts.
+      const fill = laneContext(bot, task);
+      const said = store.messagesFor(task.id);
+      // a compaction marker is not something happening in the lane, and
+      // nor is a quiet check-in
+      let last = said.length - 1;
+      while (last >= 0 && (said[last].compaction || said[last].quiet)) last--;
       return {
         id: task.id,
         title: task.title,
         state,
+        unread: Boolean(task.unread),
+        // when this lane last had anything in it, for the sidebar's times
+        lastAt: said[last]?.at ?? task.createdAt,
         createdAt: task.createdAt,
+        // The lane mail from unlisted senders is answered in. The person's
+        // own words never land there (activeLaneOf), so the app says so in
+        // it rather than letting what is typed seem to vanish.
+        ...(task.guestMail ? { guestMail: true } : {}),
+        // The room this lane's turn is speaking in, while it runs. A room
+        // shows who is thinking from this, not from the agent's own flag,
+        // which is up whenever any of its lanes works, here or not.
+        ...(task.busy && (activeRoom.get(task.id) ?? task.id) !== task.id ? { room: activeRoom.get(task.id) } : {}),
         usage: task.usage,
         context: {
           used: fill.used,
           limit: fill.limit,
           fraction: fill.fraction,
+          measured: fill.measured,
+          // "engine" when the window is the engine's own word, "table"
+          // when it is the guess by model name
+          window: fill.window,
+          ...(fill.modelLimit !== undefined ? { modelLimit: fill.modelLimit } : {}),
+          ...(fill.limitApproximate !== undefined ? { limitApproximate: fill.limitApproximate } : {}),
           summarised: Boolean(task.context),
         },
+        // what the lane keeps working toward, for the chip over the box
+        ...(task.goal ? { goal: goalSummary(task.goal, goalJudging.has(task.id)) } : {}),
+        // where a goal cannot be set at all, so no screen offers one
+        ...(laneGoalRefusal(task) ? { noGoals: true } : {}),
       };
     }),
   };
@@ -787,6 +1468,27 @@ function closeMemberStreams(personId: string) {
 let frameSeq = 0;
 const RING_SIZE = 512;
 const frameRing: Array<{ seq: number; frame: string; payload: unknown }> = [];
+
+/** Look for engine releases on a schedule, so the news is waiting in the
+ * model list rather than found by someone wondering where a model went.
+ * Soon after start, then every six hours; the check itself is cached. */
+async function checkEngineUpdates() {
+  try {
+    const described = await registry.describe();
+    const updates = await engineUpdates(
+      described.map((d) => ({
+        driverKind: d.driverKind,
+        version: d.snapshot.version ?? null,
+        available: d.snapshot.state === "available",
+      })),
+    );
+    broadcast({ kind: "engineUpdates", updates });
+  } catch {
+    /* next time */
+  }
+}
+setTimeout(() => void checkEngineUpdates(), 20_000).unref?.();
+setInterval(() => void checkEngineUpdates(), 6 * 60 * 60_000).unref?.();
 
 function broadcast(payload: unknown) {
   // a channel that cannot be reached must never cost the room its frame
@@ -824,7 +1526,13 @@ function broadcast(payload: unknown) {
   // of pixels the phone throws away, and a batch over the relay's cap is
   // dropped whole.
   if ((payload as { kind?: string })?.kind !== "screen") {
-    relayLink.publish(payload, wakeFor(payload));
+    try {
+      relayLink.publish(payload, wakeFor(payload));
+    } catch (error) {
+      // Device settings may be unreadable. Do not turn an already saved
+      // message into a failed request that the sender repeats.
+      console.error(redactSecrets(error instanceof Error ? error.message : "[bloks] Relay frame could not be sent."));
+    }
   }
 }
 
@@ -835,66 +1543,323 @@ for (const inst of registry.instances()) {
 }
 
 /**
- * The end of a turn, read for one question: did the engine run out? If
- * it did, it rests (for every agent on it), and when this agent has a
- * backup the same message goes to the backup once, in this lane, with
- * the conversation replayed to it. Only a solo lane retries: in a room
- * the turn belongs to the room's order of speakers, and the rest simply
- * applies from the next turn on.
+ * The end of a turn, read for what happens to a failed one (GitHub 284).
+ * Not every turn that ends badly failed: a stop, a stalled tool, a
+ * command and a conversation too long for the model (folded and asked
+ * again on its own, see runtime.error) end as they always did. An engine
+ * that ran out rests, for every agent on it, and the message goes to the
+ * backup at once. A safety refusal is asked again at once, in a new
+ * session told the conversation so far, since the refused one refuses
+ * everything after it. Anything else is asked again once in the same
+ * session, after a wait: the engines retry a dropped connection or an
+ * overloaded API themselves before a turn fails, so asking at once would
+ * mostly fail the same way. Only a solo lane goes on: in a room the turn
+ * belongs to the room's order of speakers. True when the turn goes on.
  */
-function fallBackIfOut(bot: BotRecord, laneId: string, roomId: string, ok: boolean, stopReason: string | null) {
+function recoverTurn(
+  bot: BotRecord,
+  laneId: string,
+  roomId: string,
+  end: { ok: boolean; stopReason: string | null; pickingUp: boolean; rebuilt: boolean },
+  say: (text: string, phoneText?: string) => void,
+): boolean {
   const used = laneEngine.get(laneId);
   const errors = turnErrors.get(laneId) ?? [];
-  const held = heldErrors.get(laneId);
+  const held = heldErrors.get(laneId) ?? [];
+  const asked = turnAsked.get(laneId);
+  const newSession = newSessionTurns.delete(laneId);
+  const recovery = recoveries.get(laneId);
   laneEngine.delete(laneId);
+  const startedAt = engineAskedAt.get(laneId);
+  engineAskedAt.delete(laneId);
   turnErrors.delete(laneId);
   heldErrors.delete(laneId);
-  if (ok || !used || stopReason === "interrupted") return;
-  if (handOver(bot, laneId, roomId, used, [...errors, stopReason ?? ""].join("\n"))) return;
-  // an error kept back for a backup that then did not take over is shown
-  // after all, exactly as it would have been
-  if (held) {
-    const shown = store.appendMessage(laneId, { role: "bot", kind: "notice", text: held });
+  turnAsked.delete(laneId);
+  recoveries.delete(laneId);
+  const trying = primaryTries.get(laneId);
+  primaryTries.delete(laneId);
+  trying?.reservation.finished();
+  if (end.ok) trying?.returned?.();
+  const command = commandTurns.delete(laneId);
+  // A model that answered can take work again, if it was asked after
+  // the engine last ran out. A local command says nothing about quota,
+  // but keeps the existing signed-in recovery.
+  if (end.ok && used) {
+    if (cooldowns.of(used.instanceId)?.reason === "signedOut") cooldowns.clear(used.instanceId);
+    else if (!command && startedAt !== undefined) cooldowns.answered(used.instanceId, startedAt);
+  }
+  // a call that went silent is about the work, not the engine running
+  // out, whatever words the stuck command happened to contain
+  const failed =
+    !end.ok &&
+    !command &&
+    used &&
+    !end.pickingUp &&
+    end.stopReason !== "interrupted" &&
+    end.stopReason !== "tool_stalled" &&
+    !errors.some((said) => isContextError(said));
+  // a failed turn that gave no reason of its own still says it failed,
+  // or a turn that ends in silence reads as the agent not answering
+  const explainSilence = () => {
+    if (!end.ok && !errors.length && end.stopReason !== "interrupted" && !end.rebuilt) say(failedTurnNotice(end.stopReason));
+  };
+  if (!failed) {
+    showHeldErrors(bot, laneId, held);
+    explainSilence();
+    // 3. The backup answered: the conversation stays on it. An own engine
+    // that rests is left alone until its rest ends instead.
+    const now = store.bot(bot.id);
+    if (end.ok && recovery?.stage === "backup" && used && now && !cooldowns.of(now.modelSelection.instanceId)) {
+      stays.set(laneId, { own: now.modelSelection, backup: used, until: Date.now() + STAY });
+    }
+    return false;
+  }
+  const evidence = [...errors, end.stopReason ?? ""].join("\n");
+  // an ACP engine says a refusal with its stop reason alone
+  const kind = failureOf(evidence) === "other" && end.stopReason === "refusal" ? "refusal" : failureOf(evidence);
+  // An engine that ran out rests, for every agent on it, since a limit
+  // belongs to the account and not to one agent. A room's turn rests it
+  // too: the agent's next turn there goes to its backup.
+  const out = outReason(evidence);
+  const rest: Rest | null = out ? cooldowns.rest(used.instanceId, out, evidence) : null;
+  // a refused session refuses every message after it, so it is never
+  // resumed: the next turn, here or in a room, is told the conversation
+  if (kind === "refusal") store.dropSession(laneId, used.instanceId);
+  const said = lastWords(errors, end.stopReason);
+  const fresh = store.bot(bot.id);
+  const goesOn = Boolean(roomId === laneId && asked && fresh && !fresh.archivedAt && !wheel.heldBy(bot.id));
+  const at = Date.now();
+  const tried = [...(recovery?.tried ?? []), { selection: used, at, said }];
+  const told = (did: string) => failureNotes.set(laneId, { text: failureLine(used, at, said, did) });
+  const notice = (text: string) => {
+    const shown = store.appendMessage(laneId, { role: "bot", kind: "notice", text });
     broadcast({ kind: "message", threadId: laneId, message: shown });
+  };
+
+  // 1. Asked again once per message. Not a refusal in a session that was
+  // already new and told the conversation: that would only repeat it. Not
+  // an engine that is out either, which cannot answer before its reset.
+  if (goesOn && !recovery && !trying && kind !== "out" && !(kind === "refusal" && newSession)) {
+    notice(
+      kind === "refusal"
+        ? `${engineName(used)} declined this message: ${said}. Trying again in a new session, with the conversation so far.`
+        : `${engineName(used)} failed: ${said}. Trying again in a minute.`,
+    );
+    told(
+      kind === "refusal"
+        ? "The provider declined it, so Bloks started this new session for the message, told the conversation so far."
+        : "Bloks waited a minute and is asking again, in the same session.",
+    );
+    askAgain(bot, laneId, { asked: asked!, stage: "retry", tried }, kind === "refusal" ? 0 : RETRY_WAIT);
+    return true;
+  }
+
+  // 2. Then the backup, once, with the conversation so far, for whoever
+  // asked. Whatever the failure was: the backup is an engine the person
+  // chose for this agent, and the turn it takes is told what failed.
+  const backup = fresh?.backupSelection ?? null;
+  const usable = goesOn && recovery?.stage !== "backup" ? backupFor(backup, used, Boolean(out)) : null;
+  if (usable) {
+    // a rejected try of a rest this lane was told of says nothing new
+    const alreadyTold = Boolean(trying && rest && !restIsNews(toldOfRest.get(laneId), rest));
+    if (rest) toldOfRest.set(laneId, toldOf(rest));
+    const why = rest
+      ? `${engineName(used)} ${REASON_WORDS[out!]} ${describeRest(rest)}.`
+      : recovery
+        ? `${engineName(used)} failed again: ${said}.`
+        : `${engineName(used)} ${kind === "refusal" ? "declined this message" : "failed"}: ${said}.`;
+    if (!alreadyTold) notice(`${why} ${engineName(usable)} is picking this up, with the conversation so far.`);
+    told(`Bloks handed the message to ${engineName(usable)}, this agent's backup engine, with the conversation so far.`);
+    askAgain(bot, laneId, { asked: asked!, stage: "backup", tried }, 0);
+    return true;
+  }
+
+  // 4. Nothing left to try: the error shows as it was, and the same
+  // notice says why nothing else took it. The conversation waits for the
+  // person.
+  told(
+    goesOn
+      ? "Nothing else could take it, so the error was shown and the agent stopped. This is the next message."
+      : roomId !== laneId
+        ? "The error was shown in the room, and it was not asked again."
+        : "The error was shown, and it was not asked again.",
+  );
+  if (!goesOn) {
+    showHeldErrors(bot, laneId, held);
+    explainSilence();
+    return false;
+  }
+  const stopped = `${tried.length > 1 ? "Asking again did not help, so " : ""}${bot.name} has stopped here.`;
+  const first = tried[0];
+  const why =
+    recovery?.stage === "backup"
+      ? `${engineName(used)} could not answer either, so ${bot.name} has stopped here. Before that, ${engineName(first.selection)} said: ${first.said}.`
+      : !backup
+        ? `${stopped} No backup engine is set for it; you can choose one in its settings, under Backup engine.`
+        : `${stopped} Its backup, ${engineName(backup)}, ${whyNotBackup(backup, used, Boolean(out))}.`;
+  if (held.length) showHeldErrors(bot, laneId, held, why);
+  else if (!errors.length) say(sentences(failedTurnNotice(end.stopReason), why), failedTurnNotice(end.stopReason));
+  else notice(why);
+  store.markLane(bot.id, laneId, true);
+  broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+  return false;
+}
+
+/** Two sentences as one notice, the first ending in a full stop. */
+function sentences(first: string, then: string): string {
+  const said = first.trim();
+  return /[.!?)]$/.test(said) ? `${said} ${then}` : `${said}. ${then}`;
+}
+
+/** The opening line of a turn after a failure (failureNotes). */
+function failureLine(selection: ModelSelection, at: number, said: string, did: string): string {
+  const time = new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return `(A note from Bloks: an earlier attempt in this conversation failed at ${time} on ${engineName(selection)}, saying: "${said}". ${did} That attempt may have done part of the work before it failed, so check what is already done before redoing anything, and tell the person what happened if it matters to them.)`;
+}
+
+/** A switch without a failed attempt in this conversation still has a
+ * cause. Keep it in past tense: the first turn back hears this line too. */
+function backupLine(own: ModelSelection, backup: ModelSelection, rest: Rest | undefined, at: number, trying = false): string {
+  const why = rest ? REASON_WORDS[rest.reason].replace(/^is /, "was ") : "was not available";
+  const switched = `${engineName(own)} ${why}, so at ${clockTime(at, at)} Bloks switched this conversation to ${engineName(backup)}, this agent's backup engine.`;
+  // A try before the reset is not a return yet: it may be turned away.
+  if (trying) {
+    const reset = rest ? `, before its expected reset at ${clockTime(rest.until, at)}` : "";
+    return `(A note from Bloks: ${switched} Bloks is trying ${engineName(own)} again with this message${reset}.)`;
+  }
+  const tries = !rest
+    ? `Bloks checks for ${engineName(own)} again on each new turn`
+    : triesBeforeReset(own, rest)
+      ? `Bloks tries ${engineName(own)} again now and then, at the latest on the first turn after ${clockTime(rest.until, at)},`
+      : `Bloks tries ${engineName(own)} again on the first turn after ${clockTime(rest.until, at)}`;
+  return `(A note from Bloks: ${switched} ${tries} and returns to it automatically when it is available.)`;
+}
+
+/** Whether an ordinary message may try this engine before its reset:
+ * a usage limit on an engine that says plainly when it turns one away. */
+function triesBeforeReset(selection: ModelSelection, rest: Rest | undefined): boolean {
+  const kind = registry.get(selection.instanceId)?.driverKind;
+  return rest?.reason === "limit" && (kind === "claudeAgent" || kind === "codex");
+}
+
+/** The backup that can take a failed turn: one that is usable and is not
+ * what just failed. Another model on the same engine counts, and resumes
+ * the same session, since sessions are kept per engine; after an engine
+ * that is out it has to be another engine. */
+function backupFor(backup: ModelSelection | null, used: ModelSelection, out: boolean): ModelSelection | null {
+  if (!backup || !engineUsable(backup)) return null;
+  if (backup.instanceId === used.instanceId && (out || (backup.model ?? null) === (used.model ?? null))) return null;
+  return backup;
+}
+
+/** Why a backup that is set could not take the turn, for the notice. */
+function whyNotBackup(backup: ModelSelection, used: ModelSelection, out: boolean): string {
+  const rest = cooldowns.of(backup.instanceId);
+  if (rest) return `${REASON_WORDS[rest.reason]} ${describeRest(rest)}`;
+  if (backup.instanceId === used.instanceId && (out || (backup.model ?? null) === (used.model ?? null))) return "is what just failed";
+  return "is not available";
+}
+
+/** The words a failed turn ended on, for a notice: its last error, or
+ * the reason it gave, without the full stop a sentence goes on after. */
+function lastWords(errors: string[], stopReason: string | null): string {
+  const said = errors.filter((e) => e.trim()).at(-1) ?? failedTurnNotice(stopReason);
+  return redactSecrets(said).trim().slice(0, 300).replace(/[.\s]+$/, "");
+}
+
+/** Errors held back for a turn that did not go on after all, shown
+ * exactly as they would have been. Out of credit, over a limit, signed
+ * out: nothing in this lane moves until the person does something, so
+ * the lane says so with its dot instead of waiting to be found (the app
+ * also raises a banner). */
+function showHeldErrors(bot: BotRecord, laneId: string, held: string[], why?: string) {
+  held.forEach((text, i) => {
+    const last = why && i === held.length - 1;
+    const shown = store.appendMessage(laneId, { role: "bot", kind: "notice", text: last ? sentences(text, why) : text, ...(last ? { phoneText: text } : {}) });
+    broadcast({ kind: "message", threadId: laneId, message: shown });
+  });
+  if (held.some((text) => outReason(text))) {
+    store.markLane(bot.id, laneId, true);
+    broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
   }
 }
 
-/** Rests an engine that ran out, and hands the turn to the backup when
- * there is one to hand it to. True when the backup took it. */
-function handOver(bot: BotRecord, laneId: string, roomId: string, used: ModelSelection, evidence: string): boolean {
-  const reason = outReason(evidence);
-  if (!reason) return false;
-  const rest: Rest = cooldowns.rest(used.instanceId, reason, evidence);
-
-  const fresh = store.bot(bot.id);
-  const backup = fresh?.backupSelection;
-  if (!fresh || roomId !== laneId || fellBack.has(laneId) || wheel.heldBy(bot.id) || fresh.archivedAt) return false;
-  if (!backup || backup.instanceId === used.instanceId || !engineUsable(backup)) return false;
-  const asked = [...store.messagesFor(laneId)]
-    .reverse()
-    .find((m) => m.role === "user" && m.kind === "text" && m.text && !m.deleted);
-  if (!asked?.text) return false;
-
-  fellBack.add(laneId);
-  toldOfRest.set(laneId, rest.until);
-  const notice = store.appendMessage(laneId, {
-    role: "bot",
-    kind: "notice",
-    text: `${engineName(used)} ${REASON_WORDS[reason]} ${describeRest(rest)}. ${engineName(backup)} is picking this up, with the conversation so far.`,
-  });
-  broadcast({ kind: "message", threadId: laneId, message: notice });
-  // after this event has finished settling the lane it ended
-  setTimeout(() => {
-    void startTurn(bot.id, asked.text!, { taskId: laneId, presetMessage: true, fallback: true }).catch((e) => {
+/**
+ * The message a failed turn was asked, asked again after `delay`, in the
+ * same lane, for whoever asked it (a routine, another agent, a stranger's
+ * mail). The lane stays busy while it waits, so whatever is said to it
+ * meanwhile queues as it would behind any turn, and Stop cancels it
+ * (cancelRecovery).
+ */
+function askAgain(bot: BotRecord, laneId: string, recovery: Recovery, delay: number) {
+  // who asked for the turn that failed, before its end clears that
+  const requester = laneRequester.get(laneId) ?? askedLast.get(laneId);
+  recoveries.set(laneId, recovery);
+  store.setTaskBusy(laneId, true);
+  broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+  const { asked, stage } = recovery;
+  recovery.timer = setTimeout(() => {
+    if (recoveries.get(laneId) !== recovery) return;
+    recovery.timer = undefined;
+    store.setTaskBusy(laneId, false);
+    void startTurn(bot.id, asked.text, {
+      taskId: laneId,
+      presetMessage: true,
+      ...(stage === "retry" ? { retry: true } : { fallback: true }),
+      recovery: stage,
+      byYou: asked.byYou,
+      ...(asked.from ? { from: asked.from } : {}),
+      ...(asked.routine ? { routine: asked.routine } : {}),
+      ...(asked.replyTo ? { replyTo: asked.replyTo } : {}),
+      ...(asked.answering ? { answering: asked.answering } : {}),
+      ...(requester ? { requester } : {}),
+    }).catch((e) => {
+      if (recoveries.get(laneId) === recovery) recoveries.delete(laneId);
+      const why = redactSecrets(e instanceof Error ? e.message : String(e));
+      const owner = store.bot(bot.id);
+      if (owner) settleOwners(owner, laneId, { ok: false, why, unsent: true });
+      telegramReturns.finish(laneId, `Could not answer: ${why}`);
+      telegramWorking.get(laneId)?.ended();
       const failed = store.appendMessage(laneId, {
         role: "bot",
         kind: "notice",
-        text: `${engineName(backup)} could not pick it up either: ${redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 300)}`,
+        text: `It could not be asked again: ${why.slice(0, 300)}`,
       });
       broadcast({ kind: "message", threadId: laneId, message: failed });
     });
-  }, 0);
+  }, delay);
+}
+
+/** A lane waiting to ask a failed turn again is stopped: nothing is asked,
+ * the lane is free, and whatever waited behind it goes. True when there
+ * was one to stop. */
+function cancelRecovery(bot: BotRecord, laneId: string, why: string): boolean {
+  const recovery = recoveries.get(laneId);
+  if (!recovery?.timer) return false;
+  clearTimeout(recovery.timer);
+  recoveries.delete(laneId);
+  const last = recovery.tried.at(-1);
+  if (last) failureNotes.set(laneId, { text: failureLine(last.selection, last.at, last.said, "Bloks was going to ask again, but it was stopped. This is the next message.") });
+  settleOwners(bot, laneId, { ok: false, why: last?.said ?? null });
+  store.setTaskBusy(laneId, false);
+  const notice = store.appendMessage(laneId, { role: "bot", kind: "notice", text: why });
+  broadcast({ kind: "message", threadId: laneId, message: notice });
+  telegramReturns.finish(laneId);
+  telegramWorking.get(laneId)?.ended();
+  broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+  drainRoomTags(bot.id);
+  drainSteer(laneId);
+  closeIfAsked(laneId);
   return true;
+}
+
+/** What a failed turn that gave no reason of its own says. A reason
+ * that reads as a sentence is shown as it is; a bare status word is
+ * put in one. */
+function failedTurnNotice(stopReason: string | null | undefined): string {
+  const reason = (stopReason ?? "").trim();
+  if (/\s/.test(reason)) return reason.slice(0, 600);
+  return reason ? `The turn did not finish (${reason.slice(0, 80)}).` : "The turn did not finish.";
 }
 
 // ── the morning brief (server/brief.ts) ────────────────────────────────
@@ -902,18 +1867,11 @@ function handOver(bot: BotRecord, laneId: string, roomId: string, used: ModelSel
 const BRIEFS_FILE = join(DATA_DIR, "briefs.json");
 /** A month of mornings, then the oldest go. */
 const MAX_BRIEFS = 30;
-let briefs: Array<Brief & { readAt?: number }> = (() => {
-  try {
-    const parsed = JSON.parse(readFileSync(BRIEFS_FILE, "utf8"));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-})();
+let briefs: Array<Brief & { readAt?: number }> = readSaved(BRIEFS_FILE, [], Array.isArray);
 function saveBriefs() {
   try {
     mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-    writeFileSync(BRIEFS_FILE, JSON.stringify(briefs), { mode: 0o600 });
+    writeFileAtomic(BRIEFS_FILE, JSON.stringify(briefs), 0o600);
   } catch {
     /* a brief is a convenience; never fail over one */
   }
@@ -1054,6 +2012,13 @@ function wakeFor(payload: unknown): Wake | undefined {
   const blok = p.threadId ? bloks.get(p.threadId) : null;
   const shared = blok?.sharing ? blok : null;
 
+  // a goal blocked on the person is as stopped as a question: the owner's,
+  // since goals are only ever set in the owner's own conversations. So
+  // are agents held at the chain limit, whose next turn is the person's.
+  if (message.kind === "notice" && (message.goal === "blocked" || message.chainHeld)) {
+    return owner ? { reason: "needs-you", clients: [owner], preview: true } : { reason: "needs-you", preview: true };
+  }
+
   if (message.kind === "options" && message.card?.requestId) {
     if (!owner) return { reason: "needs-you", preview: true };
     const approval = Boolean(message.card.tool) || message.card.title === "Approval needed";
@@ -1117,6 +2082,13 @@ function previewOf(frame: unknown): WakePreview | null {
     }
     return { title: `${who} has a question`, body: clip(m.card.subtitle || m.card.title), category: "question", threadId: f.threadId };
   }
+  // stopped and waiting for the person, in Bloks's own words
+  if (m.kind === "notice" && m.text && m.chainHeld) {
+    return { title: CHAIN_LIMIT_TITLE, body: clip(m.text), category: "question", threadId: f.threadId };
+  }
+  if (m.kind === "notice" && m.text && m.goal === "blocked") {
+    return { title: room ? `${room.name} is waiting for you` : `${bot?.name ?? "An agent"} is waiting for you`, body: clip(m.text), category: "question", threadId: f.threadId };
+  }
   if (m.kind === "text" && m.text) {
     const speaker = m.role === "bot" ? (bot?.name ?? "An agent") : m.author ? (people.person(m.author)?.name ?? "Someone") : hostName();
     return { title: room ? `${speaker} in ${room.name}` : speaker, body: clip(m.text), category: "mention", threadId: f.threadId };
@@ -1130,18 +2102,86 @@ function previewOf(frame: unknown): WakePreview | null {
 // transcript can be rebuilt after the fact and why no client is ever asked
 // to reconstruct state it missed.
 const toolMessageByItem = new Map<string, string>(); // itemId -> messageId
+/** Each running turn's calls, counted by what they asked for, so a turn
+ * making the same call again and again is said on the turn (repeats.ts). */
+const repeats = new RepeatWatch();
 
 // Nothing is running when the server starts, so a call still marked as
 // running was cut off by the last quit or crash. Settled once, here,
 // rather than left spinning in every transcript it happened in.
+// The same goes for a question or an approval: the engine waiting on it
+// went with the last run.
 for (const bot of store.bots) {
-  for (const task of bot.tasks) store.settleOpenTools(task.id);
+  for (const task of bot.tasks) {
+    store.settleOpenTools(task.id);
+    store.settleOpenAsks(task.id);
+  }
 }
-for (const room of bloks.bloks) store.settleOpenTools(room.id);
+for (const room of bloks.bloks) {
+  store.settleOpenTools(room.id);
+  store.settleOpenAsks(room.id);
+}
 const askMessageByRequest = new Map<string, string>(); // requestId -> messageId
+/** The thread each live ask's card is in: the room it was asked in, or
+ * the lane. The answer goes to the lane (askThreadByRequest), but a card
+ * settled for an answer that could not be delivered is settled where it
+ * is, or the room's card stays open forever. */
+const askCardThread = new Map<string, string>();
+/** The engine that raised each live ask, which is where its answer goes.
+ * Not always the one the lane reads as running on: a Claude Code turn
+ * that has ended can still ask (a background task), and by then the
+ * lane's engine is forgotten and the agent's own may be another. */
+const askEngineByRequest = new Map<string, string>();
 /** A collaborator who answered an approval, by request, so the record and
  * the card say who decided rather than "you". */
 const decidedByMember = new Map<string, string>();
+/** The asks settled in this run, the latest few hundred, with where each
+ * one's card is. An answer that arrives after (another window, a phone
+ * that had not heard yet) is told so beside the card it was pressed on. */
+const settledAsks = new Map<string, { thread: string; messageId: string }>();
+const MAX_SETTLED_ASKS = 500;
+
+/** An ask is over, however it ended: nothing is waiting on it now. */
+function forgetAsk(requestId: string) {
+  const messageId = askMessageByRequest.get(requestId);
+  const thread = askCardThread.get(requestId);
+  if (messageId && thread) {
+    settledAsks.set(requestId, { thread, messageId });
+    while (settledAsks.size > MAX_SETTLED_ASKS) settledAsks.delete(settledAsks.keys().next().value!);
+  }
+  askMessageByRequest.delete(requestId);
+  askCardThread.delete(requestId);
+  askThreadByRequest.delete(requestId);
+  askEngineByRequest.delete(requestId);
+  decidedByMember.delete(requestId);
+}
+
+/** What a card says under its question once it closed with nobody having
+ * answered it, by what closed it. A card that only vanished read as a
+ * question that was never asked, or one Bloks lost (GitHub 254). The
+ * engine is not named: a shared room's members read this too. */
+function closedWhy(source: string | undefined, card: { tool?: string; title: string }, agent: string): string {
+  const approval = Boolean(card.tool) || card.title === "Approval needed";
+  if (source === "timeout") {
+    return approval
+      ? "Nobody answered in time, so this was not done."
+      : `Nobody answered in time, so ${agent} carried on without an answer.`;
+  }
+  if (source === "turn-ended" || source === "shutdown") {
+    return `The turn ended before this was answered${approval ? ", so it was not done" : ""}. Nothing is waiting on it now.`;
+  }
+  if (source === "engine") return `${agent}'s engine closed this before it was answered. Nothing is waiting on it now.`;
+  return "This closed before it was answered. Nothing is waiting on it now.";
+}
+/** What such a card reads as answered with, for a screen that shows only that. */
+const CLOSED_UNANSWERED = "Closed without an answer";
+
+/** The engine an ask's answer goes to: the one that asked, while it is
+ * still there to hear it. */
+function askInstance(bot: { modelSelection: ModelSelection }, askThread: string | undefined, requestId: string) {
+  const asked = askEngineByRequest.get(requestId);
+  return (asked ? registry.get(asked) : undefined) ?? laneInstance(bot, askThread);
+}
 /** Proposed teams awaiting the user's yes, by card message id. */
 const teamPlans = new Map<string, { plan: TeamPlan; leadId: string }>();
 
@@ -1157,7 +2197,12 @@ function recoverPlan(messageId: string, botId: string) {
   return plan ? { plan, leadId: bot.id } : null;
 }
 
+const replyNotifications = new ReplyNotifications();
+
 bus.subscribe((event: RuntimeEvent) => {
+  // Maintenance compaction (idle or before a turn) does not own a
+  // command catalog: keep the latest agent turn's report.
+  if (idleCompacting.has(event.threadId)) return onIdleCompaction(event);
   broadcast({ kind: "runtime", event });
   const bot = store.botByThread(event.threadId);
   if (!bot) return;
@@ -1166,29 +2211,62 @@ bus.subscribe((event: RuntimeEvent) => {
   // lane is currently speaking.
   const roomId = activeRoom.get(event.threadId) ?? event.threadId;
   const inRoom = roomId !== event.threadId;
+  if (event.type === "turn.started") {
+    replyNotifications.start(event.threadId, event.turnId, roomId, bot.id,
+      store.taskByThread(event.threadId)?.task.goal?.status === "active");
+  }
 
   const pushMessage = (m: Omit<Message, "id" | "at">) => {
     const message = store.appendMessage(roomId, inRoom ? { ...m, from: bot.id } : m);
-    broadcast({ kind: "message", threadId: roomId, message });
+    // What a check-in says is news only once it has ended and was not
+    // quiet, so the app holds its banner until then (src/lib/notify.ts).
+    const checkIn = !inRoom && checkInTurns.has(event.threadId);
+    broadcast({ kind: "message", threadId: roomId, message, ...(checkIn ? { checkIn: true } : {}) });
+    if (!inRoom) telegramWorking.get(event.threadId)?.observe();
     return message;
   };
 
   switch (event.type) {
+    case "commands.updated":
+      if (event.providerInstanceId && registry.get(event.providerInstanceId)?.driverKind === "claudeAgent") {
+        for (const laneId of claudeCatalogs.keys()) if (!store.taskByThread(laneId)) claudeCatalogs.delete(laneId);
+        claudeCatalogs.set(event.threadId, { instanceId: event.providerInstanceId, cwd: event.cwd, catalog: event.catalog });
+      }
+      break;
     case "session.started":
       if (event.sessionId && event.providerInstanceId) {
         store.setResumeCursor(event.threadId, event.providerInstanceId, event.sessionId);
+        cutOff.session(event.threadId, event.providerInstanceId, event.sessionId);
       }
       break;
     case "item.completed":
       if (event.itemType === "assistant_text") {
         // a lead may have proposed a team; the plan becomes a card the
-        // user approves, never something that happens on its own
-        const { plan, text: afterPlan } = extractTeamPlan(event.text);
+        // user approves, never something that happens on its own. Never
+        // from a stranger's mail, which would be writing the agents the
+        // owner hires and the brief they start on.
+        const { plan, text: afterPlan } =
+          laneRequester.get(event.threadId) === MAIL_FROM_ANYONE ? { plan: null, text: event.text } : extractTeamPlan(event.text);
         // Components an engine wrote into its own answer. The CLI is the
         // route for engines with a shell; this is the one for the rest,
         // so an API model can answer with a chart like anybody else.
         const { components, text } = extractComponents(afterPlan);
-        if (text) pushMessage({ role: "bot", kind: "text", text: houseStyle(text) });
+        const answering = inRoom ? undefined : replyingTo.get(event.threadId);
+        if (answering && text) spokeInTurn.add(event.threadId);
+        // A check-in's QUIET is marked the moment it is said, so the frame
+        // that carries it already says it is not news, to every client
+        // that reads it, before the turn has even ended.
+        const quiet = !inRoom && checkInTurns.has(event.threadId) && isQuietReply(text);
+        if (text) {
+          const savedReply = pushMessage({
+            role: "bot",
+            kind: "text",
+            text: houseStyle(text),
+            ...(answering ? { afterAgent: answering } : {}),
+            ...(quiet ? { quiet: true } : {}),
+          });
+          replyNotifications.text(event.threadId, event.turnId, savedReply, event.replyPhase, event.syntheticText);
+        }
         for (const component of components) {
           if (!mayRender(component.kind, bot.withoutComponents)) continue;
           pushMessage({
@@ -1213,30 +2291,102 @@ bus.subscribe((event: RuntimeEvent) => {
       } else if (event.itemType === "tool" && event.itemId) {
         const messageId = toolMessageByItem.get(event.itemId);
         if (messageId) {
+          const tool = store.messagesFor(roomId).find((m) => m.id === messageId)?.tool;
           const patched = store.patchMessage(roomId, messageId, {
-            tool: { name: store.messagesFor(roomId).find((m) => m.id === messageId)?.tool?.name ?? "tool", ok: event.ok },
+            tool: { ...tool, name: tool?.name ?? "tool", ok: event.ok },
           });
           if (patched) broadcast({ kind: "message.patch", threadId: roomId, message: patched });
           toolMessageByItem.delete(event.itemId);
         }
+        cutOff.tool(event.threadId, null);
         // the bot just finished acting, refresh its screen preview now
         pokeScreenPoller(bot.id);
       }
       break;
     case "item.started":
       if (event.itemType === "tool") {
-        const message = pushMessage({ role: "bot", kind: "activity", tool: { name: event.title ?? "tool" } });
+        // what the change card can be sure is this turn's own, and whether
+        // it may have written files it did not name
+        if (event.paths?.length) checkpoints.noteEdits(event.threadId, event.paths);
+        if (event.mayWrite) checkpoints.noteUnnamedWrites(event.threadId);
+        // The same call made again and again is said as a chip on this
+        // row, and the row that had the turn's chip gives it up. Nothing
+        // is stopped: a loop is a guess, and stopping is the person's.
+        const mark = event.signature ? repeats.note(event.threadId, event.signature) : null;
+        const message = pushMessage({
+          role: "bot",
+          kind: "activity",
+          tool: { name: event.title ?? "tool", ...(event.command ? { command: event.command } : {}) },
+          ...(mark ? { repeated: mark.count } : {}),
+        });
         if (event.itemId) toolMessageByItem.set(event.itemId, message.id);
+        if (mark) {
+          repeats.chipAt(event.threadId, { threadId: roomId, messageId: message.id }, mark.count);
+          if (mark.moveFrom) {
+            const before = store.patchMessage(mark.moveFrom.threadId, mark.moveFrom.messageId, { repeated: undefined });
+            if (before) broadcast({ kind: "message.patch", threadId: mark.moveFrom.threadId, message: before });
+          }
+          // Once a turn. Not the call's name: a shared room's members may
+          // see only the kind of a tool, and this line reaches them whole.
+          if (mark.notice) {
+            pushMessage({
+              role: "bot",
+              kind: "notice",
+              text: `${bot.name} has made the same call ${mark.count} times in this turn, which usually means it is stuck. Nothing has been stopped. If it is not getting anywhere, stop the turn.`,
+            });
+          }
+        }
+        // named on disk, so a turn cut off mid-call can say which call
+        cutOff.tool(event.threadId, legacyToolTitle(event));
         // The browser is watched from its first use in a turn, not from the
         // turn's start: a turn that never touches it should not end with
         // a picture of whatever page an earlier one left open. Cheap to
         // photograph locally, so it refreshes faster than a cloud box.
-        if (bot.browser === true && /browser/i.test(event.title ?? "")) {
-          startScreenPoller(bot.id, async () => ({ ...(await captureFrame(BROWSER_PORT)), source: "browser" }), 1500);
+        if (bot.browser === true && /browser/i.test(legacyToolTitle(event))) {
+          startScreenPoller(bot.id, async () => ({ ...(await captureFrame(await browserPortOf(bot.id))), source: "browser" }), 1500);
         }
       }
       break;
     case "request.opened": {
+      // The engine that asked, which hears every answer given below. The
+      // lane's own is not always it: a turn that has ended can still ask,
+      // and by then the lane's engine is forgotten (askEngineByRequest).
+      const asker = registry.get(event.providerInstanceId ?? "") ?? laneInstance(bot, event.threadId);
+      // An archived agent does nothing more, whatever its rules and mode
+      // would have allowed. Its turn is being stopped; an engine that asks
+      // in the moment before it goes is refused rather than waved
+      // through, so no tool starts after the archive (GitHub 220).
+      if (event.requestId && bot.archivedAt) {
+        void asker
+          ?.adapter.respondToRequest(event.threadId, event.requestId, {
+            behavior: "deny",
+            message: `${bot.name} has been archived, so this was not done.`,
+          })
+          .catch(() => {});
+        pushMessage({ role: "bot", kind: "activity", tool: { name: "refused: the agent was archived", ok: false } });
+        break;
+      }
+      // An email from anyone reads nothing of the owner's and keeps no
+      // note about them: what the agent looked up would go back to whoever
+      // wrote. A CLI engine has no credential to ask with on that turn, and
+      // an API engine, which asks here, is refused the same.
+      // Nor does it ask the owner for a key or an app: the turn that would
+      // pick up after the owner saved one is the owner's, with the owner's
+      // trust, still carrying out what the mail said.
+      if (
+        (event.tool === "note_about_person" || event.tool === "read_message" || event.tool === "search_history" ||
+          event.tool === "request_secret" || event.tool === "request_connection") &&
+        event.requestId &&
+        laneRequester.get(event.threadId) === MAIL_FROM_ANYONE
+      ) {
+        void asker
+          ?.adapter.respondToRequest(event.threadId, event.requestId, {
+            behavior: "answer",
+            message: "Not for an email from someone the person has not listed: their conversations, notes, keys and apps stay theirs.",
+          })
+          .catch(() => {});
+        break;
+      }
       // the agent asking for an app: plant sign-in cards and answer the
       // tool right away so the model can wrap up instead of blocking
       // a note about the person, suggested for them to keep or not
@@ -1245,15 +2395,27 @@ bus.subscribe((event: RuntimeEvent) => {
         const answer = inShared
           ? "Not in a shared room: notes about the person are private to them."
           : suggestNote(bot, (event.input as { fact?: unknown } | undefined)?.fact, event.threadId);
-        void laneInstance(bot, event.threadId)
+        void asker
           ?.adapter.respondToRequest(event.threadId, event.requestId, { behavior: "answer", message: answer })
+          .catch(() => {});
+        break;
+      }
+      // reading one message recall cut short
+      if (event.tool === "read_message" && event.requestId) {
+        const id = String((event.input as { message_id?: unknown } | undefined)?.message_id ?? "").trim();
+        const found = /^[\w-]{1,80}$/.test(id) ? recalledMessage(bot, id, event.threadId) : null;
+        void asker
+          ?.adapter.respondToRequest(event.threadId, event.requestId, {
+            behavior: "answer",
+            message: found ? `${found.who}${found.by === "agent" ? " (another agent)" : ""}, ${found.where}:\n${found.text}` : "No message with that id in your conversations.",
+          })
           .catch(() => {});
         break;
       }
       // looking something up in its own past: answered straight away
       if (event.tool === "search_history" && event.requestId) {
         const query = String((event.input as { query?: unknown } | undefined)?.query ?? "").slice(0, 300);
-        void laneInstance(bot, event.threadId)
+        void asker
           ?.adapter.respondToRequest(event.threadId, event.requestId, {
             behavior: "answer",
             message: recallText(recallFor(bot, query, event.threadId), query),
@@ -1279,7 +2441,7 @@ bus.subscribe((event: RuntimeEvent) => {
                 event.requestId,
                 (event.input as { name?: unknown; hint?: unknown } | undefined) ?? {},
               );
-        const instance = laneInstance(bot, event.threadId);
+        const instance = asker;
         void instance?.adapter
           .respondToRequest(event.threadId, event.requestId, { behavior: "answer", message: answer })
           .catch(() => {});
@@ -1288,13 +2450,28 @@ bus.subscribe((event: RuntimeEvent) => {
       const permission = event.requestType === "permission";
       // Whether this is really a question, whatever the engine called it.
       const asking = !permission || isQuestionTool(event.tool);
-      // A turn a member of a shared room started. The owner's standing
-      // rules and modes were written for the owner's own requests, so for
-      // this one an allow rule or an auto mode does not answer: the owner
-      // does. A deny rule still refuses, since refusing is always safe.
+      // A turn a member of a shared room started, or an email from anyone
+      // (MAIL_FROM_ANYONE). The owner's standing rules and modes were
+      // written for the owner's own requests, so for this one an allow
+      // rule or an auto mode does not answer: the owner does. A deny rule
+      // still refuses, since refusing is always safe.
       const requester = laneRequester.get(event.threadId);
       const byMember = requester !== undefined && requester !== "owner";
-      const askedBy = byMember ? people.person(requester!)?.name : undefined;
+      const byMail = requester === MAIL_FROM_ANYONE;
+      const mailFrom = byMail ? mailAnswering.get(event.threadId)?.mail.from : undefined;
+      const askedBy = byMail ? `an email from ${mailFrom || "someone not on your list"}` : byMember ? people.person(requester!)?.name : undefined;
+
+      // A decision made here (the wheel, a rule, a mode) that could not
+      // reach the agent allowed nothing: the ask it answered is gone. Say
+      // so in the lane rather than record an allow that never happened.
+      const undelivered = (e: unknown) => {
+        pushMessage({
+          role: "bot",
+          kind: "notice",
+          text: `Bloks decided on "${(event.summary || event.tool || "an action").slice(0, 120)}" but could not deliver it (${e instanceof Error ? e.message : String(e)}), so the agent did not get to do it.`,
+        });
+        return false;
+      };
 
       // Rules first, and only what they do not cover reaches a person.
       // Questions are never governed: an agent asking its owner something
@@ -1311,13 +2488,13 @@ bus.subscribe((event: RuntimeEvent) => {
         // no longer what should happen.
         const hold = wheel.heldBy(bot.id);
         if (hold) {
-          const instance = laneInstance(bot, event.threadId);
+          const instance = asker;
           void instance?.adapter
             .respondToRequest(event.threadId, event.requestId, {
               behavior: "deny",
               message: pausedMessage(hold),
             })
-            .catch(() => {});
+            .catch((e) => undelivered(e));
           pushMessage({
             role: "bot",
             kind: "activity",
@@ -1325,24 +2502,27 @@ bus.subscribe((event: RuntimeEvent) => {
           });
           break;
         }
-        const target = targetOf(event.tool ?? "", (event.input as Record<string, unknown>) ?? {}, {
+        const targets = targetsOf(event.tool ?? "", (event.input as Record<string, unknown>) ?? {}, {
           botId: bot.id,
           agent: bot.name,
         });
-        const decision = decide(policy.list(), target);
+        const decision = decideEach(policy.list(), targets);
         if (decision.verdict === "deny" || (decision.verdict === "allow" && !byMember)) {
           const allowed = decision.verdict === "allow";
-          const instance = laneInstance(bot, event.threadId);
-          void instance?.adapter
-            .respondToRequest(event.threadId, event.requestId, {
-              behavior: allowed ? "allow" : "deny",
-              ...(allowed ? {} : { message: refusal(decision) }),
-            })
-            .catch(() => {});
-          // Written down before the action runs, refusals included, and
-          // signed by the agent it is about. A decision nobody was asked
-          // about is the one most worth being able to look up later.
-          record(
+          const instance = asker;
+          const delivered = instance
+            ? instance.adapter
+                .respondToRequest(event.threadId, event.requestId, {
+                  behavior: allowed ? "allow" : "deny",
+                  ...(allowed ? {} : { message: refusal(decision) }),
+                })
+                .then(() => true, (e) => undelivered(e))
+            : Promise.resolve(undelivered(new Error("the engine is gone")));
+          // Written down once the answer has reached the agent, refusals
+          // included, and signed by the agent it is about. A decision
+          // nobody was asked about is the one most worth being able to
+          // look up later, and one that never arrived allowed nothing.
+          void delivered.then((ok) => ok && record(
             signed(bot.id, {
               at: Date.now(),
               kind: "approval",
@@ -1355,7 +2535,7 @@ bus.subscribe((event: RuntimeEvent) => {
                 agent: bot.name,
               },
             }),
-          );
+          ));
           // Said in the lane too, or a refusal is a turn that quietly did
           // less than it was asked to.
           if (!allowed) {
@@ -1372,7 +2552,9 @@ bus.subscribe((event: RuntimeEvent) => {
         // refused by here, so a mode can only widen what is allowed,
         // never reopen what a rule shut. "auto" waves everything
         // through; "edits" waves through the file-shaped tools and
-        // cards the rest.
+        // cards the rest. "full" rarely gets here at all, because its
+        // engines are told not to ask; one that asks anyway is waved
+        // through like auto.
         const mode = bot.approvals ?? "ask";
         // File-shaped tools only, and named tightly: a bare "create"
         // would also match a connector's create_pull_request, which is
@@ -1380,12 +2562,14 @@ bus.subscribe((event: RuntimeEvent) => {
         const editish = /edit|^write|_write|patch|str_replace|save_file|create_file|mkdir/i.test(
           event.tool ?? "",
         );
-        if (!byMember && (mode === "auto" || (mode === "edits" && editish))) {
-          const instance = laneInstance(bot, event.threadId);
-          void instance?.adapter
-            .respondToRequest(event.threadId, event.requestId, { behavior: "allow" })
-            .catch(() => {});
-          record(
+        if (!byMember && (mode === "auto" || mode === "full" || (mode === "edits" && editish))) {
+          const instance = asker;
+          const delivered = instance
+            ? instance.adapter
+                .respondToRequest(event.threadId, event.requestId, { behavior: "allow" })
+                .then(() => true, (e) => undelivered(e))
+            : Promise.resolve(undelivered(new Error("the engine is gone")));
+          void delivered.then((ok) => ok && record(
             signed(bot.id, {
               at: Date.now(),
               kind: "approval",
@@ -1393,11 +2577,11 @@ bus.subscribe((event: RuntimeEvent) => {
               summary: event.summary || event.tool || "an action",
               detail: {
                 answer: "allow",
-                decidedBy: mode === "auto" ? "auto mode" : "edits mode",
+                decidedBy: mode === "full" ? "full access" : mode === "auto" ? "auto mode" : "edits mode",
                 agent: bot.name,
               },
             }),
-          );
+          ));
           break;
         }
       }
@@ -1411,10 +2595,13 @@ bus.subscribe((event: RuntimeEvent) => {
           // it as the question it is, or the card says "Approval needed"
           // over a sentence ending in a question mark.
           title: asking ? "Your agent has a question" : "Approval needed",
-          subtitle: askedBy && !asking ? `${event.summary ?? ""} (asked for by ${askedBy})`.trim() : event.summary,
+          // a question for a stranger's mail says so too: its answer is
+          // emailed to them
+          subtitle: askedBy && (!asking || byMail) ? `${event.summary ?? ""} (${asking ? "for" : "asked for by"} ${askedBy})`.trim() : event.summary,
           options: event.choices?.length ? event.choices : asking ? [] : ["Allow", "Deny"],
           requestId: event.requestId,
-          ...(byMember && !asking ? { askedFor: requester } : {}),
+          // a person, who may not then approve what they asked for
+          ...(byMember && !byMail && !asking ? { askedFor: requester } : {}),
           // The tool rides along so the card can offer to remember the
           // answer as a rule. Never for a question: a rule cannot answer
           // one, it can only stop it being asked.
@@ -1423,20 +2610,42 @@ bus.subscribe((event: RuntimeEvent) => {
       });
       if (event.requestId) {
         askMessageByRequest.set(event.requestId, message.id);
+        askCardThread.set(event.requestId, roomId);
         // answers must reach the lane that asked, not the active one
         askThreadByRequest.set(event.requestId, event.threadId);
+        if (event.providerInstanceId) askEngineByRequest.set(event.requestId, event.providerInstanceId);
         // A turn that began on a phone should not stall on a card the
-        // person cannot see. The card goes to the chat it came from, and
-        // the next message from that chat is read as the answer.
-        const chatId = telegramLive.get(bot.id);
-        if (chatId !== undefined && cfg.telegram?.token) {
-          telegramAsks.set(chatId, {
-            requestId: event.requestId,
+        // person cannot see. The card goes to the chat it came from, with
+        // its choices as buttons, and the next message from that chat is
+        // read as the answer too, for a question with no choices to tap.
+        // Not a mail's: that turn began in nobody's chat, and the person's
+        // next line there would be emailed to whoever wrote.
+        const runtime = liveTelegram(bot.id);
+        const address = telegramLive.get(bot.id);
+        const chatId = byMail || !runtime || address?.generation !== runtime.generation ? undefined : address.chatId;
+        if (chatId !== undefined && runtime) {
+          const requestId = event.requestId;
+          // Allow or Deny only for what is really an approval. A question
+          // the engine labelled a permission has its own choices, and a
+          // tap on one is the answer, not a yes to the first and a no to
+          // the rest.
+          const yesOrNo = !asking;
+          runtime.asks.set(chatId, {
+            requestId,
             botId: bot.id,
             options: message.card?.options ?? [],
-            permission,
+            permission: yesOrNo,
           });
-          void telegram.send(cfg.telegram.token, chatId, telegram.describeCard(message.card ?? {})).catch(() => {});
+          const { title, subtitle, options } = message.card ?? {};
+          const forwarded = telegramCards.forward({ title, subtitle, options, requestId, botId: bot.id, generation: runtime.generation, chatId, permission: yesOrNo });
+          void telegram
+            .post(runtime.token, chatId, forwarded.text, forwarded.keyboard, false, () => Boolean(currentTelegram(runtime)))
+            .then((messageId) => {
+              // answered before Telegram said which message it is
+              const late = messageId === undefined ? undefined : telegramCards.sent(requestId, messageId);
+              if (late) rewriteTelegramCard(late);
+            })
+            .catch(() => {});
         }
       }
       // the chip turns amber the moment a lane needs a human
@@ -1444,9 +2653,18 @@ bus.subscribe((event: RuntimeEvent) => {
       break;
     }
     case "request.resolved": {
+      // Answered anywhere, or closed: a card forwarded to a phone says so
+      // there too, and stops offering its buttons.
+      if (event.requestId) {
+        settleTelegramCard(event.requestId, (card) => outcomeOf(card, event.behavior, event.source));
+      }
       const messageId = event.requestId ? askMessageByRequest.get(event.requestId) : null;
       if (messageId) {
-        const existing = store.messagesFor(roomId).find((m) => m.id === messageId);
+        // Where the card is, which is not always where the lane speaks
+        // now: an ask closed after its turn ended finds the lane out of
+        // the room, and the room's card was left open for good.
+        const cardThread = (event.requestId ? askCardThread.get(event.requestId) : undefined) ?? roomId;
+        const existing = store.messagesFor(cardThread).find((m) => m.id === messageId);
         if (existing?.card && !existing.card.answered) {
           // The one thing in the product that is genuinely on your behalf:
           // an agent stopped, asked, and was told yes or no. Recorded with
@@ -1472,21 +2690,21 @@ bus.subscribe((event: RuntimeEvent) => {
             );
           }
           const decider = event.requestId ? decidedByMember.get(event.requestId) : undefined;
-          const patched = store.patchMessage(roomId, messageId, {
-            card: {
-              ...existing.card,
-              answered: event.behavior,
-              dismissed: event.source !== "user",
-              ...(decider ? { answeredBy: decider } : {}),
-            },
+          const patched = store.patchMessage(cardThread, messageId, {
+            card:
+              event.source === "user"
+                ? { ...existing.card, answered: event.behavior, dismissed: false, ...(decider ? { answeredBy: decider } : {}) }
+                : // Nobody answered: a timeout, the turn's end or the engine
+                  // closed it. It stays in the conversation and says which.
+                  {
+                    ...existing.card,
+                    answered: CLOSED_UNANSWERED,
+                    closed: closedWhy(event.source, existing.card, bot.name),
+                  },
           });
-          if (patched) broadcast({ kind: "message.patch", threadId: roomId, message: patched });
+          if (patched) broadcast({ kind: "message.patch", threadId: cardThread, message: patched });
         }
-        if (event.requestId) {
-          askMessageByRequest.delete(event.requestId);
-          askThreadByRequest.delete(event.requestId);
-          decidedByMember.delete(event.requestId);
-        }
+        if (event.requestId) forgetAsk(event.requestId);
       }
       broadcast({ kind: "bot", bot: clientBot(bot) });
       break;
@@ -1497,6 +2715,23 @@ bus.subscribe((event: RuntimeEvent) => {
       high.input = Math.max(high.input, event.input);
       high.output = Math.max(high.output, event.output);
       turnTokens.set(event.threadId, high);
+      noteRequest(event);
+      if (typeof event.context === "number") noteLaneReading(event, { used: event.context, window: null });
+      break;
+    }
+    case "context.reading": {
+      noteLaneReading(event, event);
+      break;
+    }
+    case "context.compacted": {
+      const before = compactionBefore(event);
+      const marker = pushMessage({
+        role: "bot",
+        kind: "notice",
+        text: compactedNotice({ before, after: null }),
+        compaction: { before, after: null },
+      });
+      noteCompacted(event, roomId, marker.id);
       break;
     }
     case "runtime.error": {
@@ -1509,15 +2744,27 @@ bus.subscribe((event: RuntimeEvent) => {
       // fix rather than report. Our idea of a model's limit is a guess, so
       // when the provider disagrees, fold and try the same thing again
       // once. Only once: a second failure is not about length.
-      if (isContextError(event.message) && !retriedForContext.has(event.threadId)) {
+      // Not a stranger's mail, which is told alone: there is nothing to fold,
+      // and what folding would summarise is other people's.
+      if (
+        !commandTurns.has(event.threadId) &&
+        isContextError(event.message) &&
+        !retriedForContext.has(event.threadId) &&
+        laneRequester.get(event.threadId) !== MAIL_FROM_ANYONE
+      ) {
         retriedForContext.add(event.threadId);
+        // what this turn was asked, not words still waiting for the next one
         const said = [...store.messagesFor(event.threadId)]
           .reverse()
-          .find((m) => m.role === "user" && m.kind === "text" && m.text && !m.deleted);
+          .find((m) => m.role === "user" && m.kind === "text" && m.text && !m.deleted && !m.queued);
+        // whoever asked for this turn, read now: the fold can take a
+        // minute, and a turn of the owner's in the lane meanwhile must not
+        // lend its trust to someone else's words asked again
+        const requester = laneRequester.get(event.threadId) ?? askedLast.get(event.threadId);
         void (async () => {
           const folded = await foldContext(bot.id, event.threadId, true).catch(() => false);
           if (folded && said?.text) {
-            await startTurn(bot.id, said.text, { taskId: event.threadId, presetMessage: true }).catch(
+            await startTurn(bot.id, said.text, { taskId: event.threadId, presetMessage: true, retry: true, byYou: turnsForYou.has(event.threadId), routine: said.via === "routine" ? said.routine : undefined, ...(requester ? { requester } : {}) }).catch(
               () => {},
             );
           } else {
@@ -1531,22 +2778,38 @@ bus.subscribe((event: RuntimeEvent) => {
         })();
         break;
       }
-      // An engine running out, with a backup ready to take the message,
-      // is said once, in plain words, when the backup takes over. The
-      // raw error waits: if the backup cannot take it after all, it is
-      // shown then (see fallBackIfOut).
-      if (!inRoom && outReason(event.message) && engineUsable(bot.backupSelection) && !fellBack.has(event.threadId)) {
-        heldErrors.set(event.threadId, event.message.slice(0, 600));
+      // A solo turn that fails is asked again or handed to the backup,
+      // and that is said once, in plain words, with the error in it. The
+      // raw error waits: if nothing takes the turn after all, it is
+      // shown then, as it would have been (see recoverTurn).
+      if (!inRoom && !commandTurns.has(event.threadId) && store.taskByThread(event.threadId)?.task.busy) {
+        const held = heldErrors.get(event.threadId) ?? [];
+        if (held.length < 8) held.push(event.message.slice(0, 600));
+        heldErrors.set(event.threadId, held);
         break;
       }
       // Not a failed tool call: the turn itself could not run. It gets a
       // readable notice rather than a truncated mono chip, because the
       // message is usually instructions for the user.
       pushMessage({ role: "bot", kind: "notice", text: event.message.slice(0, 600) });
+      // Out of credit, over a limit, signed out: nothing in this lane moves
+      // until the person does something, so the lane says so with its dot
+      // instead of waiting to be found (the app also raises a banner).
+      if (!inRoom && outReason(event.message)) {
+        store.markLane(bot.id, event.threadId, true);
+        broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+      }
       break;
     }
     case "turn.completed": {
-      usage.recordTurn(bot.id, event.providerInstanceId ?? event.provider, event.cost ?? null);
+      // Capture before owner settlement or queue dispatch can replace this lane.
+      const endingReply = replyNotifications.take(event.threadId, event.turnId);
+      const endingCheckIn = checkInTurns.has(event.threadId);
+      const command = commandTurns.has(event.threadId);
+      // a turn that failed on its length is asked again once it is folded
+      // (runtime.error above), so it is not over yet as far as a goal goes
+      const refolding = retriedForContext.has(event.threadId);
+      usage.recordTurn(bot.id, event.providerInstanceId ?? event.provider, event.cost ?? null, undefined, event.ok !== false);
       const spent = turnTokens.get(event.threadId);
       turnTokens.delete(event.threadId);
       // only solo lanes tally; a room's spend belongs to no one lane.
@@ -1560,13 +2823,27 @@ bus.subscribe((event: RuntimeEvent) => {
       if (spoke && spoke !== event.threadId && bloks.get(spoke)?.sharing) {
         chargeRoom(spoke, laneRequester.get(event.threadId) ?? "owner", turnCost(event.cost, spent));
       }
+      // A turn an engine rebuild cut off is picked up on the new engine.
+      const rebuilt = event.stopReason === ENGINE_RELOADED && settleRebuiltLane(event.threadId);
+      let pickingUp = Boolean(rebuilt);
       // A turn the Mac slept through, which failed because of it, is
       // picked up once when it wakes rather than left dead.
       const slept = sleptLanes.get(event.threadId);
       if (slept) {
         sleptLanes.delete(event.threadId);
         if (event.ok === false && slept.woke && Date.now() - slept.woke < 30 * 60_000) {
-          carryOnAfterSleep(bot.id, event.threadId, slept);
+          pickingUp = true;
+          carryOn(
+            {
+              ...slept,
+              laneId: event.threadId,
+              byYou: turnsForYou.has(event.threadId),
+              tool: cutOff.get(event.threadId)?.tool,
+            },
+            "sleep",
+            // after the failed turn has settled, so the lane is free again
+            1_500,
+          );
         }
       }
       // the final frame stops being a live preview and becomes part of
@@ -1575,8 +2852,14 @@ bus.subscribe((event: RuntimeEvent) => {
       if (frame) pushMessage({ role: "bot", kind: "screen", png: frame.png, mime: frame.mime });
       sweepArtifacts(bot.id, event.threadId, pushMessage);
       // what the turn changed in the agent's memory, into its journal
-      const remembered = memoryJournal.finish(event.threadId);
-      if (remembered.length) broadcast({ kind: "memory.changed", botId: bot.id, changes: remembered.length });
+      try {
+        const remembered = memoryJournal.finish(event.threadId);
+        if (remembered.length) broadcast({ kind: "memory.changed", botId: bot.id, changes: remembered.length });
+      } catch (error) {
+        // The engine already finished. Leave the unreadable journal
+        // untouched and still settle the lane and its changes card.
+        console.error(error instanceof Error ? error.message : "[bloks] Memory history could not be saved.");
+      }
       // the turn, for the engine report: which engine, what it cost, and
       // (once the card exists) the checkpoint its outcome is read from
       const ranOn = laneEngine.get(event.threadId) ?? bot.modelSelection;
@@ -1599,7 +2882,7 @@ bus.subscribe((event: RuntimeEvent) => {
       turnLog.add(loggedTurn);
       // what the turn did to its folder, as a card with the way back
       const rehearsing = rehearsals.byTask(event.threadId);
-      void checkpoints
+      const carded = checkpoints
         .finish(event.threadId)
         .then(async (record) => {
           if (record) turnLog.attachCheckpoint(loggedTurn.id, record.id);
@@ -1608,74 +2891,102 @@ bus.subscribe((event: RuntimeEvent) => {
             return;
           }
           if (!record) return;
-          const card = pushMessage({ role: "bot", kind: "changes", changes: checkpoints.summary(record) });
+          if (cfg.changes?.showShared === false && record.files.every((file) => file.shared)) return;
+          const changes = checkpoints.summary(record);
+          if (!changes.total) return;
+          const card = pushMessage({ role: "bot", kind: "changes", changes });
           checkpoints.attachCard(record.id, roomId, card.id);
         })
         .catch(() => {});
+      // the card belongs right under this turn, so whatever waited for
+      // the lane is delivered after it (see drainSteer)
+      cardsPending.set(event.threadId, carded);
+      void carded.then(() => {
+        if (cardsPending.get(event.threadId) !== carded) return;
+        cardsPending.delete(event.threadId);
+        // anything said while the card was being made goes now
+        drainSteer(event.threadId);
+      });
       store.setTaskBusy(event.threadId, false);
       turnStarted.delete(event.threadId);
+      repeats.end(event.threadId);
+      cutOff.end(event.threadId);
       // a call the turn never heard back from will not report now
       for (const settled of store.settleOpenTools(roomId, inRoom ? bot.id : undefined)) {
         broadcast({ kind: "message.patch", threadId: roomId, message: settled });
         for (const [item, id] of toolMessageByItem) if (id === settled.id) toolMessageByItem.delete(item);
       }
-      fallBackIfOut(bot, event.threadId, roomId, event.ok !== false, event.stopReason ?? null);
-      replyByMail(event.threadId, event.ok !== false);
-      collectMeetingItems(event.threadId, event.ok !== false);
+      // An engine that fails a turn normally says why with a runtime.error.
+      // Some only put the reason on the turn's end (a Codex turn the
+      // provider refused, Antigravity's status), and a turn that ends in
+      // silence reads as the agent not answering, so recoverTurn says it.
+      if (event.stopReason === "tool_stalled") {
+        const said = turnErrors.get(event.threadId)?.at(-1);
+        if (said) stalledSince.set(event.threadId, said);
+      }
+      const handedOver = recoverTurn(
+        bot,
+        event.threadId,
+        roomId,
+        { ok: event.ok !== false, stopReason: event.stopReason ?? null, pickingUp, rebuilt: Boolean(rebuilt) },
+        (text, phoneText) => pushMessage({ role: "bot", kind: "notice", text, ...(phoneText ? { phoneText } : {}) }),
+      );
+      if (!pickingUp && !handedOver) telegramReturns.finish(event.threadId);
+      if (!pickingUp && !handedOver && !refolding) telegramWorking.get(event.threadId)?.ended();
+      // A check-in that answered QUIET, with nobody else's words in it, is
+      // folded away and announces nothing. One the person spoke into is
+      // theirs now, and one that failed is something they should see.
+      const quietRun =
+        endingCheckIn && !inRoom && event.ok !== false && !handedOver &&
+        !turnsForYou.has(event.threadId) && foldQuietRun(event.threadId);
+      checkInTurns.delete(event.threadId);
+      const replyNotice = settledReply(endingReply, {
+        ok: event.ok !== false, stopReason: event.stopReason,
+        continues: pickingUp || handedOver || refolding, quiet: quietRun, maintenance: command,
+      });
+      if (replyNotice) {
+        // Deletion may have withdrawn these words while the attempt ran.
+        // Revalidate this chosen record only, never fall back to older text.
+        const current = store.messagesFor(replyNotice.threadId).find((m) => m.id === replyNotice.message.id);
+        if (current?.role === "bot" && current.kind === "text" && !current.deleted && !current.quiet && current.text?.trim()) {
+          broadcast({ ...replyNotice, message: { ...replyNotice.message, text: current.text } });
+        }
+      }
+      // a turn asked again or handed to the backup is not over yet, so what
+      // waits on how it ends (a routine's run, a workflow step, a meeting's
+      // write-up, a mail's reply) waits for the attempt that ends it
+      if (!handedOver) settleOwners(bot, event.threadId, { ok: event.ok !== false, why: event.stopReason ?? null, quiet: quietRun });
       if (mailQueue.length) setTimeout(() => void drainMail(), 0);
       // whatever the agent was given to act with is spent
       agentTokens.revokeTask(event.threadId);
-      store.patchBot(bot.id, { unread: true });
+      // A turn another agent started that ended well without a word to
+      // the person leaves nothing to read; anything else marks the chat.
+      const quietAgentTurn =
+        replyingTo.has(event.threadId) && event.ok !== false && !spokeInTurn.has(event.threadId);
+      spokeInTurn.delete(event.threadId);
+      if (quietAgentTurn || quietRun) {
+        // nothing new here
+      } else if (bot.tasks.some((t) => t.id === event.threadId)) store.markLane(bot.id, event.threadId, true);
+      else store.patchBot(bot.id, { unread: true });
       broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
-      // A routine's run ends where its turn does, and its summary is
-      // what the agent actually said: a row that only says "ok" answers
-      // half the question people are asking.
-      if (openRuns.has(event.threadId)) {
-        const said = store.messagesFor(event.threadId);
-        const reply = [...said]
-          .reverse()
-          .find((msg) => msg.role === "bot" && msg.kind === "text" && msg.text && !msg.deleted);
-        closeRun(event.threadId, {
-          ok: event.ok !== false,
-          summary: reply?.text,
-          error: event.ok === false ? (event.stopReason ?? "The turn did not finish.") : undefined,
-        });
-      }
-      // A workflow's ask step ends where its turn does, and what the
-      // agent actually said is the value the next step reads.
-      const onBehalfOf = workflowTurns.get(event.threadId);
-      if (onBehalfOf && workflows.run(onBehalfOf.runId)?.run.state === "running") {
-        workflowTurns.delete(event.threadId);
-        const said = lastSaid(event.threadId);
-        if (event.ok === false) {
-          // A turn stopped because somebody took the computer is not the
-          // agent failing at the step. The run still fails, because the
-          // alternative is resuming a plan made before the person
-          // changed things, but it has to say who stopped it or it reads
-          // as a crash.
-          const why = wheel.heldBy(bot.id)
-            ? `stopped: you took ${bot.name}'s computer`
-            : (event.stopReason ?? "the turn did not finish");
-          endStep(onBehalfOf.runId, onBehalfOf.stepId, "failed", { error: why });
-          finishRun(onBehalfOf.runId, "failed", why);
-        } else {
-          endStep(onBehalfOf.runId, onBehalfOf.stepId, "ok", { summary: said });
-          workflows.update(onBehalfOf.runId, (run) => {
-            run.values[onBehalfOf.stepId] = { text: said };
-            run.cursor++;
-          });
-          void advanceRun(onBehalfOf.runId).catch(() => {});
-        }
-      } else if (onBehalfOf) {
-        // the run stopped while its turn was still going
-        workflowTurns.delete(event.threadId);
-      }
       retriedForContext.delete(event.threadId);
       // If this lane is filling up, fold its older half now rather than
       // on the way into the next turn, so nobody waits on a summary.
-      if (shouldCompact(store.taskByThread(event.threadId)?.task.lastInput ?? 0, contextLimitFor(bot.modelSelection.model))) {
-        void foldContext(bot.id, event.threadId).catch(() => {});
-      } else {
+      const settledLane = store.taskByThread(event.threadId)?.task;
+      // Only a request from this engine/model can drive the fold. The
+      // default window stays a safety margin here, even when it is not
+      // a known window that the ring can display.
+      const own = readingFor(settledLane?.reading, bot.modelSelection);
+      // A stranger's mail is folded into nothing, read for no skill, and
+      // leaves no session behind: the lane's next turn may be the owner's,
+      // and none of what the mail said may reach it as context.
+      const guestEnded = laneRequester.get(event.threadId) === MAIL_FROM_ANYONE;
+      if (guestEnded) store.startFreshSession(event.threadId);
+      if (guestEnded) {
+        // nothing of the owner's to keep from this turn
+      } else if (!command && shouldCompact(own?.used ?? 0, own?.window ?? contextLimitFor(bot.modelSelection.model))) {
+        void foldAfterTurn(bot.id, event.threadId);
+      } else if (!command) {
         // Otherwise absorb one message into the running summary, if this
         // workspace asked for that. Deliberately in the else: a lane that
         // is already over the threshold wants the whole fold, not one
@@ -1687,20 +2998,24 @@ bus.subscribe((event: RuntimeEvent) => {
       // and a summarised lane is a smaller thing to read.
       // Never a shared room's lane: what other people said there is not
       // the owner's to turn into the agent's standing skills.
-      if (!isSharedLane(event.threadId)) void reviewForSkill(bot.id, event.threadId).catch(() => {});
-      // A job ends where its turn does too, and whether the agent took it
-      // or handed it back is in the same last thing they said.
-      if (openJobs.has(event.threadId)) {
-        const reply = [...store.messagesFor(event.threadId)]
-          .reverse()
-          .find((msg) => msg.role === "bot" && msg.kind === "text" && msg.text && !msg.deleted);
-        settleJob(
-          event.threadId,
-          event.ok !== false,
-          reply?.text ?? (event.stopReason ?? ""),
-        );
-      }
+      // Nor the lane strangers' mail is answered in, whoever's turn this was.
+      const guestLane = guestEnded || Boolean(settledLane?.guestMail);
+      if (!command && !guestLane && !isSharedLane(event.threadId)) void reviewForSkill(bot.id, event.threadId).catch(() => {});
+      drainRoomTags(bot.id);
+      // before anything queued starts the next turn on the old session
+      freshIfAsked(event.threadId);
       drainSteer(event.threadId);
+      closeIfAsked(event.threadId);
+      // after what waited has had its chance to go, since it goes first
+      goalTurnEnded(bot, event.threadId, {
+        ok: event.ok !== false,
+        stopReason: event.stopReason ?? null,
+        goesOn: pickingUp || handedOver || refolding,
+        inRoom,
+        command,
+        out: Boolean(loggedTurn.out),
+      });
+      replyingTo.delete(event.threadId);
       // an agent that named someone else hands the room over to them, and
       // the person who started the chain is still the one who asked
       const requester = laneRequester.get(event.threadId);
@@ -1708,7 +3023,7 @@ bus.subscribe((event: RuntimeEvent) => {
       if (inRoom) {
         const said = store.messagesFor(roomId);
         const last = [...said].reverse().find((m) => m.from === bot.id && m.kind === "text");
-        if (last?.text) void relayMentions(roomId, bot.id, last.text, requester);
+        if (last?.text) void relayMentions(roomId, bot.id, last.text, requester, nextAgentChain(event.threadId), (turnHops.get(event.threadId) ?? 0) + 1);
         if (bloks.get(roomId)?.sharing) broadcast({ kind: "room.activity", roomId, botId: bot.id, busy: false });
       }
       activeRoom.delete(event.threadId);
@@ -1799,6 +3114,78 @@ function readCuaConnection(): { command: string; args: string[]; env: Record<str
  * the room; this is how a reply finds its way back to the right room. */
 const activeRoom = new Map<string, string>(); // taskId -> blokId
 
+// ── who the person has been with ──────────────────────────────────────
+// Whatever is not pinned in the sidebar sorts by the last time it had
+// something to do with the person (GitHub 156). What counts is decided in
+// server/activity.ts (towardYou); what it needs from here is who started
+// each turn, which only the places that start turns know, and a word from
+// every route the person speaks through.
+
+/** Lanes whose latest turn the person started, so what it says back is a
+ * reply to them. Left in place when the turn ends: a turn that picks the
+ * same work up again (a backup engine, a retry once the conversation was
+ * folded, waking after the Mac slept) is still answering them, and the
+ * next turn that starts afresh says whose it is. */
+const turnsForYou = new Set<string>();
+
+/** Lanes running a quiet routine's turn (server/routines.ts, isQuiet),
+ * from its start to its end. What such a turn says is held back from the
+ * person's attention until it ends: its banner waits (the frame carries
+ * `checkIn`), and an answer of QUIET is marked quiet the moment it is
+ * said, so nothing ever announces it. */
+const checkInTurns = new Set<string>();
+
+/** An agent or a room just had something to do with the person, which
+ * moves it up the sidebar. Never backwards, so an older moment arriving
+ * late cannot sink a row. */
+function withYou(target: { bot: BotRecord } | { room: BlokRecord }, at = Date.now()) {
+  if ("bot" in target) {
+    if ((target.bot.activeWithYouAt ?? 0) >= at) return;
+    const bot = store.patchBot(target.bot.id, { activeWithYouAt: at });
+    if (bot) broadcast({ kind: "bot", bot: clientBot(bot) });
+    return;
+  }
+  if ((target.room.activeWithYouAt ?? 0) >= at) return;
+  const [room] = bloks.arrange([{ id: target.room.id, patch: { activeWithYouAt: at } }]);
+  if (room) broadcast({ kind: "blok", blok: room });
+}
+
+/** Every conversation's recall index (server/recall-index.ts), and each
+ * agent's memory files', built when first searched and kept in step by
+ * store.onAppend and store.onRewrite, within the cache's budget. */
+const recallIndexes = new IndexCache();
+
+// Every message, whichever route wrote it: a reply in a turn the person
+// started, or anything asking something of them, moves the conversation
+// it lands in.
+store.onAppend = (threadId, message) => {
+  // an index already built grows with its conversation; one nobody has
+  // searched yet is built whole when somebody does
+  const index = recallIndexes.peek(threadId);
+  const words = index ? searchableText(message) : null;
+  if (index && words) index.add(message.id, message.at, words);
+  const room = bloks.get(threadId);
+  if (room) {
+    // in a room the speaker's turn runs in one of its own lanes, the one
+    // speaking in this room now
+    const speaker = message.from ? store.bot(message.from) : null;
+    const lane = speaker?.tasks.find((task) => activeRoom.get(task.id) === threadId)?.id;
+    if (towardYou(message, Boolean(lane && turnsForYou.has(lane)))) withYou({ room }, message.at);
+    return;
+  }
+  const bot = store.botByThread(threadId);
+  if (bot && towardYou(message, turnsForYou.has(threadId))) withYou({ bot }, message.at);
+};
+
+// A message changed after it was written: the same words (a reaction, a
+// tool's result, a queued message going) keep the index, new words join
+// it, and an edit or a deletion drops it to be built again next search.
+store.onRewrite = (threadId, changed) => {
+  const index = recallIndexes.peek(threadId);
+  if (!index) return;
+  if (!changed || changed.some((m) => !index.update(m.id, m.at, searchableText(m)))) recallIndexes.drop(threadId);
+};
+
 // ── the Mac going to sleep ─────────────────────────────────────────────
 // The desktop shell says when the machine is about to sleep and when it
 // wakes (electron/main.mjs). A turn in flight across a sleep usually
@@ -1831,28 +3218,216 @@ function noteWake() {
   for (const [lane, slept] of sleptLanes) if (now - slept.at > 24 * 60 * 60_000) sleptLanes.delete(lane);
 }
 
-const SLEPT_TEXT =
-  "This computer went to sleep in the middle of your last step, which cut it off. Carry on from where you were; check what already happened before repeating anything.";
-
-function carryOnAfterSleep(botId: string, laneId: string, slept: { roomId?: string; requester?: string }) {
-  // after the failed turn has settled, so the lane is free again
-  setTimeout(() => {
-    const threadId = slept.roomId ?? laneId;
+/**
+ * Picks up a turn that was cut off: by the Mac sleeping, or by Bloks
+ * stopping (server/cut-off.ts). The person reads a notice; the agent is
+ * told, separately, to carry on, in the same lane, room and session, for
+ * whoever asked for the turn it continues. Anything said to the lane
+ * since goes in the same turn rather than one of its own, because the
+ * agent has to read it before acting on a plan made without it.
+ */
+function carryOn(
+  turn: Pick<TurnInFlight, "botId" | "laneId" | "roomId" | "requester" | "byYou" | "tool">,
+  by: CutOffBy,
+  delay = 0,
+) {
+  const threadId = turn.roomId ?? turn.laneId;
+  // A stranger's mail picks up alone: what waits in its lane is somebody
+  // else's, and goes in a turn of its own after this one.
+  const guest = turn.requester === MAIL_FROM_ANYONE;
+  // claimed now, before a settle can drain it into a turn of its own
+  const queued = guest ? undefined : steerQueues.get(turn.laneId);
+  const segment = queuedSegment(turn.laneId, queued?.items ?? [], true);
+  const waiting = segment.items.length ? { botId: turn.botId, items: segment.items } : undefined;
+  if (!guest) {
+    if (segment.rest.length) steerQueues.set(turn.laneId, { botId: turn.botId, items: segment.rest });
+    else steerQueues.delete(turn.laneId);
+  }
+  const start = () => {
+    // A waiting word may have been edited into a command during the
+    // sleep delay. Re-read before pickup; it still needs its own turn.
+    if (waiting) {
+      const current = queuedSegment(turn.laneId, waiting.items, true);
+      waiting.items = current.items;
+      if (current.rest.length) {
+        const since = steerQueues.get(turn.laneId)?.items ?? [];
+        steerQueues.set(turn.laneId, { botId: turn.botId, items: [...current.rest, ...since] });
+      }
+    }
     const notice = store.appendMessage(threadId, {
       role: "bot",
       kind: "notice",
-      ...(slept.roomId ? { from: botId } : {}),
-      text: `${store.bot(botId)?.name ?? "The agent"} was cut off when this computer slept, and is picking up where it left off.`,
+      ...(turn.roomId ? { from: turn.botId } : {}),
+      text: cutOffNotice(store.bot(turn.botId)?.name ?? "The agent", by),
     });
     broadcast({ kind: "message", threadId, message: notice });
+    const alive = (waiting?.items ?? []).flatMap((item) => {
+      const words = steerWords(turn.laneId, item);
+      return words === null ? [] : [{ item, words }];
+    });
+    const yours = alive.some(({ item }) => {
+      const m = item.messageId ? store.messagesFor(turn.laneId).find((msg) => msg.id === item.messageId) : undefined;
+      return Boolean(m && !m.agent && !m.via);
+    });
     // told to the agent, not written into the chat as if the person had
     // typed it: the notice above is what the person reads
-    void startTurn(botId, SLEPT_TEXT, {
+    const text = carryOnText(by, { tool: turn.tool, said: alive.map((said) => said.words).join("\n") });
+    void startTurn(turn.botId, text, {
       presetMessage: true,
-      ...(slept.roomId ? { roomId: slept.roomId } : { taskId: laneId }),
-      ...(slept.requester ? { requester: slept.requester } : {}),
-    }).catch((e) => sayTurnedAway(threadId, e));
-  }, 1_500);
+      carriedOn: true,
+      telegramMessages: alive.flatMap(({ item }) => item.messageId ? [item.messageId] : []),
+      personalMessages: alive.flatMap(({ item }) => item.messageId ? [item.messageId] : []),
+      ...carryOnTarget(turn),
+      byYou: Boolean(turn.byYou) || yours,
+      // the turn's own place, or further along if an agent's message is
+      // in it; the person's words in it start the chain over
+      chain: burstChain(turn.laneId, alive.map(({ item }) => item), agentChain.get(turn.laneId)),
+    })
+      // under the notice, where the pickup took them
+      .then(() => deliverQueued(turn.laneId, alive.flatMap(({ item }) => (item.messageId ? [item.messageId] : []))))
+      .catch((e) => {
+        telegramReturns.finish(turn.laneId, `Could not answer: ${redactSecrets(e instanceof Error ? e.message : String(e))}`,
+          alive.flatMap(({ item }) => item.messageId ? [item.messageId] : []));
+        // what waited is still waiting, ahead of anything said since
+        if (waiting) {
+          const since = steerQueues.get(turn.laneId)?.items ?? [];
+          steerQueues.set(turn.laneId, { botId: turn.botId, items: [...waiting.items, ...since] });
+          drainSteer(turn.laneId);
+        }
+        sayTurnedAway(threadId, e);
+      })
+      .finally(() => { queueStarts.delete(turn.laneId); drainSteer(turn.laneId); });
+  };
+  queueStarts.add(turn.laneId);
+  if (delay) setTimeout(start, delay);
+  else start();
+}
+
+/** A Continue offered for a turn that will not be picked up after all:
+ * pressed, or the conversation went on without it. */
+function retireCarryOn(turn: TurnInFlight) {
+  if (!turn.waiting) return;
+  const { threadId, noticeId } = turn.waiting;
+  const patched = store.patchMessage(threadId, noticeId, { carryOn: { laneId: turn.laneId, done: true } });
+  if (patched) broadcast({ kind: "message.patch", threadId, message: patched });
+}
+
+/**
+ * At startup, every turn still on the list was cut off by the last run
+ * ending. Each is picked up once, in the same conversation and session,
+ * for the same person; or, cut off too long ago, offered to the person
+ * with a Continue. Never one somebody stopped, or one whose agent was
+ * put away. Runs before queued messages are recovered, so what waited
+ * behind a cut-off turn joins its pickup instead of racing it.
+ */
+function recoverCutOff(now = Date.now()) {
+  const picked: TurnInFlight[] = [];
+  for (const turn of cutOff.all()) {
+    if (turn.waiting) continue;
+    const agent = store.bot(turn.botId);
+    // a rehearsal's copy is the run's to settle, not a turn to resume
+    const lane =
+      Boolean(agent?.tasks.some((t) => t.id === turn.laneId)) &&
+      !rehearsals.forTask(turn.laneId) &&
+      (!turn.roomId || Boolean(bloks.get(turn.roomId)));
+    const next = recoveryFor(turn, now, { agent, lane });
+    if (next === "drop") {
+      cutOff.take(turn.laneId);
+    } else if (next === "ask") {
+      const threadId = turn.roomId ?? turn.laneId;
+      const name = agent?.name ?? "The agent";
+      const notice = store.appendMessage(threadId, {
+        role: "bot",
+        kind: "notice",
+        ...(turn.roomId ? { from: turn.botId } : {}),
+        text: turn.carriedOn && now - turn.seenAt <= MAX_QUEUED_RECOVERY_MS
+          ? `${name} was cut off again when Bloks stopped, while picking up from the last time, so it has not picked up on its own.`
+          : cutOffWaitingNotice(name),
+        carryOn: { laneId: turn.laneId },
+      });
+      cutOff.wait(turn.laneId, { noticeId: notice.id, threadId }, now);
+    } else {
+      // off the list before anything starts: whatever becomes of this
+      // pickup, no later start makes it again
+      cutOff.take(turn.laneId);
+      picked.push(turn);
+    }
+  }
+  const pickingUp = new Set(picked.map((turn) => turn.laneId));
+  // Only these turns actually continue. A cut-off record left waiting
+  // for Continue must not lend its Telegram return to a later app turn.
+  telegramReturns.recover((laneId) => pickingUp.has(laneId));
+  recoverQueued(now, pickingUp);
+  for (const turn of picked) carryOn(turn, "restart");
+  // after both, so a goal whose turn or next note is going on is left be
+  pauseStrandedGoals();
+  // room lines that were waiting, for an agent mid-turn or for a drain,
+  // go once the agent is free (after its pickup, when it has one)
+  for (const botId of roomTags.agents()) drainRoomTags(botId);
+}
+
+/** Where a drain stands (server/drain.ts): the turns still running, as
+ * the list of turns in flight has them, and whether any lane is busy
+ * with something that is not on it, like an idle compaction. */
+function drainStatus() {
+  const running = cutOff.running().map(({ laneId, botId, roomId, startedAt, tool }) => ({
+    laneId,
+    botId,
+    ...(roomId ? { roomId } : {}),
+    startedAt,
+    ...(tool ? { tool } : {}),
+  }));
+  // a lane still getting a turn ready (claimedLanes) is as busy as one
+  // running: its message is in the transcript, and a restart now would
+  // lose the turn before the cut-off record that would pick it up exists
+  const busy =
+    telegramReturns.busy ||
+    idleCompacting.size > 0 ||
+    claimedLanes.size > 0 ||
+    store.bots.some((b) => b.tasks.some((t) => t.busy));
+  return drain.status(running, busy);
+}
+
+/** A drain called off: what it held goes now, as it would have when
+ * its lane came free. A drain that ends in a restart needs none of
+ * this; Bloks starting does the same from what is on disk. */
+function endDrain() {
+  if (!drain.stop()) return;
+  for (const laneId of [...steerQueues.keys()]) {
+    // The restart no longer holds these words, even if their turn is
+    // still running. Save and tell the screen before trying delivery.
+    for (const m of store.messagesFor(laneId)) {
+      if (!m.queued || m.waitsFor !== "restart") continue;
+      const message = store.patchMessage(laneId, m.id, { waitsFor: undefined });
+      if (message) broadcast({ kind: "message.patch", threadId: laneId, message });
+    }
+    drainSteer(laneId);
+  }
+  for (const botId of roomTags.agents()) drainRoomTags(botId);
+  for (const jobId of [...jobsHeld]) {
+    jobsHeld.delete(jobId);
+    void offerJob(jobId);
+  }
+  void drainMail();
+  void runDueRoutines().catch(() => {});
+}
+
+/** Ends a drain whose restart never came, its grace after its deadline.
+ * Armed at every start, since a later one moves the deadline, and it
+ * reads the deadline again when it fires for the same reason. */
+let drainLapse: ReturnType<typeof setTimeout> | null = null;
+function armDrainLapse() {
+  if (drainLapse) clearTimeout(drainLapse);
+  drainLapse = null;
+  const at = drain.lapsesAt();
+  if (at === null) return;
+  drainLapse = setTimeout(() => {
+    drainLapse = null;
+    if ((drain.lapsesAt() ?? 0) > Date.now()) return armDrainLapse();
+    if (drain.on) console.log("[bloks] a drain outlived its deadline with no restart, so it ended and what it held goes now");
+    endDrain();
+  }, Math.max(0, at - Date.now()));
+  drainLapse.unref?.();
 }
 /** Tokens of the turn in flight, per lane. Providers report a running
  * total for the turn, so this holds a high-water mark, popped when the
@@ -1961,8 +3536,9 @@ function roomBriefing(blok: BlokRecord, speaker: BotRecord, members: BotRecord[]
     .join("\n\n");
 }
 
-/** The room's recent history, labelled so an agent can tell who said what. */
-function roomTranscript(blokId: string, speakerId: string): string {
+/** The room's recent history, labelled so an agent can tell who said what.
+ * With `after`, only what came after that message; the cap is the same. */
+function roomTranscript(blokId: string, speakerId: string, after?: string): { text: string; lastId?: string } {
   const shared = Boolean(bloks.get(blokId)?.sharing);
   const named = (m: Message) => {
     if (m.role === "user") {
@@ -1977,16 +3553,22 @@ function roomTranscript(blokId: string, speakerId: string): string {
     const from = m.from ? store.bot(m.from) : null;
     return from ? (from.id === speakerId ? `${from.name} (you)` : from.name) : "Agent";
   };
-  return store
+  const said = store
     .messagesFor(blokId)
-    .filter((m) => m.kind === "text" && m.text && !m.deleted && !m.queued)
-    .slice(-30)
-    .map((m) =>
-      m.replyTo
-        ? `${named(m)} (replying to ${m.replyTo.author}: "${m.replyTo.excerpt}"): ${m.text}`
-        : `${named(m)}: ${m.text}`,
-    )
-    .join("\n");
+    .filter((m) => m.kind === "text" && m.text && !m.deleted && !m.queued && !m.unsent);
+  // a message no longer on the record (deleted, rewound) shows the lot
+  const seen = after ? said.findIndex((m) => m.id === after) : -1;
+  return {
+    text: (seen >= 0 ? said.slice(seen + 1) : said)
+      .slice(-30)
+      .map((m) =>
+        m.replyTo
+          ? `${named(m)} (replying to ${m.replyTo.author}: "${m.replyTo.excerpt}"): ${m.text}`
+          : `${named(m)}: ${m.text}`,
+      )
+      .join("\n"),
+    lastId: said.at(-1)?.id,
+  };
 }
 
 // ── turn dispatch ──────────────────────────────────────────────────────
@@ -2015,14 +3597,40 @@ function replyRef(raw: any): ReplyRef | undefined {
   return { ...(typeof raw.id === "string" ? { id: raw.id.slice(0, 40) } : {}), author, excerpt };
 }
 
-/** The lane background work (routines, webhooks) runs in. Reuses an
- * idle lane with this title, creates one when there is room, and only
- * falls back to the active lane at the lane cap. */
+/** An agent's main conversation, General when it is still there. Not by
+ * title (an agent renames its own lane with `bloks rename`) and not by
+ * threadId (it follows whatever lane the person opened): the oldest lane
+ * that is not a watcher's, a rehearsal's or a shared room's. */
+function mainLaneOf(bot: BotRecord) {
+  const side = new Set<string>([
+    ...watchers.filter((w) => w.botId === bot.id && w.laneId).map((w) => w.laneId!),
+    ...bloks.roomsFor(bot.id).map((r) => r.lanes?.[bot.id]).filter((id): id is string => Boolean(id)),
+  ]);
+  const byAge = [...bot.tasks].sort((a, b) => a.createdAt - b.createdAt);
+  return byAge.find((t) => !side.has(t.id) && !rehearsals.forTask(t.id) && !t.guestMail) ?? byAge[0];
+}
+
+/** The lane the person has open, as somewhere for work that names no
+ * lane: a phone message, a room's turn, a message with no lane. Not the
+ * lane strangers' mail is answered in, even when that is what is open,
+ * since the owner's work there would run beside what those mails said. */
+function activeLaneOf(bot: BotRecord): string {
+  const active = bot.tasks.find((t) => t.id === (bot.activeTaskId ?? bot.threadId));
+  return active && !active.guestMail ? active.id : mainLaneOf(bot).id;
+}
+
+/** The lane background work with a title of its own runs in (jobs,
+ * workflows, mail, meetings, and a routine or webhook that names one).
+ * Reuses an idle lane with this title, creates one when there is room,
+ * and only falls back to the active lane at the lane cap. */
 function backgroundTaskId(botId: string, title: string): string | undefined {
   const bot = store.bot(botId);
   if (!bot) return undefined;
-  const named = bot.tasks.find((t) => t.title === title);
-  if (named) return named.busy ? undefined : named.id;
+  // never a shared room's lane, a rehearsal's, or the one strangers' mail
+  // is answered in, whatever its title
+  const usable = (t: TaskRecord) => !isSharedLane(t.id) && !rehearsals.forTask(t.id) && !t.guestMail;
+  const named = bot.tasks.find((t) => t.title === title && usable(t));
+  if (named) return named.busy || claimedLanes.has(named.id) ? undefined : named.id;
   const active = bot.activeTaskId;
   const made = store.createTask(botId, title);
   if (made) {
@@ -2032,15 +3640,216 @@ function backgroundTaskId(botId: string, title: string): string | undefined {
     broadcast({ kind: "bot", bot: clientBot(store.bot(botId)) });
     return made.id;
   }
-  const fallback = bot.tasks.find((t) => !t.busy);
+  // nor, at the cap, any of those, which the owner's work must not run in
+  const fallback = bot.tasks.find((t) => !t.busy && !claimedLanes.has(t.id) && usable(t));
   return fallback?.id;
 }
 
-async function startTurn(
+/** A conversation's id, as `--thread` and the routine and webhook fields
+ * may name one instead of its title. Never made into a title: a lane
+ * called by an id is one nobody meant to open (GitHub 237). */
+const LANE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The conversation a routine, a watcher or a webhook speaks in, without
+ * making one (GitHub 237). Naming none is the agent's first conversation:
+ * one agent, one conversation, unless somebody asks for another. Named,
+ * it is the lane with that id, or else that title; undefined for a title
+ * nobody has yet, which the caller makes. An id that is none of this
+ * agent's lanes (one since closed) is never a title, so that work goes to
+ * the first conversation as well.
+ */
+function namedLane(bot: BotRecord, named: string | undefined): TaskRecord | undefined {
+  if (!named) return mainLaneOf(bot);
+  // a shared room's lane is the room's, a rehearsal's is its copy's, and
+  // the one strangers' mail is answered in is theirs
+  const lanes = bot.tasks.filter((t) => !isSharedLane(t.id) && !rehearsals.forTask(t.id) && !t.guestMail);
+  return (
+    lanes.find((t) => t.id === named) ??
+    lanes.find((t) => t.title === named) ??
+    (LANE_ID.test(named) ? mainLaneOf(bot) : undefined)
+  );
+}
+
+/** Why background work cannot be filed with this conversation named, or
+ * null. An id has to be one of the agent's own lanes, since it is never
+ * made into a title; a title is made when it is first needed. */
+function threadRefusal(botId: string, named: string | undefined): string | null {
+  if (!named || !LANE_ID.test(named)) return null;
+  const bot = store.bot(botId);
+  if (bot?.tasks.some((t) => t.id === named && !isSharedLane(t.id) && !rehearsals.forTask(t.id) && !t.guestMail)) return null;
+  return `${named} is not the id of any of ${bot?.name ?? "that agent"}'s conversations. Name one by its title or its id, or name none to use its first.`;
+}
+
+/** The lane a routine or a webhook event can start its turn in now: the
+ * one it names, made when a title is not there yet (backgroundTaskId), or
+ * the agent's first. Undefined while that lane is busy. */
+function workLaneId(botId: string, named: string | undefined): string | undefined {
+  const bot = store.bot(botId);
+  if (!bot) return undefined;
+  const lane = namedLane(bot, named);
+  if (!lane) return backgroundTaskId(botId, named!);
+  // Taken while it runs, and while words said to it wait their turn: now
+  // that routines and webhooks share the agent's first conversation, they
+  // must not go ahead of what the person said there. Not the drain, which
+  // holds a webhook's event in the lane's queue instead, nor a change card
+  // still being made, which is nobody's words and done in seconds
+  // (laneWaits has both).
+  const waiting =
+    lane.busy || claimedLanes.has(lane.id) || beingEdited.has(lane.id) ||
+    steerQueues.has(lane.id) || queueStarts.has(lane.id) || steerAttempts.has(lane.id);
+  return waiting ? undefined : lane.id;
+}
+
+/** Lanes a webhook has been handed a turn for, from acceptance until
+ * startTurn returns. startTurn marks its lane busy only after a few awaits,
+ * so two events arriving together would both see the lane idle. */
+const webhookLanes = new Set<string>();
+
+/** Why this agent cannot take a webhook turn right now, decided by the same
+ * checks startTurn makes first (hold, then engine). A hold is temporary, so
+ * it is a retryable 503; a missing engine needs a settings change, so it is
+ * a 409, a configuration refusal. Whether a sender retries a 409 is the
+ * sender's policy, not this receiver's. startTurn keeps its own checks, so a
+ * hold placed after this runs still stops the turn there. The body is generic:
+ * the caller holds only the webhook token, so the bot's name, the hold's
+ * reason and the engine's ID stay with the owner (chat and logs). */
+function webhookRefusal(botId: string): { status: number; retryAfter?: string; error: string } | undefined {
+  const bot = store.bot(botId);
+  if (!bot) return { status: 409, error: "no such agent" };
+  const hold = wheel.heldBy(bot.id);
+  if (hold) return { status: 503, retryAfter: "60", error: "agent temporarily unavailable" };
+  const selection = selectEngine(bot);
+  if (!registry.get(selection.instanceId)) return { status: 409, error: "agent cannot take events right now" };
+  return undefined;
+}
+
+/** The lane a webhook event can start its turn in now, or undefined when the
+ * lane is busy or another webhook event has already claimed it. */
+function claimWebhookLane(botId: string, thread: string | undefined): string | undefined {
+  const laneId = workLaneId(botId, thread);
+  if (!laneId || webhookLanes.has(laneId)) return undefined;
+  webhookLanes.add(laneId);
+  return laneId;
+}
+
+/** What each lane's Claude Code session was given of the parts of a
+ * persona that move (server/standing-prompt.ts). In memory only: after a
+ * restart the next turn starts the record again, and pays the one cache
+ * write any restart would. */
+const standing = new Map<string, StandingRecord>();
+/** Only the latest classified report for this lane, instance and folder. */
+const claudeCatalogs = new Map<string, { instanceId: string; cwd: string | null; catalog: ClaudeCatalog }>();
+/** A native command is never steered or handed to a backup as words. */
+const commandTurns = new Set<string>();
+/** Protect a queue segment until startTurn has claimed the lane. */
+const queueStarts = new Set<string>();
+function acceptingNative(bot: BotRecord, laneId?: string): string | undefined {
+  const selection = (laneId ? laneEngine.get(laneId) : undefined) ?? selectEngine(bot);
+  const kind = registry.get(selection.instanceId)?.driverKind;
+  return kind === "claudeAgent" || kind === "codex" ? selection.instanceId : undefined;
+}
+/** An instance that is gone reads as Claude Code, the only engine a
+ * marker written by 2.5.33 can name, so its queued command is still
+ * refused rather than sent on as words. */
+function commandFor(text: string, instanceId: string): string | null {
+  return engineCommand(text, registry.get(instanceId)?.driverKind ?? "claudeAgent");
+}
+function queuedCommand(laneId: string, item: { messageId?: string }): string | undefined {
+  const m = item.messageId ? store.messagesFor(laneId).find((m) => m.id === item.messageId) : undefined;
+  if (!m?.text || m.deleted || m.agent || (m.via && m.via !== "routine") || m.commandInstance === null) return undefined;
+  const accepted = m.commandInstance ?? (store.botByThread(laneId) ? acceptingNative(store.botByThread(laneId)!, laneId) : undefined);
+  return accepted && commandFor(m.text, accepted) ? accepted : undefined;
+}
+/** One ordinary prefix or one command. The remaining words stay in FIFO order. */
+function queuedSegment<T extends { messageId?: string; text?: string }>(laneId: string, items: T[], continuation = false) {
+  const alive = items.filter((item) => steerWords(laneId, item) !== null);
+  const first = alive.findIndex((item) => queuedCommand(laneId, item));
+  const size = first < 0 ? alive.length : first === 0 && !continuation ? 1 : first;
+  return { items: alive.slice(0, size), rest: alive.slice(size) };
+}
+
+/** A start's hold on its lane, from its busy check until it marks the
+ * lane busy. */
+type LaneClaim = { lane?: string; cancelPrimaryTry?: () => void };
+
+/** Lanes a start has found free and not yet marked busy, to the start
+ * that holds each. Getting ready awaits (a shared room's plan, a fold of
+ * a long conversation, which can take a minute), and a second start that
+ * found the lane free meanwhile went ahead too: two turns in one lane,
+ * and on Claude Code the second one failing freed the lane under the
+ * first. Whatever asks whether a lane is free counts a claimed one as
+ * busy (laneWaits, backgroundTaskId, drainSteer). */
+const claimedLanes = new Map<string, LaneClaim>();
+/** Lanes whose turn was stopped while it was still getting ready. A
+ * lane reads as working from the moment something is said to it, but its
+ * engine is only started once everything it needs is there (notes
+ * recalled, the folder photographed, a box woken), which can take from a
+ * moment to a minute. A stop in between found no engine turn to
+ * interrupt and was lost: the turn then started anyway and ran as if
+ * nobody had pressed anything (GitHub 272). So the stop is kept here and
+ * honoured at the last check before the engine hears a word. */
+const stoppedGettingReady = new Set<string>();
+
+/** Stops a lane's turn, whichever stage it is at: the engine's turn when
+ * there is one, and a turn still getting ready by leaving word for it. */
+async function interruptLane(bot: BotRecord, laneId: string) {
+  // a failed turn waiting to be asked again has no engine turn to stop
+  if (cancelRecovery(bot, laneId, "Stopped. It will not be asked again.")) return;
+  const adapter = laneInstance(bot, laneId)?.adapter;
+  if (store.taskByThread(laneId)?.task.busy && !adapter?.hasSession(laneId)) {
+    stoppedGettingReady.add(laneId);
+    cancelPrimaryTry(laneId);
+  }
+  await adapter?.interruptTurn(laneId);
+}
+
+/** store.deleteTask, counting a lane still getting a turn ready as busy:
+ * closed then, the turn would start in a lane that no longer exists. */
+function deleteLane(botId: string, laneId: string): ReturnType<typeof store.deleteTask> {
+  if (claimedLanes.has(laneId)) return "busy";
+  const outcome = store.deleteTask(botId, laneId);
+  // A rehearsal's lane is the only way to its copy: closed, nothing can
+  // follow up on it or apply it, so the copy goes now rather than in a week.
+  const rehearsed = outcome === "ok" ? rehearsals.forTask(laneId) : undefined;
+  if (rehearsed && !rehearsed.settledAt) {
+    void rehearsals
+      .settle(rehearsed.id, "discarded")
+      .then(() => broadcast({ kind: "rehearsals" }))
+      .catch(() => {});
+  }
+  return outcome;
+}
+
+/** Starts a turn (startClaimedTurn). A start that gives up before
+ * marking its lane busy (refused, held by a drain, or failed getting
+ * ready) lets go of the lane here, and what waited behind it goes, as
+ * it would after a turn. */
+async function startTurn(botId: string, text: string, opts: Parameters<typeof startClaimedTurn>[2] = {}): Promise<void> {
+  const claim: LaneClaim = {};
+  try {
+    await startClaimedTurn(botId, text, opts, claim);
+  } catch (error) {
+    claim.cancelPrimaryTry?.();
+    throw error;
+  } finally {
+    if (claim.lane && claimedLanes.get(claim.lane) === claim) {
+      claimedLanes.delete(claim.lane);
+      claim.cancelPrimaryTry?.();
+      drainSteer(claim.lane);
+      drainRoomTags(botId);
+    }
+  }
+}
+
+async function startClaimedTurn(
   botId: string,
   text: string,
   opts: {
     roomId?: string;
+    /** How many times in a row agents had passed the room along when a
+     * mention started this turn (turnHops). Unset is 0, except on a turn
+     * that goes on with another, which keeps that turn's count. */
     hops?: number;
     replyTo?: ReplyRef;
     taskId?: string;
@@ -2050,6 +3859,11 @@ async function startTurn(
     /** The user message is already in the transcript (a drained queue);
      * do not append it again. */
     presetMessage?: boolean;
+    /** Telegram requests held by a drain, consumed by this turn only. */
+    telegramMessages?: string[];
+    /** The dispatched segment's message ids, used only to find personal
+     * words for named skills. Never taken from a client body. */
+    personalMessages?: string[];
     /** Who asked, in a shared room: "owner" or a person id. Decides who
      * approvals go to (always the owner for a member's turn). */
     requester?: string;
@@ -2059,10 +3873,48 @@ async function startTurn(
     /** This turn runs on the agent's backup, because its own engine just
      * ran out partway through the same message. */
     fallback?: boolean;
+    /** Another agent sent this message (see AgentNote). */
+    from?: { botId: string; name: string };
+    /** A routine started this turn; the transcript keeps its prompt alone. */
+    routine?: Message["routine"];
+    /** A queued message from another agent, already written and worded:
+     * only marks what this turn says as that exchange's reply. */
+    answering?: { peerId: string; peerName: string };
+    /** The person started this turn, so what it says back is a reply to
+     * them and moves the conversation up the sidebar. Unset for anything
+     * else: another agent, a routine, a watcher, a job, a webhook. */
+    byYou?: boolean;
+    /** False for generated words relayed on the person's behalf. */
+    personal?: boolean;
+    /** The person said this from Telegram (Message.fromTelegram). */
+    fromTelegram?: boolean;
+    telegramBinding?: Message["telegramBinding"];
+    /** This turn picks up one that was cut off (server/cut-off.ts). */
+    carriedOn?: boolean;
+    /** This turn asks again what the lane's last turn was asked, after
+     * the conversation was folded to fit, or after it failed. */
+    retry?: boolean;
+    /** This turn is a failed one's retry or its handover to the backup
+     * (recoverTurn), which keeps the message's place in what has been
+     * tried for it. */
+    recovery?: Recovery["stage"];
+    /** Server-created accepting instance for a queued native command. */
+    commandInstance?: string;
+    /** How many turns in a row agents have started, this one included,
+     * since anything else did (agentChain). Unset is 0, except on a turn
+     * that goes on with another (a pickup, a backup, a retry), which
+     * keeps that turn's place. */
+    chain?: number;
+    /** The turn answering a mail (drainMail). Any other turn starting in
+     * its lane, other than one going on with it, ends that: its words
+     * are not the mail's reply (replyByMail). */
+    answersMail?: boolean;
   } = {},
-) {
+  claim: LaneClaim = {},
+): Promise<void> {
   const bot = store.bot(botId);
   if (!bot) throw Object.assign(new Error("no such agent"), { status: 404 });
+  if (opts.telegramBinding && !telegramConnectionCurrent(opts.telegramBinding)) throw new Error("This agent's Telegram connection changed before the message could start.");
 
   // Somebody at the wheel stops the agent, not just its questions.
   //
@@ -2094,12 +3946,7 @@ async function startTurn(
   // step naming it. Every one of those arrives here, and every one of
   // them fails loudly rather than quietly waking somebody who was put
   // away on purpose.
-  if (bot.archivedAt) {
-    throw Object.assign(new Error(`${bot.name} is archived. Restore it to give it work.`), {
-      status: 409,
-      archived: true,
-    });
-  }
+  if (bot.archivedAt) throw archivedRefusal(bot);
 
   // the gate is the lane: other lanes keep their own turns running.
   //
@@ -2111,17 +3958,49 @@ async function startTurn(
   const sharing: RoomSharing | null = sharedRoom?.sharing ?? null;
   const task = sharing
     ? sharedLaneFor(bot, sharedRoom!)
-    : (bot.tasks.find((t) => t.id === (opts.taskId ?? bot.activeTaskId)) ?? bot.tasks[0]);
+    : (bot.tasks.find((t) => t.id === (opts.taskId ?? activeLaneOf(bot))) ?? bot.tasks[0]);
   if (!task) throw Object.assign(new Error("no task lane on this agent"), { status: 500 });
-  if (task.busy) {
+  if (task.busy || claimedLanes.has(task.id)) {
     throw Object.assign(new Error("this task is already running, interrupt it or open another task"), {
       status: 409,
+      busy: true,
     });
+  }
+  // Claimed before the first await below, until the lane is marked busy
+  // (or startTurn lets go of it, if this start gives up first).
+  claim.lane = task.id;
+  claimedLanes.set(task.id, claim);
+
+  // Bloks is finishing what is running before it restarts
+  // (server/drain.ts). Nothing new starts here, and nothing is turned
+  // away either: words for one of the agent's lanes wait in that lane's
+  // queue, which is on disk, as they would behind a busy turn. A room
+  // line is refused the way a busy agent refuses it, and its caller
+  // holds it the same way. Only the turn that was already running may
+  // go on: picked up after sleep, handed to a backup, or asked again
+  // after a fold.
+  if (drain.on && !opts.carriedOn && !opts.fallback && !opts.retry) {
+    // a note in the queue runs as the owner's, so a turn somebody else
+    // asked for is held by its caller instead
+    if ((opts.roomId && opts.roomId !== task.id) || opts.rehearsal || (opts.requester && opts.requester !== "owner")) {
+      throw Object.assign(new Error(DRAINING_TEXT), { status: 503, draining: true });
+    }
+    if (opts.presetMessage) {
+      // already in the conversation, or a note from Bloks itself, so it
+      // waits as a note: in memory, like every note in the queue
+      const entry = steerQueues.get(task.id) ?? { botId: bot.id, items: [] };
+      entry.items.push({ text, ...(opts.chain ? { chain: opts.chain } : {}) });
+      steerQueues.set(task.id, entry);
+    } else {
+      queueOnLane(bot.id, task.id, text, { replyTo: opts.replyTo, from: opts.from, routine: opts.routine, personal: opts.byYou === true && opts.personal !== false, chain: opts.chain });
+    }
+    return;
   }
 
   // A rehearsal lane keeps rehearsing: a follow-up works on the same copy,
-  // and its card replaces the last one. Once the copy is gone (applied or
-  // discarded), the lane has nowhere to work and says so.
+  // and its card, still measured from the folder as the copy was made,
+  // replaces the last one. Once the copy is gone (applied or discarded),
+  // the lane has nowhere to work and says so.
   const rehearsed = opts.rehearsal ? null : rehearsals.forTask(task.id);
   if (rehearsed) {
     if ((rehearsed.state === "ready" || rehearsed.state === "empty") && rehearsals.exists(rehearsed)) {
@@ -2140,25 +4019,54 @@ async function startTurn(
     }
   }
 
-  // Which engine answers. The agent's own, unless it is resting after
-  // running out (or gone) and the agent has a backup that is not.
   const own = bot.modelSelection;
-  const backup = bot.backupSelection && bot.backupSelection.instanceId !== own.instanceId ? bot.backupSelection : null;
   const ownRest = cooldowns.of(own.instanceId);
-  const ownMissing = !registry.get(own.instanceId);
-  const selection: ModelSelection =
-    (opts.fallback || ownRest || ownMissing) && engineUsable(backup) ? backup : own;
+  const directCommandInstance = !opts.from && !opts.presetMessage ? acceptingNative(bot, task.id) : undefined;
+  // Keep Claude's existing room/direct-command behavior. Codex's new
+  // command path is for the person's own input in an agent lane.
+  const directCommandAllowed = registry.get(directCommandInstance ?? "")?.driverKind === "claudeAgent" || (opts.byYou && opts.personal !== false && !opts.roomId);
+  const commandInstance = opts.commandInstance ?? (directCommandAllowed ? directCommandInstance : undefined);
+  const command = Boolean(commandInstance && commandFor(text, commandInstance));
+  const staying = !opts.fallback && Boolean(stayOf(bot, task.id));
+  const ownInstance = registry.get(own.instanceId);
+  const backup = bot.backupSelection;
+  const reservation =
+    !command && !opts.fallback && !opts.retry && !opts.carriedOn && !staying &&
+    (!opts.roomId || opts.roomId === task.id) && triesBeforeReset(own, ownRest) && ownInstance?.enabled !== false &&
+    backup?.instanceId !== own.instanceId && engineUsable(backup)
+      ? cooldowns.reserve(own.instanceId, RETRY_INTERVAL) : undefined;
+  const ownTry: PrimaryTry | undefined = reservation ? { reservation } : undefined;
+  if (ownTry) {
+    primaryTries.set(task.id, ownTry);
+    claim.cancelPrimaryTry = () => cancelPrimaryTry(task.id, ownTry);
+  }
+  const selection = ownTry ? own : selectEngine(bot, opts.fallback, task.id);
+  if (command && (selection.instanceId !== commandInstance || acceptingNative(bot) !== commandInstance || !engineUsable(selection))) {
+    const name = registry.get(commandInstance!)?.driverKind === "codex" ? "Codex" : "Claude Code";
+    throw Object.assign(new Error(`This command was queued for ${name}, but that engine is no longer selected or available. Choose it again and send the command again.`), { status: 409 });
+  }
   const instance = registry.get(selection.instanceId);
   if (!instance) {
-    throw Object.assign(
-      new Error(`provider instance "${selection.instanceId}" is unavailable, pick another model in settings`),
-      { status: 409 },
-    );
+    throw Object.assign(new Error(unavailableEngineMessage(selection.instanceId)), { status: 409 });
   }
   if (sharing && !sharedSafe(instance.driverKind)) {
     throw Object.assign(
       new Error(
         `${bot.name} runs on an engine whose tools cannot be switched off yet, so it sits out shared rooms. Move it to Claude Code or an API model to bring it in.`,
+      ),
+      { status: 409 },
+    );
+  }
+  // An email from someone the owner has not listed is answered the way a
+  // guest in a shared room is: in conversation only, with nothing of the
+  // owner's, on an engine whose tools can be switched off. A shell that
+  // asks first still reads the whole disk without asking, the owner's
+  // keys included, and the answer is mailed to whoever wrote.
+  const guestMail = (opts.requester ?? (opts.fallback || opts.retry ? askedLast.get(task.id) : undefined)) === MAIL_FROM_ANYONE;
+  if (guestMail && !sharedSafe(instance.driverKind)) {
+    throw Object.assign(
+      new Error(
+        `${bot.name} runs on an engine whose tools cannot be switched off yet, so it does not answer mail from someone not on your list. List who may write under Email in Settings, or move it to Claude Code or an API model.`,
       ),
       { status: 409 },
     );
@@ -2191,6 +4099,9 @@ async function startTurn(
   // where the reply lands: the lane's own thread, or the shared room
   const roomId = opts.roomId ?? task.id;
   const blok = roomId === task.id ? null : bloks.get(roomId);
+  // Private rooms can share a provider lane with solo turns. Their
+  // switch context still belongs to each agent in each room separately.
+  const awayId = blok ? `${task.id}:${roomId}` : task.id;
   // Who the agent is told it is working with, which is not the same as
   // who is on the roster. An archived member is still in the room so the
   // transcript stays legible, but telling a live agent to hand something
@@ -2203,19 +4114,112 @@ async function startTurn(
   // keyed by the lane, so a room turn in one lane never bleeds messages
   // into a solo turn running in another
   activeRoom.set(task.id, roomId);
+  // decided before the person's own message below is written, so the
+  // door every message passes reads this turn and not the last one
+  const forYouBefore = turnsForYou.has(task.id);
+  if (opts.byYou) turnsForYou.add(task.id);
+  else turnsForYou.delete(task.id);
+  // A quiet routine's turn, in the agent's own lane. Never a room's turn
+  // or a command, where there is nobody to be quiet for, or nothing to
+  // answer QUIET with.
+  const checkIn = Boolean(opts.routine?.quiet) && !blok && !command;
+  if (checkIn) checkInTurns.add(task.id);
+  else checkInTurns.delete(task.id);
+
+  // What the agent said elsewhere that bears on what the person just
+  // said (recallAhead), found before their words are written so the
+  // message carries the notes it was given. Only the person's own turn in
+  // one of the agent's own conversations: not a room, shared or not, not
+  // a stranger's mail, another agent, a routine, a native command or a
+  // rehearsal, and not a turn going on with an earlier one, which already
+  // had its chance.
+  const recallWanted =
+    opts.byYou === true &&
+    opts.personal !== false &&
+    !opts.from &&
+    !opts.routine &&
+    !opts.rehearsal &&
+    !opts.carriedOn &&
+    !opts.fallback &&
+    !opts.retry &&
+    !command &&
+    !blok &&
+    !sharing &&
+    !guestMail &&
+    !task.guestMail &&
+    (opts.requester ?? "owner") === "owner" &&
+    cfg.recall?.beforeTurn !== false &&
+    bot.recallBeforeTurn !== false;
+  // Words that waited for a turn are already written; the person's own
+  // among them are what is looked for, and the last of them keeps the notes.
+  const waited = recallWanted && opts.presetMessage
+    ? store.messagesFor(task.id).filter((m) => opts.personalMessages?.includes(m.id) && m.role === "user" && m.kind === "text" && !m.deleted && !m.agent && !m.via)
+    : [];
+  const recalledAhead = recallWanted
+    ? recallAhead(bot, task.id, opts.presetMessage ? waited.map((m) => m.text ?? "").join("\n") : text)
+    : null;
+  if (recalledAhead && waited.length) {
+    const patched = store.patchMessage(task.id, waited[waited.length - 1].id, { recalled: recalledAhead.notes });
+    if (patched) broadcast({ kind: "message.patch", threadId: task.id, message: patched });
+  }
 
   // In a room the prompt already carries the labelled history, and the
   // triggering message is already on the record; only a solo chat writes
   // the user turn here.
+  const telegramInputIds = [...(opts.telegramMessages ?? [])];
+  // Where what this turn answers begins in the conversation: before its
+  // own words, or at the first of the waiting ones it takes. What another
+  // engine answered from here on is what the own engine misses (away).
+  const turnSince = Math.min(
+    Date.now(),
+    ...store.messagesFor(roomId).filter((m) => telegramInputIds.includes(m.id)).map((m) => m.at),
+  );
   if (!blok && !opts.presetMessage) {
     const userMessage = store.appendMessage(roomId, {
       role: "user",
       kind: "text",
       text,
+      ...(recalledAhead ? { recalled: recalledAhead.notes } : {}),
       ...(opts.replyTo ? { replyTo: opts.replyTo } : {}),
+      ...(opts.from ? { agent: { dir: "in" as const, peerId: opts.from.botId, peerName: opts.from.name } } : {}),
+      ...(opts.routine ? { via: "routine" as const, routine: opts.routine, ...(command ? { commandInstance } : {}) } : {}),
+      ...(opts.fromTelegram ? { fromTelegram: true } : {}),
+      ...(opts.telegramBinding ? { telegramBinding: opts.telegramBinding } : {}),
     });
+    if (opts.telegramBinding) telegramInputIds.push(userMessage.id);
     broadcast({ kind: "message", threadId: roomId, message: userMessage });
   }
+  // what this turn says back belongs to that exchange (see AgentNote)
+  const answering = opts.from ? { peerId: opts.from.botId, peerName: opts.from.name } : opts.answering;
+  if (!blok && answering) replyingTo.set(task.id, answering);
+  else replyingTo.delete(task.id);
+  // the words as written, for naming the lane; the engine also hears who sent them
+  const said = text;
+  // What a solo turn was asked, the way it was asked, so a turn that
+  // fails can be asked again (recoverTurn). A new message starts with a
+  // retry and a handover of its own; a turn going on with a failed one
+  // keeps that message's.
+  if (!opts.recovery) recoveries.delete(task.id);
+  const recovering = opts.recovery ? recoveries.get(task.id) : undefined;
+  if (!blok && !command && recovering) turnAsked.set(task.id, recovering.asked);
+  else if (!blok && !command) {
+    turnAsked.set(task.id, {
+      text: said,
+      since: turnSince,
+      byYou: opts.byYou === true,
+      ...(opts.from ? { from: opts.from } : opts.answering ? { answering: opts.answering } : {}),
+      ...(opts.routine ? { routine: opts.routine } : {}),
+      ...(opts.replyTo ? { replyTo: opts.replyTo } : {}),
+    });
+  } else if (blok || command) turnAsked.delete(task.id);
+  // A named skill injects instructions. Take names from the person's
+  // actual words, never from wrappers, notes or background sources.
+  const personalWords = opts.personalMessages && !blok
+    ? store.messagesFor(task.id).filter((m) => opts.personalMessages!.includes(m.id) && m.namedSkills === true && m.role === "user" && m.kind === "text" && !m.deleted && !m.agent && !m.via).map((m) => m.text ?? "")
+    : opts.byYou && opts.personal !== false && !opts.from && !opts.presetMessage && !blok ? [said] : [];
+  const skillNames = instance.driverKind === "codex" && !command ? codexSkillNames(personalWords) : [];
+  if (opts.from) text = fromAgentPrompt(opts.from, text);
+  if (opts.routine && !command) text = fromRoutinePrompt(opts.routine, text, blok ? null : lastReportFor(task.id));
 
   // ── the transcript for API-backed drivers ──
   //
@@ -2232,13 +4236,17 @@ async function startTurn(
   // leave room for the system prompt and the reply
   const transcriptBudget = Math.max(2_000, Math.floor(contextLimit * COMPACT_AT) - 4_000);
   const buildTranscript = (): { turns: Turn[]; dropped: number } => {
-    if (blok) return { turns: [], dropped: 0 };
+    // a guest's mail is told alone: earlier mail in its lane was other
+    // people's, and what the owner said there is the owner's
+    if (blok || guestMail) return { turns: [], dropped: 0 };
+    // a message marked not sent was never said, and one still queued has
+    // not been yet (it joins at the end when it goes), so no engine hears either
     const settled = store
       .messagesFor(roomId)
-      .filter((m) => m.kind === "text" && m.text && !m.deleted)
+      .filter((m) => m.kind === "text" && m.text && !m.deleted && !m.queued && !m.unsent)
       .map((m) => ({
         role: m.role === "user" ? ("user" as const) : ("assistant" as const),
-        text: m.text!,
+        text: storedPrompt(m),
       }));
     return assembleTranscript(settled, task.context ?? null, transcriptBudget);
   };
@@ -2248,7 +4256,7 @@ async function startTurn(
   // limit would never fire, because trimming is what makes it fit, and
   // the trimming is exactly the silent forgetting this replaces.
   let built = buildTranscript();
-  if (!blok && built.dropped > 0) {
+  if (!command && !blok && built.dropped > 0) {
     if (await foldContext(bot.id, task.id).catch(() => false)) built = buildTranscript();
   }
   const transcript = built.turns;
@@ -2258,15 +4266,34 @@ async function startTurn(
   // told us about themselves in settings. Two kinds compose here: the
   // agent's own one-line skills, and full library skills it has attached.
   const attached = getSkills(bot.skillIds ?? []);
+  // Only a turn that gets a credential gets BLOKS_CLI in its environment
+  // (see below), so anything else is told the path itself.
+  const cliCommand = !sharing && runsAProcess(instance.driverKind) ? CLI_COMMAND : `node "${AGENT_CLI}"`;
+  // The asking tools (request_secret, request_connection) live in Claude
+  // Code's bridge and in the API tool loop, nowhere else. Every other
+  // engine with a credential asks for a key on the command line instead,
+  // and the rest are not told about either (GitHub 172).
+  const asksByTool = instance.driverKind === "claudeAgent" || specFor(instance.driverKind)?.tools === true;
   const connectorHint = [
-    cfg.composio?.key && bot.composio !== false
+    asksByTool && cfg.composio?.key && bot.composio !== false
       ? "When a task needs an app the user has not connected yet (Slack, Gmail, GitHub, and so on), call the request_connection tool with the app slugs. A sign-in card appears in the chat; never paste sign-in or OAuth links into the conversation yourself."
       : null,
-    "When a task needs an API key or other secret from the user, call the request_secret tool and they get a secure field in the chat; never ask for keys in plain conversation.",
+    secretHint(asksByTool ? "tool" : !sharing && runsAProcess(instance.driverKind) ? "cli" : null, cliCommand),
   ]
     .filter(Boolean)
     .join(" ");
-  const persona = [
+  // The parts of the persona that move between turns, which a resumed
+  // Claude Code session keeps as they were when it started (see
+  // server/standing-prompt.ts). The room's history is told in the turn's
+  // message on that engine, and in the system prompt on the rest.
+  const standingNow: Standing = {
+    // what every agent has learned about them and they confirmed, and how
+    // to add to it; never in a room other people are reading
+    notes: (!sharing && !guestMail && profileNotes.prompt()) || null,
+    memory: !guestMail && (!sharing || sharing.memoryFor?.includes(bot.id)) ? workspace.memoryPrompt(bot.id) : null,
+  };
+  const roomInMessage = Boolean(blok) && instance.driverKind === "claudeAgent";
+  const personaWith = (moving: Standing) => [
     `You are ${bot.name}, a personal agent in Bloks.`,
     connectorHint,
     bot.title && `Role: ${bot.title}.`,
@@ -2279,13 +4306,16 @@ async function startTurn(
     // engine gets a credential it could read them with. See the note in
     // server/skills.ts for why withholding one from an engine that cannot
     // fetch it would be losing the instruction rather than deferring it.
-    skillsPrompt(
-      disclose(attached, runsAProcess(instance.driverKind)),
-      `To read one, run: node "${AGENT_CLI}" skill <id>`,
-    ),
+    // not for a guest's mail: what the owner wrote them is the owner's
+    !guestMail &&
+      skillsPrompt(
+        disclose(attached, runsAProcess(instance.driverKind)),
+        `To read one, run: ${cliCommand} skill <id>`,
+      ),
     // The composer offers these by id after a slash (#51), so a message
     // naming one that way is asking for it by name.
-    attached.length > 0 &&
+    !guestMail &&
+      attached.length > 0 &&
       "When a message names one of your skills with a slash and its id, like /id, the person is asking for that skill: follow it.",
     // Every engine gets the gallery; only the route differs. One with a
     // shell calls the CLI. One without writes the component into its own
@@ -2294,30 +4324,31 @@ async function startTurn(
     galleryPrompt(
       bot.withoutComponents,
       runsAProcess(instance.driverKind)
-        ? `To use one, run: node "${AGENT_CLI}" show <kind> '<json>'`
+        ? `To use one, run: ${cliCommand} show <kind> '<json>'`
         : 'To use one, write it as a fenced block on its own:\n```bloks\n{ "kind": "table", ... }\n```',
     ),
     // In a shared room the owner's private context stays out unless the
     // owner has let this agent's memory into the room: other people are
     // reading the replies.
-    (!sharing || sharing.memoryFor?.includes(bot.id)) &&
+    !guestMail &&
+      (!sharing || sharing.memoryFor?.includes(bot.id)) &&
       cfg.profile?.about?.trim() &&
       `About the person you work for: ${cfg.profile.about.trim()}`,
-    // what every agent has learned about them and they confirmed, and how
-    // to add to it; never in a room other people are reading
-    !sharing && profileNotes.prompt(),
-    !sharing && noteBriefing(runsAProcess(instance.driverKind) ? `node "${AGENT_CLI}"` : null),
-    (!sharing || sharing.memoryFor?.includes(bot.id)) && workspace.memoryPrompt(bot.id),
+    moving.notes,
+    !sharing && !guestMail && noteBriefing(runsAProcess(instance.driverKind) ? cliCommand : null),
+    moving.memory,
     sharing && sharedBriefing(sharedRoom!, sharing, roomTools),
-    `Deliverables: when you produce a file for the user (a report, web page, slide deck, spreadsheet, PDF, chart), save it to ${artifacts.artifactsDir(bot.id)} with a descriptive filename. Files saved there appear in the chat as cards the user can open in-app or download. HTML, PDF, images, CSV, XLSX, markdown and text all render in-app; for slide decks, save an HTML version alongside any .pptx so the deck is viewable in place.`,
+    guestMail &&
+      "This is an email from someone the person you work for has not listed. Answer it from what you know, in conversation only: you have no tools here, and nothing private of theirs is yours to share.",
+    !guestMail && `Deliverables: when you produce a file for the user (a report, web page, slide deck, spreadsheet, PDF, chart), save it to ${artifacts.artifactsDir(bot.id)} with a descriptive filename. Files saved there appear in the chat as cards the user can open in-app or download. HTML, PDF, images, CSV, XLSX, markdown and text all render in-app; for slide decks, save an HTML version alongside any .pptx so the deck is viewable in place.`,
     HOUSE_STYLE,
     // In a room, who else is here and who decides. Solo chats stay silent
     // about all of it.
     blok && roomBriefing(blok, bot, members),
-    blok && `Recent conversation in this room:\n${roomTranscript(roomId, bot.id)}`,
-    // only senior agents can ask for a team, and only outside a room, 
+    blok && !roomInMessage && `Recent conversation in this room:\n${roomTranscript(roomId, bot.id).text}`,
+    // only senior agents can ask for a team, and only outside a room,
     // inside one they already have colleagues to delegate to
-    !blok && (bot.seniority ?? 1) >= 3 && TEAM_PROTOCOL,
+    !blok && !guestMail && (bot.seniority ?? 1) >= 3 && TEAM_PROTOCOL,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -2327,24 +4358,90 @@ async function startTurn(
   // the driver already knows about, and a turn between the first check
   // and this line is in neither place: not yet registered, so nothing
   // interrupts it, and already past the gate, so nothing refuses it.
+  //
+  // What this start marked above is taken back before it refuses, or the
+  // lane reads as speaking with no turn behind it until its next one:
+  // idle compaction passes it over, and a room waits on it.
+  const unmark = () => {
+    activeRoom.delete(task.id);
+    replyingTo.delete(task.id);
+    if (forYouBefore) turnsForYou.add(task.id);
+    else turnsForYou.delete(task.id);
+    checkInTurns.delete(task.id);
+  };
   const stillHeld = wheel.heldBy(bot.id);
   if (stillHeld) {
+    unmark();
     wheel.noteTurnedAway(bot.id);
     broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
     throw Object.assign(new Error(heldRefusal(stillHeld, bot.name)), { status: 409, held: true });
   }
+  // and the same for an archive that landed during the fold
+  if (store.bot(bot.id)?.archivedAt) {
+    unmark();
+    throw archivedRefusal(bot);
+  }
 
-  laneRequester.set(task.id, opts.requester ?? "owner");
+  // A backup engine or a retry after a fold goes on with the turn before
+  // it, for whoever asked for that one (a pickup is told who, by the
+  // record of the turn it picks up).
+  const requester = opts.requester ?? (opts.fallback || opts.retry ? askedLast.get(task.id) : undefined) ?? "owner";
+  laneRequester.set(task.id, requester);
+  // somebody else's turn in a mail's lane: what it says is not emailed
+  if (!opts.answersMail && !opts.carriedOn && !opts.fallback && !opts.retry) mailAnswering.delete(task.id);
+  askedLast.set(task.id, requester);
+  // The owner asked for this turn, or something they set up did. A
+  // member of a shared room or an email from anyone did not, and their
+  // turn gets none of the owner's standing trust (MAIL_FROM_ANYONE).
+  const owners = requester === "owner";
+  // set before the engine hears a word, so a `bloks say` from this turn
+  // reads this turn's place and not the last one's
+  const goesOn = opts.carriedOn || opts.fallback || opts.retry;
+  const inRoomChain = opts.roomId && opts.roomId !== task.id ? (roomChain.get(opts.roomId) ?? 0) : 0;
+  agentChain.set(task.id, opts.chain ?? (goesOn ? (agentChain.get(task.id) ?? 0) : inRoomChain));
+  // and its count of the room being passed along, set here for the same
+  // reason: what this turn says in a room is judged by its own count
+  turnHops.set(task.id, opts.hops ?? (goesOn ? (turnHops.get(task.id) ?? 0) : 0));
   if (sharing) broadcast({ kind: "room.activity", roomId: sharedRoom!.id, botId: bot.id, busy: true });
 
   // Mark it busy now, before any of the slow work, so the composer locks
   // the instant someone presses send. The dispatch itself is deliberately
   // not awaited: provisioning a box can take a minute and a half, and an
   // HTTP request must never be the thing holding that open.
+  if (command) commandTurns.add(task.id);
+  // a stop left for an earlier turn is not this one's; a turn that goes
+  // on from one that was stopped between its two halves still is
+  if (!goesOn) stoppedGettingReady.delete(task.id);
   store.setTaskBusy(task.id, true);
+  // a goal judged before this turn began is not judging this one
+  laneTurns.set(task.id, (laneTurns.get(task.id) ?? 0) + 1);
+  // the busy flag holds the lane from here
+  if (claimedLanes.get(task.id) === claim) claimedLanes.delete(task.id);
   turnStarted.set(task.id, Date.now());
+  // every turn counts its calls from nothing, a backup's or a retry's too
+  repeats.begin(task.id);
+  // on disk before the engine hears a word, so from here on a crash
+  // leaves this turn to be picked up when Bloks starts again
+  const replaced = cutOff.begin({
+    laneId: task.id,
+    botId: bot.id,
+    ...(roomId !== task.id ? { roomId } : {}),
+    requester,
+    ...(opts.byYou ? { byYou: true } : {}),
+    instanceId: selection.instanceId,
+    session: sessionRef(task.resumeCursors[selection.instanceId]),
+    startedAt: Date.now(),
+    ...(workflowTurns.has(task.id) ? { workflow: true } : {}),
+    ...(opts.carriedOn ? { carriedOn: true } : {}),
+  });
+  if (replaced?.waiting) retireCarryOn(replaced);
+  telegramReturns.bind(task.id, opts.telegramMessages, Boolean(opts.carriedOn || opts.fallback || opts.retry));
   notesThisTurn.delete(task.id);
-  store.patchBot(bot.id, { unread: false });
+  // A check-in leaves the dot as it found it: one every quarter of an
+  // hour would otherwise read the lane for the person each time, and a
+  // reply they have not seen yet would lose its dot to a run that, being
+  // quiet, puts none back.
+  if (!checkIn) store.markLane(bot.id, task.id, false);
   artifactBaseline.set(task.id, artifacts.snapshot(bot.id));
   turnTokens.delete(task.id);
   broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
@@ -2353,7 +4450,7 @@ async function startTurn(
   // thing asked of it, kept very short so the strip reads like a to-do
   // list. General keeps its name; it is the conversation, not a task.
   if (!blok && /^Task \d+$/.test(task.title)) {
-    const words = text.replace(/\s+/g, " ").trim().split(" ");
+    const words = said.replace(/\s+/g, " ").trim().split(" ");
     let short = "";
     for (const word of words.slice(0, 3)) {
       const next = short ? `${short} ${word}` : word;
@@ -2361,10 +4458,44 @@ async function startTurn(
       short = next;
     }
     short = (short || words[0].slice(0, 24)).replace(/[.,!?;:]+$/, "");
-    if (short) store.patchTaskTitle(bot.id, task.id, short);
+    if (short) retitleLane(bot.id, task.id, short);
   }
 
+  // The lane goes back to idle, whichever way this turn ends without
+  // reaching its engine. Nothing is listening for a turn.completed that
+  // was never going to come.
+  const settleUnsent = (failure?: string) => {
+    claim.cancelPrimaryTry?.();
+    commandTurns.delete(task.id);
+    checkInTurns.delete(task.id);
+    activeRoom.delete(task.id);
+    laneRequester.delete(task.id);
+    replyingTo.delete(task.id);
+    turnAsked.delete(task.id);
+    recoveries.delete(task.id);
+    // what was got ready for it goes with it: the folder's photograph,
+    // the Local VM, and the credential it would have run with
+    checkpoints.cancel(task.id);
+    releaseVm(task.id);
+    agentTokens.revokeTask(task.id);
+    if (sharing) broadcast({ kind: "room.activity", roomId: sharedRoom!.id, botId: bot.id, busy: false });
+    store.setTaskBusy(task.id, false);
+    // a Telegram request this turn took is answered with why it did not run
+    telegramReturns.finish(task.id, failure);
+    turnStarted.delete(task.id);
+    repeats.end(task.id);
+    cutOff.end(task.id);
+    // and so is whatever registered to hear how it ended
+    settleOwners(bot, task.id, { ok: false, why: failure ?? null, unsent: true });
+    broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+    drainRoomTags(bot.id);
+    freshIfAsked(task.id);
+    drainSteer(task.id);
+    closeIfAsked(task.id);
+  };
+
   void (async () => {
+    let tryAccepted = false;
     try {
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
       // A shared room hands the agent nothing of the owner's: no connected
@@ -2375,19 +4506,24 @@ async function startTurn(
       // Unless the owner has opened some of them to the room (roomTools),
       // and then only what is both open to the room and granted to this
       // agent: a room never widens what an agent could do on its own.
-      if ((!sharing || roomTools?.connectors) && cfg.composio?.key && bot.composio !== false) {
+      //
+      // An email from anyone gets none of them either. An API engine calls
+      // a connector or the computer with nothing to ask the owner first,
+      // and the answer goes back to whoever wrote.
+      const othersTurn = Boolean(sharing) || !owners;
+      if ((!othersTurn || roomTools?.connectors) && cfg.composio?.key && bot.composio !== false) {
         integrations.composio = { key: cfg.composio.key, url: cfg.composio.url };
       }
       const attached = (cfg.mcpServers ?? []).filter(
         (server) =>
-          (bot.mcpServers ?? []).includes(server.id) && (!sharing || (roomTools?.mcp ?? []).includes(server.id)),
+          (bot.mcpServers ?? []).includes(server.id) && (!othersTurn || (roomTools?.mcp ?? []).includes(server.id)),
       );
       if (attached.length) {
         integrations.mcpServers = attached.map(({ id: _id, ...rest }) => rest);
       }
       // cloud | sandbox | local | off | undefined(auto), with a per-turn
       // override taking precedence over the agent's own setting
-      const wants = sharing && !roomTools?.computer ? "off" : (opts.computerOverride ?? bot.computer);
+      const wants = othersTurn && !roomTools?.computer ? "off" : (opts.computerOverride ?? bot.computer);
       // "sandbox" is the stored name for the Local VM: a Cua desktop in a
       // container on this machine, shared by all agents one at a time
       let vmTurn = false;
@@ -2415,18 +4551,31 @@ async function startTurn(
       }
       if (wants !== "off" && wants !== "local" && wants !== "sandbox" && box.boxConfigured(cfg)) {
         let b = await box.findBox(cfg, bot.id).catch(() => null);
-        // the Computer driver runs ON the box, provision it on first use
-        if (!b && instance.driverKind === "boxAgent") {
-          broadcast({ kind: "computer", botId: bot.id, state: "provisioning" });
-          await box.provisionBox(cfg, bot.id, bot.name);
-          b = await box.findBox(cfg, bot.id).catch(() => null);
-        }
-        // A computer put to sleep for being idle wakes before the turn
-        // needs it, rather than failing the turn's first command.
-        if (b && !box.isAwake(b)) {
-          broadcast({ kind: "computer", botId: bot.id, state: "waking" });
-          b = await box.wakeBox(cfg, b);
-          if (!b) throw new Error(`${bot.name}'s computer did not wake in time. Try again in a minute.`);
+        // The app shows "setting up" from the first word until the next
+        // one, so a box being made or woken always ends with one, ready or
+        // failed. A provision that threw, or one that came up awake, used
+        // to say nothing more, and the chat spun on it until a reload.
+        let said = false;
+        let ready = false;
+        try {
+          // the Computer driver runs ON the box, provision it on first use
+          if (!b && instance.driverKind === "boxAgent") {
+            broadcast({ kind: "computer", botId: bot.id, state: "provisioning" });
+            said = true;
+            await box.provisionBox(cfg, bot.id, bot.name);
+            b = await box.findBox(cfg, bot.id).catch(() => null);
+          }
+          // A computer put to sleep for being idle wakes before the turn
+          // needs it, rather than failing the turn's first command.
+          if (b && !box.isAwake(b)) {
+            broadcast({ kind: "computer", botId: bot.id, state: "waking" });
+            said = true;
+            b = await box.wakeBox(cfg, b);
+            if (!b) throw new Error(`${bot.name}'s computer did not wake in time. Try again in a minute.`);
+          }
+          ready = Boolean(b);
+        } finally {
+          if (said) broadcast({ kind: "computer", botId: bot.id, state: ready ? "ready" : "failed" });
         }
         if (b) {
           integrations.computer = { boxId: b.id, token: cfg.box!.token! };
@@ -2446,12 +4595,11 @@ async function startTurn(
       // does not also need the whole desktop, and the narrower tool is
       // the one to hand it. Off unless asked for, because a browser
       // starts a real process.
-      if ((!sharing || roomTools?.browser) && bot.browser === true) {
-        integrations.browser = {
-          // a shared room's browser is its own, never signed in as the owner
-          profileDir: join(DATA_DIR, "browser", sharing ? `room-${sharedRoom!.id}` : bot.id),
-          port: BROWSER_PORT,
-        };
+      if ((!othersTurn || roomTools?.browser) && bot.browser === true) {
+        // a shared room's browser is its own, never signed in as the owner
+        const profileDir = join(DATA_DIR, "browser", sharing ? `room-${sharedRoom!.id}` : bot.id);
+        browserProfiles.set(bot.id, profileDir);
+        integrations.browser = { profileDir };
       }
 
       // A lane keeps the folder its first turn ran in: engines key
@@ -2476,16 +4624,15 @@ async function startTurn(
         projectDesk = workingFolder(standing);
         if (standing.folders.length && !projectDesk) {
           const gone = standing.folderStates.filter((f) => f.state !== "ok").map((f) => f.path);
+          const why = missingFolderMessage(project, gone);
           const notice = store.appendMessage(roomId, {
             role: "bot",
             ...(blok ? { from: bot.id } : {}),
             kind: "notice",
-            text: missingFolderMessage(project, gone),
+            text: why,
           });
           broadcast({ kind: "message", threadId: roomId, message: notice });
-          store.setTaskBusy(task.id, false);
-          turnStarted.delete(task.id);
-          broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+          settleUnsent(why);
           return;
         }
       }
@@ -2505,24 +4652,118 @@ async function startTurn(
       // turns. Session-cursor engines get the story replayed inline;
       // API engines replay the transcript themselves every turn.
       const instanceId = selection.instanceId;
+      const nativeReplay = Boolean(instance.adapter.capabilities.replaysNatively);
+      const ownReading = readingFor(task.reading, selection);
+      const handoffTokens = handoffBudget(ownReading?.window ?? contextLimitFor(selection.model));
+      // And the own engine coming back resumes that session, told what it
+      // missed, unless it is longer than a new session's story would be:
+      // then it starts a new session told the conversation, as an engine
+      // switch does (GitHub 284).
+      if (!blok && !command && instanceId !== own.instanceId && !catchups.has(task.id) && task.lastInstanceId === own.instanceId && typeof task.resumeCursors[own.instanceId] === "string") {
+        catchups.set(task.id, { instanceId: own.instanceId, since: turnAsked.get(task.id)?.since ?? turnSince, by: engineName(selection) });
+      }
+      const back = !blok && !command ? catchups.get(task.id) : undefined;
+      let missed: { turns: Turn[]; by: string } | null = null;
+      if (back && back.instanceId === instanceId) {
+        if (!ownTry) catchups.delete(task.id);
+        const said = store
+          .messagesFor(roomId)
+          .filter((m) => m.kind === "text" && m.text && !m.deleted && !m.queued && !m.unsent && m.at >= back.since && m.at < turnSince)
+          .map((m) => ({ role: m.role === "user" ? ("user" as const) : ("assistant" as const), text: storedPrompt(m) }));
+        const bounded = boundHandoff(said, handoffTokens);
+        const resumes = typeof task.resumeCursors[instanceId] === "string" && !nativeReplay && !guestMail;
+        if (resumes && bounded.left === 0) missed = { turns: bounded.turns, by: back.by };
+        const returned = () => {
+          if (catchups.get(task.id) === back) catchups.delete(task.id);
+          const notice = store.appendMessage(roomId, {
+            role: "bot",
+            kind: "notice",
+            text: missed ? `${engineName(selection)} is back on this conversation, in its own session.` : `${engineName(selection)} is back on this conversation.`,
+          });
+          broadcast({ kind: "message", threadId: roomId, message: notice });
+        };
+        // A bounded try is back only after the model answers. A rejected
+        // try keeps the original blind spot and gives no false return line.
+        if (ownTry) ownTry.returned = returned;
+        else returned();
+      }
       const engineFresh =
         !blok &&
+        !missed &&
         engineIsFresh({
           instanceId,
           lastInstanceId: task.lastInstanceId,
           resumeCursors: task.resumeCursors,
           hasUserTurn: transcript.some((m) => m.role === "user"),
         });
-      const nativeReplay = Boolean(instance.adapter.capabilities.replaysNatively);
-      let turnText = opts.replyTo
+      let turnText = !command && opts.replyTo
         ? `(Replying to ${opts.replyTo.author}'s earlier message: "${opts.replyTo.excerpt}")\n\n${text}`
         : text;
-      if (engineFresh && !nativeReplay) turnText = freshTurnText(transcript, turnText);
+      // In the turn's words, ahead of the person's, and never in the
+      // system prompt, which a resumed session keeps byte for byte for
+      // its cache (server/standing-prompt.ts).
+      if (recalledAhead) turnText = `${recalledAhead.block}\n\n${turnText}`;
+
+      // The story a new session is told is bounded, by the window of the
+      // engine about to hear it (its own word when it has measured this
+      // lane, the table's otherwise), never the whole transcript: told
+      // whole, a long conversation was a hundred thousand characters in
+      // one message, sent again with every tool call (GitHub 222). When
+      // the bound leaves messages out and the lane's engine can
+      // summarise, the older part is folded into the running summary
+      // first, so what is left out is carried by the summary instead.
+      const story = async (fold: boolean) => {
+        let bounded = boundHandoff(transcript, handoffTokens);
+        if (fold && bounded.left > 0 && (await foldContext(bot.id, task.id, false, handoffTokens).catch(() => false))) {
+          bounded = boundHandoff(buildTranscript().turns, handoffTokens);
+        }
+        return bounded;
+      };
+
+      // A resumed session that has grown past the line is compacted
+      // before this turn, so its tool calls do not each send the whole of
+      // it again (GitHub 222, 223). Claude Code is sent /compact from
+      // here; an engine that can compact itself is asked to in the turn;
+      // one that can do neither starts a new session told the bounded
+      // story. Only on the engine and model that made the reading, and
+      // never mid-turn: a turn already running is left to finish.
+      // a guest's mail resumes nothing, so it has nothing to compact
+      const resumable = engineFresh || guestMail ? undefined : task.resumeCursors[instanceId];
+      const compactNow =
+        !command &&
+        !nativeReplay &&
+        typeof resumable === "string" &&
+        ownReading !== null &&
+        compactBeforeTurn({
+          used: ownReading.used,
+          window: readingWindow(ownReading),
+          ...beforeTurnSettings(),
+          lastFrom: compactedFrom.get(task.id),
+        });
+      if (compactNow) compactedFrom.set(task.id, ownReading!.used);
+      const compactHere = compactNow && instance.driverKind === "claudeAgent";
+      const compactInTurn = compactNow && !compactHere && Boolean(instance.adapter.capabilities.compactsFirst);
+      const replaceSession = compactNow && !compactHere && !compactInTurn;
+      if (!command && engineFresh && !nativeReplay) {
+        const told = await story(true);
+        // no engine served it last when its session was dropped
+        // (store.dropSession), which is a new session, not another engine
+        turnText = freshTurnText(told.turns, turnText, { left: told.left, ...(task.lastInstanceId === "" ? { why: "session" as const } : {}) });
+      } else if (replaceSession) {
+        const told = await story(true);
+        turnText = freshTurnText(told.turns, turnText, { left: told.left, why: "session" });
+      }
+      if (missed) turnText = catchUpText(missed.turns, missed.by, turnText);
       const undone = undoneSince.get(task.id);
-      if (undone) {
+      if (undone && !command) {
         undoneSince.delete(task.id);
         const named = undone.slice(0, 20).join(", ") + (undone.length > 20 ? `, and ${undone.length - 20} more` : "");
         turnText = `(Since your last turn, the user undid your changes to: ${named}. Those files are back as they were before that turn.)\n\n${turnText}`;
+      }
+      const stalledNote = stalledSince.get(task.id);
+      if (stalledNote && !command) {
+        stalledSince.delete(task.id);
+        turnText = `${stallPreface(stalledNote)}\n\n${turnText}`;
       }
 
       // A credential of this agent's own, for this turn only. Given only
@@ -2531,34 +4772,80 @@ async function startTurn(
       //
       // Not in a shared room: the credential reaches the owner's whole
       // workspace, and the saved secrets ride in the same environment.
+      // Nor for a turn someone else asked for, such as mail from an
+      // address nobody listed: with it, that turn could file a routine
+      // or a watcher for the agent, and those run later as the owner's.
       const credential =
-        !sharing && runsAProcess(instance.driverKind) ? agentTokens.mint(bot.id, task.id, Date.now()) : null;
+        !sharing && owners && runsAProcess(instance.driverKind) ? agentTokens.mint(bot.id, task.id, Date.now()) : null;
+
+      // A session that has run the CLI before may have run it from a copy
+      // of Bloks that is no longer where it was. Said once, in the turn
+      // itself: an engine that keeps the first system prompt of a session
+      // never reads a newer one (GitHub 150).
+      const resumeCursor = ((engineFresh || replaceSession) && !command) || guestMail ? undefined : task.resumeCursors[instanceId];
+      // a refusal in a session that is already new is not asked again
+      // in another one: it would only be refused the same way
+      if (!blok && !command && resumeCursor === undefined) newSessionTurns.add(task.id);
+      else newSessionTurns.delete(task.id);
+      if (!command && credential && resumeCursor && task.briefedCli !== CLI_COMMAND) {
+        turnText = `${cliMovedNote(CLI_COMMAND, task.briefedCli)}\n\n${turnText}`;
+      }
+
+      // Claude Code keeps its system prompt byte for byte while a session
+      // resumes, so the prompt cache in front of the conversation holds
+      // (GitHub 193). What moved since is said ahead of the message, and
+      // so is what the room said since this session last heard it.
+      // Every other engine is told the whole persona each turn as before.
+      let standingNext: StandingRecord | null = null;
+      let persona = personaWith(standingNow);
+      if (instance.driverKind === "claudeAgent") {
+        const kept = standingFor(standing.get(task.id), standingNow, {
+          instanceId,
+          resuming: typeof resumeCursor === "string",
+        });
+        standingNext = command ? null : kept.next;
+        persona = personaWith(kept.system);
+        const ahead: string[] = [];
+        if (!command && kept.preamble) ahead.push(kept.preamble);
+        if (!command && blok) {
+          const seen = kept.next.roomSeen[blok.id];
+          const room = roomTranscript(roomId, bot.id, seen);
+          if (room.text) {
+            ahead.push(
+              seen
+                ? `(In this room since your last turn here:\n${room.text})`
+                : `(Recent conversation in this room:\n${room.text})`,
+            );
+          }
+          if (room.lastId) standingNext = { ...kept.next, roomSeen: { ...kept.next.roomSeen, [blok.id]: room.lastId } };
+        }
+        if (ahead.length) turnText = `${ahead.join("\n\n")}\n\n${turnText}`;
+      }
 
       // photographed before the agent can touch it, so the turn's card
       // can show what changed and put it back
-      // an agent working in its own workspace writes its memory there;
-      // that has its own journal, so it is not a change to undo here
       if (opts.rehearsal) {
-        const ownDesk = opts.rehearsal.dir === workspace.workspaceDir(bot.id);
         await checkpoints
-          .begin(task.id, bot.id, opts.rehearsal.dir, ownDesk ? ["MEMORY.md", "memory/"] : [], opts.rehearsal.copy)
+          .begin(task.id, bot.id, opts.rehearsal.dir, memoryPaths(bot.id, opts.rehearsal.dir), opts.rehearsal.copy)
           .catch(() => false);
       } else {
-        const ownDesk = turnCwd === workspace.workspaceDir(bot.id);
-        await checkpoints.begin(task.id, bot.id, turnCwd, ownDesk ? ["MEMORY.md", "memory/"] : []).catch(() => {});
+        await checkpoints.begin(task.id, bot.id, turnCwd, memoryPaths(bot.id, turnCwd)).catch(() => {});
       }
       memoryJournal.begin(task.id, bot.id);
 
       // what this turn runs on, and a fresh slate for what goes wrong in it
       laneEngine.set(task.id, selection);
+      engineAskedAt.set(task.id, Date.now());
       turnErrors.delete(task.id);
-      if (!opts.fallback) fellBack.delete(task.id);
       // Said once per rest, not once per turn: the first turn on the
       // backup explains itself, the rest of the afternoon does not.
-      if (selection !== own && !opts.fallback) {
+      if (selection !== own && !opts.fallback && !staying) {
         const why = ownRest ?? null;
-        if (!why || toldOfRest.get(task.id) !== why.until) {
-          if (why) toldOfRest.set(task.id, why.until);
+        const news = !why || restIsNews(toldOfRest.get(task.id), why);
+        // kept as last seen either way, so a reset that creeps with each
+        // rejected try is never mistaken for one that ended
+        if (why) toldOfRest.set(task.id, toldOf(why));
+        if (news) {
           const notice = store.appendMessage(roomId, {
             role: "bot",
             ...(blok ? { from: bot.id } : {}),
@@ -2571,7 +4858,7 @@ async function startTurn(
         }
       }
 
-      await instance.adapter.sendTurn({
+      const sending: SendTurnInput = {
         threadId: task.id,
         cwd: turnCwd,
         ...(credential
@@ -2581,7 +4868,8 @@ async function startTurn(
                 // engine starts a process per turn, so a value saved a
                 // moment ago is in this one without restarting anything.
                 // Listed first so a secret can never shadow the lines below.
-                ...(cfg.secrets ?? {}),
+                // Only on the owner's own turns: they are the owner's keys.
+                ...(owners ? usableSecrets(cfg.secrets) : {}),
                 BLOKS_URL: `http://127.0.0.1:${PORT}`,
                 BLOKS_TOKEN: credential.token,
                 BLOKS_CLI: AGENT_CLI,
@@ -2591,12 +4879,32 @@ async function startTurn(
         // its own workspace is always the agent's to edit: memory notes
         // must not queue approval cards behind a custom working folder.
         // Not in a shared room, where those notes are the owner's.
-        ...(onCloud || sharing ? {} : { extraDirs: [workspace.ensureWorkspace(bot.id)] }),
-        ...(sharing ? { shared: { tools: sharing.tools } } : {}),
+        ...(onCloud || sharing || guestMail ? {} : { extraDirs: [workspace.ensureWorkspace(bot.id)] }),
+        ...(sharing ? { shared: { tools: sharing.tools } } : guestMail ? { shared: { tools: "conversation" as const } } : {}),
+        // full access takes the engine's own guards off too; never in a
+        // shared room, where the approvals protect other people, and
+        // never for a turn the owner did not vouch for, whose approvals
+        // come to the owner and so need the guards that raise them
+        ...(bot.approvals === "full" && !sharing && owners ? { fullAccess: true } : {}),
+        ...(!owners && !sharing ? { untrusted: true } : {}),
         text: turnText,
+        ...(command && instance.driverKind === "codex" ? { compactOnly: true } : {}),
+        ...(skillNames.length ? { skillNames } : {}),
+        stallMs: stallLimitMs(),
         model: selection.model,
         effort: bot.effort,
-        resumeCursor: engineFresh ? undefined : task.resumeCursors[instanceId],
+        ...(bot.engineHooks === false ? { noHooks: true } : {}),
+        resumeCursor,
+        // If the session behind the cursor turns out to be gone, the new
+        // one is told the bounded story rather than nothing. Claude Code
+        // does not open a new session on its own, so it is not given one.
+        ...(typeof resumeCursor === "string" && !nativeReplay && instance.driverKind !== "claudeAgent"
+          ? (() => {
+              const told = boundHandoff(transcript, handoffTokens);
+              return { handoff: freshTurnText(told.turns, turnText, { left: told.left, why: "session" }) };
+            })()
+          : {}),
+        ...(compactInTurn ? { compactFirst: true } : {}),
         transcript,
         system:
           persona +
@@ -2609,12 +4917,151 @@ async function startTurn(
                 : integrations.sandbox
                   ? " You have your own Linux sandbox: a persistent shell and filesystem at /work, isolated from this person's machine. Use sandbox_exec for anything a shell can do. There is no display, so nothing can be clicked or screenshotted; work in files and commands."
                   : "") +
-          (credential ? `\n\n${cliBriefing(`node "${AGENT_CLI}"`)}` : "") +
-          (project ? `\n\n${briefFor(project)}` : ""),
+          (credential ? `\n\n${cliBriefing(CLI_COMMAND)}` : "") +
+          (project && !guestMail ? `\n\n${briefFor(project)}` : ""),
         integrations,
-      });
+      };
+      // What an idle compaction sends again later, so its request starts
+      // with the same tools and system prompt as this one and reads the
+      // cache this turn leaves. Not the words, the transcript, or the
+      // turn's credential and secrets. Not a shared room's lane, a
+      // rehearsal, or a turn on the Local VM, which has to be claimed.
+      if (instance.driverKind === "claudeAgent" && !sharing && !opts.rehearsal && !vmTurn) {
+        const {
+          text: _text,
+          transcript: _transcript,
+          env: _env,
+          resumeCursor: _cursor,
+          handoff: _handoff,
+          compactFirst: _compactFirst,
+          ...kept
+        } = sending;
+        lastSent.set(task.id, { instanceId, input: kept });
+      } else {
+        lastSent.delete(task.id);
+      }
+      // The engine as it is now. One rebuilt while this turn was getting
+      // ready (reloadProviders) is the one it goes to: the old one is
+      // gone, and nothing would hear the turn end on it.
+      await reloading;
+      let engine = registry.get(instanceId);
+      if (!engine) throw new Error(unavailableEngineMessage(instanceId));
+      // not for a turn already stopped: it ends at the check below
+      if (compactHere && !stoppedGettingReady.has(task.id)) {
+        const go = await compactThenSend(bot, task.id, roomId, engine, sending);
+        if (!go) {
+          // Stopped while the session was being compacted: the turn ends
+          // here, the way any stopped turn does, and the words wait.
+          bus.publish({
+            type: "turn.completed",
+            eventId: newId(),
+            provider: engine.driverKind,
+            providerInstanceId: instanceId,
+            threadId: task.id,
+            createdAt: new Date().toISOString(),
+            ok: false,
+            stopReason: "interrupted",
+          });
+          return;
+        }
+        // the session compacted is the one the words go into
+        const now = store.taskByThread(task.id)?.task.resumeCursors[instanceId];
+        if (typeof now === "string") sending.resumeCursor = now;
+        // and the engine as it is now: one rebuilt during the compaction
+        // ended it, and the old one is gone
+        await reloading;
+        engine = registry.get(instanceId);
+        if (!engine) throw new Error(unavailableEngineMessage(instanceId));
+      }
+      // Asked one last time, with nothing awaited between here and the
+      // engine. Getting ready can take a minute (a box waking, a
+      // checkpoint of a big folder), and an archive or a hold in that
+      // minute found the lane busy but no engine turn to interrupt. The
+      // turn then went out anyway, to an agent that had been put away,
+      // and its tools ran (GitHub 220). It is dropped instead, said so,
+      // and the lane is left as if it had never been asked.
+      const connectionChanged = opts.telegramBinding && !telegramConnectionCurrent(opts.telegramBinding);
+      // A stop pressed while this was getting ready is the same kind of
+      // thing: there was nothing to interrupt then, so it ends here.
+      const stopped = stoppedGettingReady.delete(task.id);
+      const withdrawn =
+        unsendable(bot.id) ??
+        (connectionChanged ? "This agent's Telegram connection changed before the message could start. The words remain unsent in the app." : null) ??
+        (stopped ? `Stopped before ${bot.name} had started on it.` : null);
+      if (withdrawn) {
+        if (connectionChanged) {
+          for (const id of telegramInputIds) {
+            const patch = store.patchMessage(task.id, id, { queued: false, unsent: true });
+            if (patch) broadcast({ kind: "message.patch", threadId: task.id, message: patch });
+          }
+        }
+        // a deleted agent's conversations are gone, and stay gone
+        if (store.bot(bot.id)) {
+          const notice = store.appendMessage(roomId, {
+            role: "bot",
+            ...(blok ? { from: bot.id } : {}),
+            kind: "notice",
+            text: withdrawn,
+          });
+          broadcast({ kind: "message", threadId: roomId, message: notice });
+        }
+        settleUnsent(withdrawn);
+        return;
+      }
+      // Read the choices and rest at dispatch: either can change while
+      // a turn is getting ready. The chat notice is not the dedupe, and
+      // a changed rest gets one correction with absolute past facts.
+      // A failure in this conversation keeps its original longer line.
+      const pendingFailure = command ? undefined : failureNotes.get(task.id);
+      const failedNote = pendingFailure?.text;
+      const chosen = store.bot(bot.id) ?? bot;
+      const pending = command ? undefined : awayOf(chosen, awayId);
+      // Fresh, not the rest this turn began with: one that ended while
+      // the turn got ready is not named, and its end is no correction.
+      const restNow = cooldowns.of(chosen.modelSelection.instanceId);
+      const changedRest = Boolean(restNow && pending && restIsNews(pending.rest, restNow));
+      // the rest as this conversation last saw it, so a creeping reset
+      // stays the same rest across many turns
+      if (pending && restNow && !changedRest) pending.rest = toldOf(restNow);
+      const at = pending?.at ?? turnSince;
+      const leaving = !command && sameSelection(chosen.modelSelection, own) && sameSelection(selection, chosen.backupSelection) && !sameSelection(selection, chosen.modelSelection) && (!pending || changedRest)
+        ? {
+            own: chosen.modelSelection,
+            backup: selection,
+            at,
+            rest: restNow && toldOf(restNow),
+            ...(() => {
+              const told = failedNote ?? (blok && staying && !restNow ? awayOf(chosen, task.id)?.note : undefined);
+              return told ? { note: told, switched: false } : { note: backupLine(chosen.modelSelection, selection, restNow, at), switched: true };
+            })(),
+          }
+        : undefined;
+      const returning = !command && sameSelection(pending?.own, selection) ? pending : undefined;
+      // A try of the resting own engine hears why the conversation moved,
+      // not the return line, which says it is back.
+      const tryNote = ownTry && returning?.switched ? backupLine(returning.own, returning.backup, restNow, returning.at, true) : undefined;
+      const note = failedNote ?? tryNote ?? returning?.note ?? leaving?.note;
+      if (note) {
+        sending.text = `${note}\n\n${sending.text}`;
+        if (sending.handoff) sending.handoff = `${note}\n\n${sending.handoff}`;
+      }
+      await engine.adapter.sendTurn(sending);
+      tryAccepted = true;
+      ownTry?.reservation.accepted();
+      // Keep an undelivered failure line, and never consume a newer failure.
+      if (pendingFailure && failureNotes.get(task.id) === pendingFailure) failureNotes.delete(task.id);
+      // A stopped preparation or a command did not hear this line. Keep
+      // the handover until an engine has actually accepted the turn.
+      if (leaving) away.set(awayId, leaving);
+      else if (returning && !ownTry) away.delete(awayId);
+      else if (returning && ownTry) {
+        const heard = ownTry.returned;
+        ownTry.returned = () => { if (away.get(awayId) === returning) away.delete(awayId); heard?.(); };
+      }
+      if (standingNext) standing.set(task.id, standingNext);
       if (integrations.computer) startScreenPoller(bot.id);
-      store.markTaskDispatched(bot.id, task.id, instanceId);
+      // A local command has not heard a pending engine handoff or CLI note.
+      if (!command) store.markTaskDispatched(bot.id, task.id, instanceId, credential ? CLI_COMMAND : undefined);
     } catch (e) {
       const message = redactSecrets(e instanceof Error ? e.message : String(e));
       const failure = store.appendMessage(roomId, {
@@ -2629,15 +5076,102 @@ async function startTurn(
         broadcast({ kind: "message", threadId: roomId, message });
         return message;
       });
-      activeRoom.delete(task.id);
-      laneRequester.delete(task.id);
-      if (sharing) broadcast({ kind: "room.activity", roomId: sharedRoom!.id, botId: bot.id, busy: false });
-      store.setTaskBusy(task.id, false);
-      turnStarted.delete(task.id);
-      broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
-      drainSteer(task.id);
+      settleUnsent(`Could not answer: ${message}`);
+    } finally {
+      if (!tryAccepted) claim.cancelPrimaryTry?.();
     }
   })();
+}
+
+/** The refusal an archived agent gives anything that would wake it. */
+function archivedRefusal(bot: { name: string }) {
+  return Object.assign(new Error(`${bot.name} is archived. Restore it to give it work.`), {
+    status: 409,
+    archived: true,
+  });
+}
+
+/** Why a turn already admitted must not reach its engine after all, in
+ * words for the lane, or null when it may go. */
+function unsendable(botId: string): string | null {
+  const now = store.bot(botId);
+  if (!now) return "The agent was deleted before this reached its engine, so it did not run.";
+  if (now.archivedAt) {
+    return `${now.name} was archived before this reached its engine, so it did not run. Restore ${now.name} and send it again if it is still wanted.`;
+  }
+  const hold = wheel.heldBy(botId);
+  if (hold) {
+    wheel.noteTurnedAway(botId);
+    return heldRefusal(hold, now.name);
+  }
+  return null;
+}
+
+/**
+ * Whatever registered to hear how a lane's turn ended hears it: a
+ * routine's run, a workflow's ask step, a job, the email being answered
+ * and the meeting being written up. Once per turn, from turn.completed,
+ * or `unsent` from a start that failed before reaching its engine, which
+ * otherwise left each of them waiting on an end that never came.
+ */
+function settleOwners(bot: BotRecord, laneId: string, outcome: { ok: boolean; why: string | null; unsent?: boolean; quiet?: boolean }) {
+  const { ok, why, unsent, quiet } = outcome;
+  // what the agent actually said; a turn that never ran said nothing,
+  // and the last reply in its lane belongs to an earlier one
+  const said = unsent ? "" : lastSaid(laneId);
+  // A failed turn may still be answered by a backup engine, so its mail
+  // waits a little for that (replyByMail). Nothing picks up a turn that
+  // never ran, and a sender left waiting would be emailed whatever the
+  // lane says next.
+  if (unsent) mailAnswering.delete(laneId);
+  else replyByMail(laneId, ok);
+  collectMeetingItems(laneId, ok);
+  // A routine's run ends where its turn does, and its summary is
+  // what the agent actually said: a row that only says "ok" answers
+  // half the question people are asking.
+  if (openRuns.has(laneId)) {
+    closeRun(laneId, {
+      ok,
+      summary: said || undefined,
+      error: ok ? undefined : (why ?? "The turn did not finish."),
+      ...(quiet ? { quiet: true } : {}),
+    });
+  }
+  // A workflow's ask step ends where its turn does, and what the
+  // agent actually said is the value the next step reads.
+  const onBehalfOf = workflowTurns.get(laneId);
+  if (onBehalfOf && workflows.run(onBehalfOf.runId)?.run.state === "running") {
+    workflowTurns.delete(laneId);
+    if (!ok) {
+      // A turn stopped because somebody took the computer is not the
+      // agent failing at the step. The run still fails, because the
+      // alternative is resuming a plan made before the person
+      // changed things, but it has to say who stopped it or it reads
+      // as a crash.
+      const failed = wheel.heldBy(bot.id)
+        ? `stopped: you took ${bot.name}'s computer`
+        : (why ?? "the turn did not finish");
+      endStep(onBehalfOf.runId, onBehalfOf.stepId, "failed", { error: failed });
+      finishRun(onBehalfOf.runId, "failed", failed);
+    } else {
+      endStep(onBehalfOf.runId, onBehalfOf.stepId, "ok", { summary: said });
+      workflows.update(onBehalfOf.runId, (run) => {
+        run.values[onBehalfOf.stepId] = { text: said };
+        run.cursor++;
+      });
+      // After the ended turn has finished settling its lane. The next step
+      // can start in this same lane at once, and the rest of the ending
+      // (its credential revoked, its lane state cleared) would otherwise
+      // land on the step that just began.
+      setTimeout(() => void advanceRun(onBehalfOf.runId).catch(() => {}), 0);
+    }
+  } else if (onBehalfOf) {
+    // the run stopped while its turn was still going
+    workflowTurns.delete(laneId);
+  }
+  // A job ends where its turn does too, and whether the agent took it
+  // or handed it back is in the same last thing they said.
+  if (openJobs.has(laneId)) settleJob(laneId, ok, said || (why ?? ""));
 }
 
 // ── shared rooms ──────────────────────────────────────────────────────
@@ -2646,11 +5180,28 @@ async function startTurn(
 // server/people.ts (who is in); what is here is how a shared room changes
 // an agent's turn. See notes in startTurn for each of these.
 
-/** Who started a lane's current turn: "owner", or a person id. Set when
- * a turn is dispatched and cleared when it ends. An approval raised by a
- * turn a member started always goes to the owner, whatever the owner's
- * standing rules and modes would have done on their own. */
+/** Who started a lane's current turn: "owner", a person id, or
+ * MAIL_FROM_ANYONE. Set when a turn is dispatched and cleared when it
+ * ends. An approval raised by a turn anyone but the owner started always
+ * goes to the owner, whatever the owner's standing rules and modes would
+ * have done on their own. */
 const laneRequester = new Map<string, string>();
+
+/** Who asked for each lane's latest turn, kept after it ends: a backup
+ * engine picking the turn up, or the same words asked again after a
+ * fold, go on with it for whoever asked, and not as the owner. */
+const askedLast = new Map<string, string>();
+
+/** The requester of a turn an email started when the Email settings let
+ * anyone write (no `allowFrom`). Whoever that is, the owner has not
+ * vouched for them, so the turn runs like one a member of a shared room
+ * asked for: approvals come to the owner as cards, allow rules and auto
+ * modes do not answer for it (deny rules still refuse), full access is
+ * off, and no saved secret is in its environment. Mail from an address
+ * the owner listed runs as the owner's own. */
+const MAIL_FROM_ANYONE = "mail:anyone";
+/** The conversation mail from an address nobody listed is answered in. */
+const UNLISTED_MAIL = "Unlisted email";
 
 /** Engines whose tools can be switched off for a shared room. Claude Code
  * takes --restricted and --tools; the API engines have no tools beyond
@@ -2671,6 +5222,77 @@ function sharedSafe(driverKind: string): boolean {
  */
 function ownerToolsSafe(bot: BotRecord): boolean {
   return registry.get(bot.modelSelection.instanceId)?.driverKind === "claudeAgent";
+}
+
+/**
+ * The facts the security checkup reads (server/security.ts), gathered
+ * from what is already stored. Names and counts only: no key, no secret's
+ * value, no device token, no webhook address. Engines are asked through
+ * the half minute cache, so opening the page runs no CLI it just ran.
+ */
+async function securityReport() {
+  const live = store.bots.filter((b) => !b.archivedAt);
+  // this machine is reachable only once its own computer-use bridge is set up
+  const machineBridge = Boolean(readCuaConnection());
+  const driverOf = (selection: ModelSelection) => registry.get(selection.instanceId)?.driverKind;
+  const used = new Map<string, number>();
+  for (const bot of live) {
+    for (const selection of [bot.modelSelection, bot.backupSelection]) {
+      if (selection?.instanceId) used.set(selection.instanceId, (used.get(selection.instanceId) ?? 0) + 1);
+    }
+  }
+  const signedOut: SecurityFacts["signedOut"] = [];
+  for (const [instanceId, agents] of used) {
+    const instance = registry.get(instanceId);
+    if (!instance || instance.enabled === false) continue;
+    const rest = cooldowns.of(instanceId);
+    const readiness = engineReadiness({ present: true, rest, snapshot: rest ? null : await recentSnapshot(instance) });
+    if (readiness.state === "signedOut") signedOut.push({ id: instanceId, name: instance.displayName ?? instance.driverKind, agents });
+  }
+  const toolsOf = (tools: RoomSharing["ownerTools"]) =>
+    [
+      tools?.connectors && "your apps",
+      tools?.mcp?.length && "your MCP servers",
+      tools?.browser && "a browser",
+      tools?.computer && "your computer",
+    ].filter((t): t is string => typeof t === "string");
+  const facts: SecurityFacts = {
+    agents: live.map((bot) => {
+      const kind = driverOf(bot.modelSelection);
+      return {
+        id: bot.id,
+        name: bot.name,
+        approvals: bot.approvals ?? "ask",
+        browser: bot.browser === true,
+        // "local", or left to decide for itself, which falls back to this
+        // machine whenever the agent has no cloud computer of its own
+        thisMachine: machineBridge && (bot.computer === "local" || bot.computer == null),
+        refusesUnlistedMail: Boolean(kind) && !sharedSafe(kind!),
+      };
+    }),
+    remote: {
+      // read from disk, where pairing keeps its devices
+      enabled: remoteEnabled(),
+      relay: Boolean(cfg.relay?.enabled),
+      devices: pairingStatus().devices.length,
+      memberDevices: memberDevices().length,
+    },
+    email: { enabled: Boolean(cfg.chat?.email?.enabled && cfg.chat.email.id), allowFrom: mailAllowList().length },
+    rooms: bloks.bloks.filter((b) => b.sharing).map((b) => ({ id: b.id, name: b.name, ownerTools: toolsOf(b.sharing!.ownerTools) })),
+    secrets: Object.keys(cfg.secrets ?? {}).sort(),
+    // the daily backup (server/backup.ts), which is on unless switched off
+    backups: { auto: cfg.backups?.auto !== false },
+    files: process.platform === "win32" ? null : filePermissions(DATA_DIR),
+    webhooks: webhooks.hooks.filter((h) => h.enabled).length,
+    signedOut,
+  };
+  const findings = checkup(facts);
+  return {
+    findings,
+    risky: findings.filter((f) => f.level === "risky").length,
+    look: findings.filter((f) => f.level === "look").length,
+    checkedAt: Date.now(),
+  };
 }
 
 /** Whether collaborators may answer approvals in this room right now.
@@ -2783,18 +5405,11 @@ function sharedLaneFor(bot: BotRecord, blok: BlokRecord) {
 // ── meeting notes (server/meetings.ts) ─────────────────────────────────
 
 const MEETINGS_FILE = join(DATA_DIR, "meetings.json");
-let meetings: Meeting[] = (() => {
-  try {
-    const parsed = JSON.parse(readFileSync(MEETINGS_FILE, "utf8"));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-})();
+let meetings: Meeting[] = readSaved(MEETINGS_FILE, [], Array.isArray);
 function saveMeetings() {
   try {
     mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-    writeFileSync(MEETINGS_FILE, JSON.stringify(meetings.slice(-50)), { mode: 0o600 });
+    writeFileAtomic(MEETINGS_FILE, JSON.stringify(meetings.slice(-50)), 0o600);
   } catch {
     /* kept in memory */
   }
@@ -2802,12 +5417,25 @@ function saveMeetings() {
 /** Lanes writing up a meeting, so the end of the turn collects the items. */
 const meetingLanes = new Map<string, string>();
 
+/** A write-up that failed, or never started, leaves its meeting to be
+ * written up again. Still marked with the lane, it would read as written
+ * up, and ending it again would be refused for good. Only while the lane
+ * is still this write-up's: a later try has a lane of its own. */
+function releaseMeeting(id: string, laneId: string) {
+  const meeting = meetings.find((m) => m.id === id);
+  if (!meeting || meeting.laneId !== laneId) return;
+  delete meeting.laneId;
+  saveMeetings();
+  broadcast({ kind: "meetings" });
+}
+
 function collectMeetingItems(laneId: string, ok: boolean) {
   const id = meetingLanes.get(laneId);
   if (!id) return;
   meetingLanes.delete(laneId);
   const meeting = meetings.find((m) => m.id === id);
-  if (!meeting || !ok) return;
+  if (!meeting) return;
+  if (!ok) return releaseMeeting(meeting.id, laneId);
   meeting.items = actionItems(lastSaid(laneId), store.bots.filter((b) => !b.archivedAt).map((b) => ({ id: b.id, name: b.name })));
   saveMeetings();
   broadcast({ kind: "meetings" });
@@ -2816,24 +5444,33 @@ function collectMeetingItems(laneId: string, ok: boolean) {
 // ── watchers (server/watchers.ts) ──────────────────────────────────────
 
 const WATCHERS_FILE = join(DATA_DIR, "watchers.json");
-let watchers: Watcher[] = (() => {
-  try {
-    const parsed = JSON.parse(readFileSync(WATCHERS_FILE, "utf8"));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-})();
+let watchers: Watcher[] = readSaved(WATCHERS_FILE, [], Array.isArray);
 function saveWatchers() {
   try {
     mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-    writeFileSync(WATCHERS_FILE, JSON.stringify(watchers), { mode: 0o600 });
+    writeFileAtomic(WATCHERS_FILE, JSON.stringify(watchers), 0o600);
   } catch {
     /* kept in memory; written next time */
   }
 }
-/** What a client sees: everything but the last look's contents. */
-const watcherView = ({ seen: _seen, seenItems: _items, ...rest }: Watcher) => rest;
+/** What a client sees: everything but the last look's contents, and
+ * whether it is paused because its agent is archived. */
+const watcherView = ({ seen: _seen, seenItems: _items, ...rest }: Watcher) => ({
+  ...rest,
+  ...(suspendedFor(rest.botId) ? { suspended: "archived" as const } : {}),
+});
+
+/**
+ * Whether an agent's schedules sit out because it is archived (GitHub
+ * 220). Their stored definitions are not touched, `enabled` included:
+ * flipping it would lose which ones the person had switched off
+ * themselves, and Restore has to bring back exactly what was there. So
+ * a routine or watcher of an archived agent is on and suspended, and
+ * everything that would run one asks this first.
+ */
+function suspendedFor(botId: string): boolean {
+  return Boolean(store.bot(botId)?.archivedAt);
+}
 const folderWatches = new Map<string, import("node:fs").FSWatcher>();
 const settleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const checking = new Set<string>();
@@ -2849,7 +5486,7 @@ function disarmWatcher(id: string) {
  * the minute tick is only a fallback for events the filesystem drops. */
 function armWatcher(w: Watcher) {
   disarmWatcher(w.id);
-  if (w.kind !== "folder" || !w.enabled) return;
+  if (w.kind !== "folder" || !w.enabled || suspendedFor(w.botId)) return;
   try {
     const fw = watch(w.target, { recursive: true }, () => {
       clearTimeout(settleTimers.get(w.id));
@@ -2874,28 +5511,91 @@ async function fetchWatched(url: string): Promise<string> {
   return text.slice(0, 2_000_000);
 }
 
-/** The lane a watcher's turns run in, made on first use. */
+/** Checks running right now, across every watcher. A few at a time is
+ * plenty for a schedule measured in minutes, and keeps a workspace full
+ * of slow checks from crowding the machine. */
+const MAX_CHECKS_AT_ONCE = 3;
+let runningChecks = 0;
+
+/** Where a check runs: the agent's working folder, as its turns do. */
+function checkFolder(bot: BotRecord): string {
+  return bot.cwd && existsSync(bot.cwd) ? bot.cwd : workspace.ensureWorkspace(bot.id);
+}
+
+/** What a check runs with: this machine's environment and the secrets
+ * saved for agents, never an agent's workspace credential, which lives
+ * for one turn and a check is not a turn. */
+function checkEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...usableSecrets(cfg.secrets) };
+  delete env.BLOKS_TOKEN;
+  return env;
+}
+
+const runsCommandsUnasked = (bot: BotRecord | null | undefined) => bot?.approvals === "auto" || bot?.approvals === "full";
+
+/**
+ * The lane a watcher's turns run in: the conversation it names, by id or
+ * by title, or the agent's first when it names none (GitHub 237). A title
+ * nobody has yet is made without moving the person off the one they have
+ * open. One titled as a watcher's own, "Watching: <name>", which is where
+ * every watcher spoke before, is its own lane (`laneId`), and closes with
+ * it (GitHub 166); the one it already has comes first, should another
+ * lane share its title.
+ */
 function watcherLane(w: Watcher, bot: BotRecord) {
-  const known = w.laneId ? bot.tasks.find((t) => t.id === w.laneId) : undefined;
-  if (known) return known;
+  const own = w.thread && w.laneId ? bot.tasks.find((t) => t.id === w.laneId && t.title === w.thread) : undefined;
+  const named = own ?? namedLane(bot, w.thread);
+  if (named) return named;
+  const title = w.thread!;
   const active = bot.activeTaskId;
-  const made = store.createTask(bot.id, `Watching: ${w.name}`.slice(0, 40));
-  if (!made) throw new Error(`${bot.name} has too many tasks open for a watcher lane. Close one.`);
+  const made = store.createTask(bot.id, title);
+  if (!made) throw new Error(laneLimitError(bot.name, bot.tasks.map((t) => t.title)));
   store.setActiveTask(bot.id, active);
-  w.laneId = made.id;
+  if (title.startsWith(WATCHING)) w.laneId = made.id;
   broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
   return store.bot(bot.id)!.tasks.find((t) => t.id === made.id)!;
+}
+
+/** Rename a lane. A watcher that speaks in it by its title follows the
+ * new one: otherwise its next fire would make a second lane under the old
+ * title, and closing the watcher would leave the renamed one behind. */
+function retitleLane(botId: string, laneId: string, title: string) {
+  const was = store.bot(botId)?.tasks.find((t) => t.id === laneId)?.title;
+  store.patchTaskTitle(botId, laneId, title);
+  const now = store.bot(botId)?.tasks.find((t) => t.id === laneId)?.title;
+  if (!was || !now || was === now) return;
+  const following = watchers.filter((w) => w.botId === botId && w.laneId === laneId && w.thread === was);
+  for (const w of following) w.thread = now;
+  if (following.length) {
+    saveWatchers();
+    broadcast({ kind: "watchers" });
+  }
+}
+
+/** Whether anyone but a watcher said something in a lane. Such a lane
+ * is somebody's conversation now, and outlives the watcher that made it. */
+function personSpokeIn(laneId: string) {
+  return store.messagesFor(laneId).some((m) => m.role === "user" && m.via !== "watcher");
 }
 
 async function fireWatcher(w: Watcher, bot: BotRecord, what: string) {
   const text = watcherTurn(w, what);
   if (w.mode === "rehearse") {
+    // a rehearsal keeps its own conversations, whatever the watcher names
     await openRehearsals([bot], text, { quiet: true, via: "watcher" });
   } else {
+    // Into the conversation the work belongs to, where its context is.
+    // Busy, or Bloks finishing up to restart, it waits in the same queue
+    // as a person's message would.
     const lane = watcherLane(w, bot);
-    const said = store.appendMessage(lane.id, { role: "user", kind: "text", text, via: "watcher" });
-    broadcast({ kind: "message", threadId: lane.id, message: said });
-    await startTurn(bot.id, text, { taskId: lane.id, presetMessage: true });
+    const chain = w.chain ? { chain: w.chain } : {};
+    if (laneWaits(lane)) {
+      queueOnLane(bot.id, lane.id, text, { via: "watcher", ...chain });
+    } else {
+      const said = store.appendMessage(lane.id, { role: "user", kind: "text", text, via: "watcher" });
+      broadcast({ kind: "message", threadId: lane.id, message: said });
+      await startTurn(bot.id, text, { taskId: lane.id, presetMessage: true, ...chain });
+    }
   }
   w.fires = [{ at: Date.now(), summary: what.split("\n")[0].slice(0, 160) }, ...w.fires].slice(0, 10);
 }
@@ -2909,20 +5609,65 @@ async function fireWatcher(w: Watcher, bot: BotRecord, what: string) {
 async function checkWatcher(id: string, manual = false): Promise<{ fired: boolean; note: string }> {
   const w = watchers.find((x) => x.id === id);
   if (!w) return { fired: false, note: "no such watcher" };
+  // Not a look that failed: no look at all. Recording one as an error
+  // every few minutes kept an archived agent's watcher busy and red,
+  // and moved its last look on for work nobody was there to do.
+  const owner = store.bot(w.botId);
+  if (owner?.archivedAt) return { fired: false, note: `${owner.name} is archived, so this watcher is paused until it is restored.` };
   if (checking.has(id)) return { fired: false, note: "already looking" };
   checking.add(id);
   try {
     const bot = store.bot(w.botId);
-    if (!bot || bot.archivedAt) throw new Error("its agent is gone or archived");
+    if (!bot) throw new Error("its agent is gone");
     const lane = w.laneId ? bot.tasks.find((t) => t.id === w.laneId) : undefined;
     if (lane?.busy || (w.kind === "folder" && bot.busy)) return { fired: false, note: `${bot.name} is working; it will look again shortly` };
+    // A person holding the agent would have its turn refused, so a look
+    // now would only use the change up. The first look after the release
+    // finds it instead (GitHub 135).
+    if (wheel.heldBy(bot.id)) return { fired: false, note: `${bot.name} is being held right now; it will look again once released` };
+    if (!checkAllowed(w, bot.approvals)) {
+      w.lastCheck = Date.now();
+      w.lastError = `Waiting for approval: its command does not run until ${hostName()} approves it here.`;
+      return { fired: false, note: w.lastError };
+    }
+    // An agent's watcher past the limit is held without looking, so
+    // whatever changed is still there for the look after the person's say.
+    if (chainPastLimit(w.chain ?? 0)) {
+      const why = chainHeld(w.chain!, `The watcher ${chainName(w.name)} did not look for ${chainName(bot.name)}.`);
+      // the person is told once a hold starts, not at every look it holds
+      const toldAlready = w.lastError === why;
+      w.lastCheck = Date.now();
+      w.lastError = why;
+      const speaksIn = w.laneId && w.thread ? bot.tasks.find((t) => t.id === w.laneId && t.title === w.thread) : undefined;
+      const lane = speaksIn ?? namedLane(bot, w.thread) ?? mainLaneOf(bot);
+      if (!toldAlready && lane) {
+        chainNotice(bot, lane.id, why);
+      }
+      return { fired: false, note: w.lastError };
+    }
 
     let what: string | null = null;
-    if (w.kind === "folder") {
+    // What this look saw, kept here until the turn it calls for has
+    // started: a turn refused now leaves the change to be found again.
+    const next: { seen?: string; seenItems?: string[] } = {};
+    if (w.kind === "check") {
+      if (runningChecks >= MAX_CHECKS_AT_ONCE) return { fired: false, note: "other checks are running; it will look again shortly" };
+      runningChecks++;
+      let result: Awaited<ReturnType<typeof runCheck>>;
+      try {
+        result = await runCheck(w.target, checkFolder(bot), checkEnv());
+      } finally {
+        runningChecks--;
+      }
+      const outcome = checkOutcome(result, w.seen);
+      if (outcome.error) throw new Error(outcome.error);
+      next.seen = outcome.seen;
+      what = outcome.what;
+    } else if (w.kind === "folder") {
       if (!existsSync(w.target)) throw new Error("the folder is not there any more");
       const now = folderSnapshot(w.target);
       if (w.seen) what = describeFolderChanges(folderChanges(JSON.parse(w.seen), now));
-      w.seen = JSON.stringify(now);
+      next.seen = JSON.stringify(now);
     } else if (w.kind === "page") {
       const text = pageText(await fetchWatched(w.target)).slice(0, 60_000);
       if (w.seen !== undefined && hashOf(text) !== hashOf(w.seen)) {
@@ -2932,7 +5677,7 @@ async function checkWatcher(id: string, manual = false): Promise<{ fired: boolea
           what = added.length ? added.map((line) => `+ ${line}`).join("\n") : "Some text was removed from the page.";
         }
       }
-      w.seen = text;
+      next.seen = text;
     } else {
       const items = parseFeed(await fetchWatched(w.target));
       if (w.seenItems) {
@@ -2940,7 +5685,7 @@ async function checkWatcher(id: string, manual = false): Promise<{ fired: boolea
         const fresh = items.filter((i) => !had.has(i.id)).slice(0, 5);
         if (fresh.length) what = fresh.map((i) => `- ${i.title}${i.link ? ` (${i.link})` : ""}`).join("\n");
       }
-      w.seenItems = [...new Set([...items.map((i) => i.id), ...(w.seenItems ?? [])])].slice(0, 400);
+      next.seenItems = [...new Set([...items.map((i) => i.id), ...(w.seenItems ?? [])])].slice(0, 400);
     }
     w.lastCheck = Date.now();
     w.lastError = undefined;
@@ -2953,6 +5698,9 @@ async function checkWatcher(id: string, manual = false): Promise<{ fired: boolea
         w.lastError = "Held back: it already started six turns in the last hour.";
       }
     }
+    // reached only if any turn this look called for has started
+    if ("seen" in next) w.seen = next.seen;
+    if (next.seenItems) w.seenItems = next.seenItems;
     return { fired, note: fired ? "changed, and the agent is on it" : what ? w.lastError ?? "" : manual ? "no change since the last look" : "" };
   } catch (e) {
     w.lastError = (e as Error).message.slice(0, 200);
@@ -2965,12 +5713,78 @@ async function checkWatcher(id: string, manual = false): Promise<{ fired: boolea
   }
 }
 
+/**
+ * One conversation per agent became the default (GitHub 237): a routine,
+ * a watcher or a webhook that names no conversation speaks in the agent's
+ * first. What was filed before keeps going where it went, so on the first
+ * start after the update each one that named none is given the
+ * conversation it already used: "Routines", "Webhooks", and for a watcher
+ * the lane of its own, by the title that lane has now. Nothing is moved
+ * or closed. Done once and noted in the config, so what is filed later
+ * without a conversation stays in the first one. Before the sweep below,
+ * which leaves a lane a watcher names alone.
+ */
+// Noted twice: in config.json, and in a file of its own that outlives a
+// config.json set aside as invalid. Done again after that, it would
+// send everything filed since the update back to the old lanes.
+// Bloks 2.5.36 knew the lane strangers' mail is answered in by its title
+// alone. An agent with no marked lane has its lane of that title marked,
+// so the protections follow it from here on, renamed or not.
+for (const bot of store.bots) {
+  if (bot.tasks.some((t) => t.guestMail)) continue;
+  const old = bot.tasks.find((t) => t.title === UNLISTED_MAIL);
+  if (old) store.markGuestMail(old.id);
+}
+
+const ONE_CONVERSATION_MARK = join(DATA_DIR, "one-conversation");
+if (typeof cfg.oneConversationAt !== "number" && !existsSync(ONE_CONVERSATION_MARK)) {
+  routines.nameUnnamed("Routines");
+  webhooks.nameUnnamed("Webhooks");
+  const unnamed = watchers.filter((w) => !w.thread);
+  for (const w of unnamed) {
+    const own = w.laneId ? store.bot(w.botId)?.tasks.find((t) => t.id === w.laneId) : undefined;
+    w.thread = own?.title ?? `${WATCHING}${w.name}`.slice(0, 40);
+  }
+  if (unnamed.length) saveWatchers();
+  cfg.oneConversationAt = Date.now();
+  // Neither note being written must stop Bloks starting. With both lost
+  // it is done again on the next start, which renames only what was filed
+  // in between with no conversation.
+  try {
+    writeFileAtomic(ONE_CONVERSATION_MARK, `${cfg.oneConversationAt}\n`, 0o600);
+  } catch {
+    /* config.json below, then */
+  }
+  try {
+    saveConfig({ oneConversationAt: cfg.oneConversationAt });
+  } catch {
+    /* the mark above, then */
+  }
+}
+
 for (const w of watchers) armWatcher(w);
+// Lanes of watchers removed before removing one closed its lane, which
+// can fill an agent's limit with nothing it may close (GitHub 166).
+// Nothing runs yet, so closing is just the store's.
+for (const bot of store.bots) {
+  for (const id of orphanWatcherLanes(bot.tasks, watchers, personSpokeIn)) deleteLane(bot.id, id);
+}
+// Rehearsal copies nobody applied or discarded are cleared now, and then
+// every hour while Bloks runs: a Mac that is never restarted would keep
+// them all. Not before this point, past the last wait of startup, since
+// settling one redraws its card and that is broadcast.
+const sweepRehearsals = () =>
+  void rehearsals
+    .sweep()
+    .then((changed) => changed && broadcast({ kind: "rehearsals" }))
+    .catch(() => {});
+sweepRehearsals();
+setInterval(sweepRehearsals, 60 * 60_000).unref?.();
 // Pages and feeds on their own schedules; folders as a fallback.
 setInterval(() => {
   const now = Date.now();
   for (const w of watchers) {
-    if (!w.enabled) continue;
+    if (!w.enabled || suspendedFor(w.botId)) continue;
     if ((w.lastCheck ?? 0) + w.every * 60_000 <= now) void checkWatcher(w.id);
   }
 }, 60_000).unref?.();
@@ -2981,6 +5795,13 @@ setInterval(() => {
  * start. Used by the Rehearse button and by watchers set to rehearse.
  */
 async function openRehearsals(bots: BotRecord[], text: string, opts: { quiet?: boolean; via?: Message["via"] } = {}) {
+  // Refused before any copy is made. A watcher set to rehearse keeps what
+  // it saw unseen, so it fires again at its first look once Bloks is back.
+  if (drain.on) {
+    throw Object.assign(new Error("Bloks is finishing what is running before it restarts. Rehearse this once it is back."), {
+      status: 503,
+    });
+  }
   const dir = rehearsalDir(bots[0]);
   if (!dir || !trackable(dir)) {
     throw Object.assign(new Error(`${bots[0].name}'s folder cannot be rehearsed: it is missing, or it is a whole home folder.`), { status: 400 });
@@ -3002,7 +5823,17 @@ async function openRehearsals(bots: BotRecord[], text: string, opts: { quiet?: b
     if (b.id !== bots[0].id || opts.quiet) store.setActiveTask(b.id, active);
     let r: Rehearsal;
     try {
-      r = await rehearsals.open({ group, botId: b.id, taskId: task.id, dir, text });
+      r = await rehearsals.open({
+        group,
+        botId: b.id,
+        taskId: task.id,
+        dir,
+        text,
+        // the folder as it is copied, which every turn in the copy is
+        // compared with; a photograph that fails here is tried again as
+        // the turn starts, rather than costing the rehearsal
+        photograph: (copy) => checkpoints.baseline(dir, copy, memoryPaths(b.id, dir)).catch(() => false),
+      });
     } catch (e) {
       store.deleteTask(b.id, task.id);
       throw Object.assign(new Error(`The folder could not be copied: ${(e as Error).message}`), { status: 500 });
@@ -3011,8 +5842,10 @@ async function openRehearsals(bots: BotRecord[], text: string, opts: { quiet?: b
     store.pinTaskCwd(task.id, r.copy);
     const said = store.appendMessage(task.id, { role: "user", kind: "text", text, ...(opts.via ? { via: opts.via } : {}) });
     broadcast({ kind: "message", threadId: task.id, message: said });
+    // the one the person asked, when somebody asked
+    if (!opts.quiet && b.id === bots[0].id) withYou({ bot: b }, said.at);
     broadcast({ kind: "bot", bot: clientBot(store.bot(b.id)) });
-    void startTurn(b.id, rehearsalBrief(r, text), { taskId: task.id, presetMessage: true, rehearsal: { dir, copy: r.copy } }).catch(async (e) => {
+    void startTurn(b.id, rehearsalBrief(r, text), { taskId: task.id, presetMessage: true, rehearsal: { dir, copy: r.copy }, byYou: !opts.quiet }).catch(async (e) => {
       const notice = store.appendMessage(task.id, { role: "bot", kind: "notice", text: `The rehearsal could not start: ${(e as Error).message}` });
       broadcast({ kind: "message", threadId: task.id, message: notice });
       await rehearsals.settle(r.id, "failed");
@@ -3024,31 +5857,282 @@ async function openRehearsals(bots: BotRecord[], text: string, opts: { quiet?: b
   return { group, dir, attempts };
 }
 
+function laneIndex(threadId: string): TermIndex {
+  return recallIndexes.get(threadId, () => indexMessages(store.messagesFor(threadId)));
+}
+
+/** One place recall reaches, with what the person calls it beside what
+ * the agent is told, for the notes a turn shows it was given. */
+interface RecallPlace {
+  threadId: string;
+  where: string;
+  kind: "conversation" | "room" | "memory";
+  label: string;
+}
+
 /**
- * What an agent can look back through (server/recall.ts): its own lanes
- * and the rooms it sits in. A lane that belongs to a room shared with
- * other people reaches that room only, so a guest cannot ask their way
- * into the owner's private conversations.
+ * Where an agent can look back (server/recall.ts): its own lanes and the
+ * rooms it sits in. A lane that belongs to a room shared with other
+ * people reaches that room only, so a guest cannot ask their way into the
+ * owner's private conversations. The lane that answers mail from anyone
+ * reaches nothing, and nothing reaches it: what strangers wrote is not
+ * the owner's past to bring up.
  */
-function recallSources(bot: BotRecord, laneId?: string | null): RecallSource[] {
+function recallPlaces(bot: BotRecord, laneId?: string | null): { places: RecallPlace[]; private: boolean } {
+  const lane = laneId ? bot.tasks.find((task) => task.id === laneId) : undefined;
+  if (lane?.guestMail) return { places: [], private: false };
   const sharedRoom = laneId ? bloks.bloks.find((b) => b.sharing && b.lanes?.[bot.id] === laneId) : undefined;
-  if (sharedRoom) return [{ threadId: sharedRoom.id, where: `room ${sharedRoom.name}`, messages: store.messagesFor(sharedRoom.id) }];
+  if (sharedRoom) {
+    return { places: [{ threadId: sharedRoom.id, where: `room ${sharedRoom.name}`, kind: "room", label: sharedRoom.name }], private: false };
+  }
   const sharedLanes = new Set(bloks.bloks.filter((b) => b.sharing).map((b) => b.lanes?.[bot.id]).filter(Boolean));
-  const sources: RecallSource[] = bot.tasks
-    .filter((task) => !sharedLanes.has(task.id))
-    .map((task) => ({ threadId: task.id, where: `your conversation "${task.title}"`, messages: store.messagesFor(task.id) }));
+  const places: RecallPlace[] = bot.tasks
+    .filter((task) => !sharedLanes.has(task.id) && !task.guestMail)
+    .map((task) => ({ threadId: task.id, where: `your conversation "${task.title}"`, kind: "conversation" as const, label: task.title }));
   for (const room of bloks.bloks) {
     if (room.sharing || !room.memberIds.includes(bot.id)) continue;
-    sources.push({ threadId: room.id, where: `room ${room.name}`, messages: store.messagesFor(room.id) });
+    places.push({ threadId: room.id, where: `room ${room.name}`, kind: "room", label: room.name });
   }
-  return sources;
+  return { places, private: true };
+}
+
+type PlacedSource = IndexedSource & { place: RecallPlace };
+
+/** The agent's memory files as places to search: MEMORY.md and its
+ * topic files, or the topic files alone. */
+function memorySources(bot: BotRecord, which: "all" | "topics"): PlacedSource[] {
+  return workspace.memoryFiles(bot.id).flatMap((file) => {
+    if (which === "topics" && file.name === "MEMORY.md") return [];
+    const index = recallIndexes.get(`memory:${bot.id}:${file.name}`, () => indexMemory(file.read(), file.mtimeMs), file.stamp);
+    if (!index.docs.length) return [];
+    const place: RecallPlace = { threadId: `memory:${file.name}`, where: `your memory file ${file.name}`, kind: "memory", label: file.name };
+    return [{ threadId: place.threadId, where: place.where, index, memory: file.name, place }];
+  });
+}
+
+/** Everything recall searches from `laneId`, indexed. Memory comes along
+ * wherever the agent's private conversations do, and never into a shared
+ * room or a stranger's mail. */
+function recallSources(bot: BotRecord, laneId?: string | null, options: { memory?: "all" | "topics"; except?: string } = {}): PlacedSource[] {
+  const reach = recallPlaces(bot, laneId);
+  const sources: PlacedSource[] = reach.places
+    .filter((place) => place.threadId !== options.except)
+    .map((place) => ({ threadId: place.threadId, where: place.where, index: laneIndex(place.threadId), messages: store.messagesFor(place.threadId), place }));
+  return reach.private ? [...sources, ...memorySources(bot, options.memory ?? "all")] : sources;
+}
+
+/** The cache back under budget, once a search is done with it. */
+function recallDone() {
+  recallIndexes.trim();
+}
+
+/** One message in full, from the places recall searches and nowhere
+ * else, for a hit recall cut short (GitHub 143). */
+function recalledMessage(bot: BotRecord, messageId: string, laneId?: string | null) {
+  for (const place of recallPlaces(bot, laneId).places) {
+    const message = store.messagesFor(place.threadId).find((m) => m.id === messageId);
+    if (!message || message.deleted || !message.text) continue;
+    return { messageId, threadId: place.threadId, where: place.where, at: message.at, ...speakerFor(bot)(message), text: message.text };
+  }
+  return null;
 }
 
 function recallFor(bot: BotRecord, query: string, laneId?: string | null, limit = 8) {
+  const sources = recallSources(bot, laneId);
+  const hits = recallFrom(query, sources, speakerFor(bot), { limit });
+  recallDone();
+  return hits;
+}
+
+/** What recall before a turn may add at most: three excerpts of about
+ * five hundred characters each, about 1,500 in all, found by a hit that
+ * shares at least two of the person's words and holds at least this
+ * share of what makes them particular (their words, each weighted by how
+ * rare it is in the agent's past), and scores at least this much. */
+const RECALL_AHEAD = { notes: 3, chars: 500, recent: 40, strength: 0.45, score: 4.5 };
+
+const flatWords = (text: string) => text.replace(/[…\s]+/g, " ").trim().toLowerCase();
+
+/**
+ * Before the person's own turn in one of an agent's conversations, the
+ * best of what was said in the agent's other conversations, or kept in
+ * its memory topic files, that matches what the person just said. Not
+ * MEMORY.md, which the standing prompt already carries, and not this
+ * conversation, which the agent already has.
+ *
+ * Conservative on purpose: a note that is beside the point costs the
+ * agent attention and the person trust, so nothing comes back unless it
+ * clears the bar in RECALL_AHEAD, and nothing the agent was given in this
+ * conversation's recent messages, or that those messages already say,
+ * is given again.
+ */
+function recallAhead(bot: BotRecord, laneId: string, words: string): { notes: RecalledNote[]; block: string } | null {
+  if (termsOf(words).length < 2) return null;
+  const sources = recallSources(bot, laneId, { memory: "topics", except: laneId });
+  if (!sources.length) return null;
+  const recent = store.messagesFor(laneId).slice(-RECALL_AHEAD.recent);
+  const told = new Set(recent.flatMap((m) => (m.recalled ?? []).flatMap((note) => [`${note.threadId ?? note.memory}/${note.messageId}`, flatWords(note.text)])));
+  const said = [...recent.filter((m) => !m.deleted && m.text).map((m) => flatWords(m.text!)), flatWords(words)];
+  const hits = recallFrom(words, sources, speakerFor(bot), {
+    limit: RECALL_AHEAD.notes * 2,
+    need: () => 2,
+    minStrength: RECALL_AHEAD.strength,
+    minScore: RECALL_AHEAD.score,
+    excerpt: RECALL_AHEAD.chars,
+    skip: (source, doc) => told.has(`${source.memory ?? source.threadId}/${doc.id}`),
+  })
+    .filter((hit) => {
+      const core = flatWords(hit.text);
+      return !told.has(core) && !said.some((line) => line.includes(core));
+    })
+    .slice(0, RECALL_AHEAD.notes);
+  recallDone();
+  if (!hits.length) return null;
+  const places = new Map(sources.map((source) => [source.threadId, source.place]));
+  const notes = hits.map((hit): RecalledNote => {
+    const place = places.get(hit.threadId)!;
+    return hit.memory
+      ? { kind: "memory", memory: hit.memory, messageId: hit.messageId, where: place.label, at: hit.at, text: hit.text }
+      : { kind: place.kind, threadId: hit.threadId, messageId: hit.messageId, where: place.label, at: hit.at, who: noteWho(bot, hit), text: hit.text };
+  });
+  return { notes, block: recallBlock(hits) };
+}
+
+/** Who said a recalled line, as the person reads it under their message. */
+function noteWho(bot: BotRecord, hit: RecallHit): string {
+  if (hit.by === "person") return "You";
+  if (hit.by === "self") return bot.name;
+  return hit.who;
+}
+
+/** Who said a message, as recall reports it. A message another agent
+ * sent lands as a user message with the sender in `agent`; reading only
+ * the role named it the person (GitHub 136). */
+function speakerFor(bot: BotRecord) {
   const person = cfg.profile?.name?.trim() || "the person";
-  return recall(query, recallSources(bot, laneId), (message) =>
-    message.role === "user" ? person : message.from ? (store.bot(message.from)?.name ?? "an agent") : bot.name,
-  limit);
+  return (message: RecallMessage): Speaker => {
+    if (message.agent?.dir === "in") {
+      return { who: store.bot(message.agent.peerId)?.name ?? message.agent.peerName, by: "agent", agentId: message.agent.peerId };
+    }
+    if (message.role === "user") {
+      if (message.author) return { who: people.person(message.author)?.name ?? "a member", by: "member" };
+      return { who: person, by: "person" };
+    }
+    if (message.from && message.from !== bot.id) return { who: store.bot(message.from)?.name ?? "an agent", by: "agent", agentId: message.from };
+    return { who: bot.name, by: "self", agentId: bot.id };
+  };
+}
+
+/** Why `callerId` may stop `targetId`'s turn, or null when it may not:
+ * it hired that agent, or it outranks it in a room they are both in. The
+ * same seniority that gives the lead the final call in a room (GitHub 141). */
+function mayStop(callerId: string, targetId: string): "hired" | "senior" | null {
+  const target = store.bot(targetId);
+  const caller = store.bot(callerId);
+  if (!target || !caller || callerId === targetId) return null;
+  if (target.hiredBy === callerId) return "hired";
+  const outranks = (caller.seniority ?? 1) > (target.seniority ?? 1);
+  if (outranks && bloks.bloks.some((room) => room.memberIds.includes(callerId) && room.memberIds.includes(targetId))) return "senior";
+  return null;
+}
+
+/**
+ * What still ties an agent to work, in words: why an agent that hired it
+ * may not archive it yet (GitHub 148). Archiving is for an agent whose
+ * work is done, so anything running, waiting or scheduled is a reason to
+ * leave it be and say so, never something to cancel on its behalf.
+ */
+function pendingWork(bot: BotRecord): string[] {
+  const lanes = new Set(bot.tasks.map((t) => t.id));
+  const named = (titles: string[]) => titles.map((t) => `"${t}"`).join(", ");
+  const out: string[] = [];
+  const busy = bot.tasks.filter((t) => t.busy);
+  if (busy.length) out.push(`it is working in ${named(busy.map((t) => t.title))}`);
+  const queued = bot.tasks.filter((t) => store.messagesFor(t.id).some((m) => m.queued && !m.unsent && !m.deleted));
+  if (queued.length) out.push(`messages are waiting for it in ${named(queued.map((t) => t.title))}`);
+  const asks = [...askThreadByRequest.values()].filter((thread) => lanes.has(thread)).length;
+  if (asks) out.push(`${asks} question${asks === 1 ? " is" : "s are"} waiting on an answer`);
+  const claimed = jobs.list().filter((j) => j.claimedBy === bot.id && j.state === "claimed");
+  if (claimed.length) out.push(`it has claimed ${claimed.length === 1 ? "a job" : `${claimed.length} jobs`} on the board`);
+  const scheduled = routines.routines.filter((r) => r.enabled && r.targetKind === "agent" && (r.targetId === bot.id || lanes.has(r.targetId)));
+  if (scheduled.length) out.push(`${scheduled.length === 1 ? "a routine is" : `${scheduled.length} routines are`} on for it`);
+  const watching = watchers.filter((w) => w.botId === bot.id && w.enabled);
+  if (watching.length) out.push(`${watching.length === 1 ? "a watcher is" : `${watching.length} watchers are`} on for it`);
+  const hooks = webhooks.for({ botId: bot.id }).filter((h) => h.enabled);
+  if (hooks.length) out.push(`${hooks.length === 1 ? "a webhook points" : `${hooks.length} webhooks point`} at it`);
+  const runs = workflows
+    .list()
+    .filter((w) => w.trigger?.targetId === bot.id || w.steps?.some((step) => step.targetId === bot.id))
+    .flatMap((w) => (w.runs ?? []).filter((r) => r.state === "running" || r.state === "waiting"));
+  if (runs.length) out.push(`${runs.length === 1 ? "a workflow run involving it is" : `${runs.length} workflow runs involving it are`} not finished`);
+  if (wheel.heldBy(bot.id)) out.push("it is on hold");
+  return out;
+}
+
+/**
+ * What archiving does to work, whichever way an agent was archived: the
+ * person's menu, hiding it, or the agent that hired it (GitHub 220).
+ * Called once the archive is on record, so a turn that was admitted but
+ * had not reached its engine yet finds it there and is dropped, and
+ * anything a running turn asks for from now on is refused.
+ *
+ * Every running turn is stopped, and waited for: an engine that acts
+ * without asking only stops for certain when its process has gone, and
+ * the archive is not reported done before then.
+ */
+async function windDown(bot: BotRecord) {
+  await Promise.all(
+    bot.tasks
+      .filter((t) => t.busy)
+      .map(async (lane) => {
+        cutOff.stop(lane.id);
+        if (cancelRecovery(bot, lane.id, "Stopped. It will not be asked again.")) return;
+        await laneInstance(bot, lane.id)?.adapter.interruptTurn(lane.id).catch(() => {});
+      }),
+  );
+  stopScreenPoller(bot.id);
+  terminals.close(bot.id);
+  // its browser goes the way its shells do; the profile, and its
+  // sign-ins, stay for a Restore
+  void closeBrowser(join(DATA_DIR, "browser", bot.id)).catch(() => {});
+  // A hold naming an agent that cannot act would sit in the activity
+  // panel forever.
+  wheel.release(bot.id);
+  // Per turn credentials, in memory, nothing to keep.
+  agentTokens.revokeBot(bot.id);
+  // Its folder watches stop listening. Its routines and the rest of its
+  // watchers are skipped while it is archived (see suspendedFor); none
+  // of their definitions change.
+  for (const w of watchers) if (w.botId === bot.id) disarmWatcher(w.id);
+  broadcast({ kind: "routines" });
+  broadcast({ kind: "watchers" });
+}
+
+/**
+ * The other half, on Restore: its schedules run again exactly as they
+ * were left, and the person is told which ones in the agent's own
+ * conversation. Routines and watchers waking up again with no word was
+ * the surprise this is here to avoid.
+ */
+function resumeSchedules(bot: BotRecord) {
+  for (const w of watchers) if (w.botId === bot.id) armWatcher(w);
+  broadcast({ kind: "routines" });
+  broadcast({ kind: "watchers" });
+  const now = new Date();
+  const resumed = [
+    ...routines.routines
+      .filter((r) => r.enabled && r.targetKind === "agent" && r.targetId === bot.id && nextScheduledAfter(r, now))
+      .map((r) => `the routine ${r.name ? `"${r.name}" (${describeRoutine(r)})` : describeRoutine(r)}`),
+    ...watchers.filter((w) => w.enabled && w.botId === bot.id).map((w) => `the watcher "${w.name}"`),
+  ];
+  if (!resumed.length) return;
+  const listed = resumed.length === 1 ? resumed[0] : `${resumed.slice(0, -1).join(", ")} and ${resumed.at(-1)}`;
+  const notice = store.appendMessage(bot.threadId, {
+    role: "bot",
+    kind: "notice",
+    text: `${bot.name} is restored, and what it does on its own has resumed: ${listed}. ${resumed.length === 1 ? "It was" : "They were"} paused while ${bot.name} was archived. Switch any of them off in Routines or Watchers if it should stay quiet.`,
+  });
+  broadcast({ kind: "message", threadId: bot.threadId, message: notice });
 }
 
 /** The owner's name as members see it. */
@@ -3128,12 +6212,22 @@ function roomPeopleFrame(roomId: string) {
   });
 }
 
-/** Takes a person's access away entirely: devices, relay token. Used when
- * they leave or are removed from their last room. */
+/** Closes a person's open streams and revokes their relay token. Their
+ * paired devices are revoked earlier, by removeMemberFromRoom, while the
+ * membership still stands. Used when they leave or are removed from
+ * their last room. */
 async function revokeMember(personId: string, relayTokenHash?: string) {
-  revokePerson(personId);
   closeMemberStreams(personId);
   if (relayTokenHash) await relayLink.revokeClient(relayTokenHash);
+}
+
+/** Removes a person from a room. When it is their last room, their
+ * paired devices are revoked first, while the membership still stands,
+ * so a refused settings read leaves both unchanged. */
+function removeMemberFromRoom(personId: string, roomId: string) {
+  return people.removeFromRoom(personId, roomId, (roomless) => {
+    if (roomless) revokePerson(personId);
+  });
 }
 
 /** Stops sharing a room: every member out, every open invite closed,
@@ -3146,12 +6240,14 @@ async function stopSharing(roomId: string) {
     if (inv.relayTokenHash) await relayLink.revokeClient(inv.relayTokenHash);
   }
   for (const m of members) {
-    const { roomless } = people.removeFromRoom(m.personId, roomId);
+    const { roomless } = removeMemberFromRoom(m.personId, roomId);
     if (roomless) await revokeMember(m.personId, m.person.relayTokenHash);
   }
   const blok = bloks.unshare(roomId);
   if (blok) broadcast({ kind: "blok", blok });
   roomPeopleFrame(roomId);
+  // the room's own browser has nobody left to serve
+  void closeBrowser(join(DATA_DIR, "browser", `room-${roomId}`)).catch(() => {});
 }
 
 /** The link an invite travels as. Everything after the # stays in the
@@ -3170,13 +6266,6 @@ function inviteLink(input: { inviteId: string; secret: string; relayToken: strin
 }
 
 // ── rooms ─────────────────────────────────────────────────────────────
-/**
- * How many agent-triggered turns may follow one human message. Without a
- * ceiling two agents that keep naming each other would talk forever, on
- * the user's tokens and without their attention.
- */
-const MAX_AGENT_HOPS = 3;
-
 /** Post into a room and wake whoever it was addressed to. */
 /** One dispatch loop per room at a time; latecomers chain behind it. */
 const roomPosting = new Map<string, Promise<unknown>>();
@@ -3191,6 +6280,10 @@ interface RoomAuthor {
   hops: number;
   toAll?: boolean;
   replyTo?: ReplyRef;
+  /** The person wrote it, in the app. A routine's post has no author
+   * either, so this is said rather than worked out: it decides whether
+   * the members' answers are replies to the person. */
+  byYou?: boolean;
 }
 
 async function postToRoom(blok: BlokRecord, text: string, author: RoomAuthor) {
@@ -3209,7 +6302,7 @@ function enqueueRoomPost(blok: BlokRecord, text: string, author: RoomAuthor) {
     ...(author.via ? { via: author.via } : {}),
     kind: "text",
     text,
-    queued: Boolean(previous),
+    ...(previous ? { queued: true, queuedAt: Date.now() } : {}),
     ...(author.replyTo ? { replyTo: author.replyTo } : {}),
   });
   broadcast({ kind: "message", threadId: blok.id, message });
@@ -3217,11 +6310,10 @@ function enqueueRoomPost(blok: BlokRecord, text: string, author: RoomAuthor) {
     const current = store.messagesFor(blok.id).find((m) => m.id === message.id);
     const room = bloks.get(blok.id);
     if (!room || !current || current.deleted) return message;
-    if (current.queued) {
-      const patched = store.patchMessage(blok.id, message.id, { queued: false });
-      broadcast({ kind: "message.patch", threadId: blok.id, message: patched! });
-    }
-    return postToRoomNow(room, current.text ?? text, author, current);
+    // into the room's history after what the room said while it waited
+    if (current.queued) deliverQueued(blok.id, [message.id]);
+    const delivered = store.messagesFor(blok.id).find((m) => m.id === message.id) ?? current;
+    return postToRoomNow(room, delivered.text ?? text, author, delivered);
   });
   roomPosting.set(blok.id, run);
   const cleanup = () => {
@@ -3240,6 +6332,10 @@ function enqueueRoomPost(blok: BlokRecord, text: string, author: RoomAuthor) {
 }
 
 async function postToRoomNow(blok: BlokRecord, text: string, author: RoomAuthor, message: Message) {
+  // The person (or a member, or something they set up) has had a say.
+  // Cleared as it goes out rather than when it was posted, since a round
+  // still running ahead of it could set the place again in between.
+  if (!author.botId) roomChain.delete(blok.id);
   const members = blok.memberIds.map((id) => store.bot(id)).filter(Boolean) as BotRecord[];
   // Whether the room has anybody in it and whether anybody in it can
   // answer are two questions, and they used to be the same list. An
@@ -3298,30 +6394,270 @@ async function postToRoomNow(blok: BlokRecord, text: string, author: RoomAuthor,
     broadcast({ kind: "message", threadId: blok.id, message: notice });
   }
 
+  await dispatchRound(
+    blok.id,
+    targets.map((id) => [id, text] as const),
+    author.hops,
+    requester,
+    author.byYou,
+  );
+  return message;
+}
+
+/** `byYou` is the first round's: whoever the person's message woke is
+ * answering them, and whoever those name in turn is answering an agent.
+ * `hops` is the first round's too, the count its turns start with
+ * (turnHops); whoever is named after that waits with their own. */
+async function dispatchRound(
+  roomId: string,
+  work: ReadonlyArray<readonly [string, string]>,
+  hops: number,
+  requester?: string,
+  byYou?: boolean,
+) {
   // While this loop runs, handoffs queue instead of firing. Otherwise the
   // lead would be pulled in the moment the first member reported, spend
   // its expensive turn on a third of the work, and get pulled in again for
   // each of the rest.
-  const queue = new Map<string, string>();
-  dispatching.set(blok.id, queue);
+  const queue = new Map<string, RoundTag>();
+  dispatching.set(roomId, queue);
   try {
-    await speakInTurn(
-      blok.id,
-      targets.map((id) => [id, text] as const),
-      author.hops,
-      requester,
-    );
+    await speakInTurn(roomId, work.map(([id, text]) => [id, text, hops] as const), requester, byYou);
     // whoever was named while the room was busy speaks now, and anyone
     // they name in turn goes round again until the chain runs out
     for (let round = 0; round < MAX_AGENT_HOPS && queue.size; round++) {
-      const waiting = [...queue];
+      const waiting = [...queue].map(([id, tag]) => [id, tag.text, tag.hops] as const);
       queue.clear();
-      await speakInTurn(blok.id, waiting, author.hops + round + 1, requester);
+      await speakInTurn(roomId, waiting, requester);
+    }
+    // Someone can still be named when the rounds run out: an agent that
+    // said so into the room from a turn of its own elsewhere, late in the
+    // last one, was inside its own count. Held as a mention past the
+    // bound is, and said, where it used to be dropped without a word.
+    for (const from of new Set([...queue.values()].map((tag) => tag.from))) {
+      const names = [...queue].filter(([, tag]) => tag.from === from).flatMap(([id]) => store.bot(id)?.name ?? []);
+      if (names.length) sayMentionHeld(roomId, hopsNotice(store.bot(from)?.name ?? "An agent", names));
     }
   } finally {
-    dispatching.delete(blok.id);
+    dispatching.delete(roomId);
   }
-  return message;
+}
+
+/** Lanes whose running turn was started by another agent's message, so
+ * what it says carries that context (Message.afterAgent). */
+const replyingTo = new Map<string, { peerId: string; peerName: string }>();
+/** Lanes whose agent-started turn said something in the chat. One that
+ * finished without a word has nothing for the person to read, so it does
+ * not mark the conversation unread. */
+const spokeInTurn = new Set<string>();
+
+/** How many turns in a row agents may start in one another, or in
+ * themselves, with `bloks say` before the person has a say. Each one is
+ * a paid turn, and a turn's own budget (TURN_BUDGET in
+ * server/agent-cli.ts) starts again in every one of them, so nothing
+ * else stops two agents keeping each other going all afternoon. The
+ * workspace limit defaults to twelve, and the person may set it from 1
+ * to 50 (server/agent-chain.ts). Rooms have their own bound as well
+ * (MAX_AGENT_HOPS in server/room-hops.ts). */
+function agentLimit(): number { return agentTurnLimit(cfg.agents?.turnLimit); }
+function chainPastLimit(depth: number): boolean { return pastAgentLimit(depth, agentLimit()); }
+/** The place a message, job, routine or watcher from the turn in
+ * `laneId` takes: one past that turn's own. */
+function nextAgentChain(laneId: string): number {
+  return (agentChain.get(laneId) ?? 0) + 1;
+}
+
+/** Where each lane's latest turn sits in a chain of agents' messages: 0
+ * for one the person, a routine, a watcher, a webhook or an email
+ * started, and one more than the sender's own turn for one another
+ * agent's message started. Kept in memory rather than on the lane
+ * record: a restart begins every chain again, which lets a loop that
+ * spans one run a single stretch more at most, and nothing is left on
+ * disk for a closed lane or an old version to carry. */
+const agentChain = new Map<string, number>();
+
+/** How far along a chain of agents' messages a room is: the place of the
+ * latest agent's message that named someone there, until anyone else
+ * posts. A room turn that waited (a busy agent's line, or one named mid
+ * round) starts from it; one woken at once is handed its place directly.
+ * Otherwise an agent could keep another going by naming it in a room from
+ * a conversation, and be written back to from that room, without either
+ * chain ever growing. The latest rather than the highest, so a loop that
+ * stopped yesterday does not hold back what is asked today. */
+const roomChain = new Map<string, number>();
+
+/** How many times in a row agents had passed a room along when each
+ * lane's latest turn started: 0 for one anything but a room mention
+ * started (the person, a routine, a watcher, a webhook, an email, an
+ * agent's direct `bloks say`), and one more than the turn that named it
+ * for one a mention started. A pickup, a backup engine or a retry keeps
+ * the count of the turn it continues. Kept with the turn, as agentChain
+ * is, and not with the agent: an agent's count outlived the room chain
+ * it came from, and held what that agent said from an unrelated turn
+ * afterwards (GitHub 268). */
+const turnHops = new Map<string, number>();
+
+/** A message an agent sent with `bloks say`, to another agent or to
+ * itself: who sent it, and the place in the chain the turn it starts
+ * would take, one more than the sender's own turn. */
+interface AgentChain {
+  depth: number;
+  sender: { botId: string; name: string };
+}
+
+/** The place in the chain a message from the agent whose turn runs in
+ * `laneId` would take. */
+function chainFrom(sender: { id: string; name: string }, laneId: string): AgentChain {
+  return { depth: nextAgentChain(laneId), sender: { botId: sender.id, name: sender.name } };
+}
+
+/** The place in the chain for a turn that takes these waiting items,
+ * or goes on with one at `from` and takes them: 0 when the person's own
+ * words are among them, since the person writing starts a chain over;
+ * otherwise as far along as the furthest agent's message, with a note
+ * from Bloks itself keeping the place of the turn it carries on, and a
+ * webhook's or a watcher's at 0. */
+function burstChain(laneId: string, items: ReadonlyArray<{ messageId?: string; chain?: number }>, from = 0): number {
+  let depth = from;
+  for (const item of items) {
+    if (item.chain) depth = Math.max(depth, item.chain);
+    else if (!item.messageId) depth = Math.max(depth, agentChain.get(laneId) ?? 0);
+    else {
+      const m = store.messagesFor(laneId).find((msg) => msg.id === item.messageId);
+      if (m && !m.agent && !m.via) return 0;
+    }
+  }
+  return depth;
+}
+
+/** Why a routine or a watcher an agent filed did not start its turn:
+ * agents had already started too many in a row (MAX_AGENT_CHAIN). */
+function chainHeld(chain: number, subject: string): string {
+  return `Held: ${chainLimitText(subject, chain, agentLimit())}`;
+}
+
+/** A chain held at MAX_AGENT_CHAIN, said where the person will find it:
+ * a notice in the conversation it would have gone on in, that
+ * conversation marked unread, and the phone woken for it (wakeFor), as
+ * for a goal blocked on them. Held at night, it used to wait unseen
+ * until somebody happened to open the right conversation (GitHub 248).
+ * Once, however often the same hold is met again. */
+function chainNotice(bot: BotRecord, laneId: string, text: string, key?: string) {
+  const last = store.messagesFor(laneId).at(-1);
+  if (last?.kind === "notice" && (key ? last.chainHeld && last.chainHoldKey === key : last.text === text)) return;
+  const notice = store.appendMessage(laneId, { role: "bot", kind: "notice", text, chainHeld: true, ...(key ? { chainHoldKey: key } : {}) });
+  store.markLane(bot.id, laneId, true);
+  broadcast({ kind: "message", threadId: laneId, message: notice });
+  broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+}
+
+/** The refusal an agent gets for a message past MAX_AGENT_CHAIN, and the
+ * notice the person finds in the recipient's conversation (chainNotice).
+ * The count is the whole chain, every agent's turn since the person last
+ * had a say, so the notice says so and names only the last step of it,
+ * rather than calling it back and forth between the last two. Whoever
+ * the person writes to next starts from 0. */
+function chainRefusal(bot: BotRecord, laneId: string, chain: AgentChain, words: string) {
+  const limit = agentLimit();
+  const text = redactSecrets(chainLimitText(
+    `A message from ${chainName(chain.sender.name)} to ${chainName(bot.name)} was not delivered.`,
+    chain.depth, limit, chainExcerpt(words, redactSecrets),
+  ));
+  const key = JSON.stringify([chain.sender.botId, bot.id, chain.depth, limit]);
+  chainNotice(bot, laneId, text, key);
+  // the person's notice says where the limit is set; the agent's says to
+  // wrap up, and nothing about lifting it
+  return Object.assign(new Error(chainAgentRefusal(bot.name, chain.depth)), { status: 429 });
+}
+
+/** Conversations an agent asked to close from inside its own turn there.
+ * A lane cannot close while it is working, and the agent asking is the
+ * thing keeping it busy, so the close waits for the turn to end. */
+const closeAfterTurn = new Set<string>();
+
+/** Conversations whose agent asked, from inside a turn there, for a fresh
+ * engine session. The turn's own session is still being written until it
+ * ends, so the reset waits for that (GitHub 139). */
+const freshAfterTurn = new Set<string>();
+
+/** Starts the fresh session an agent asked for, and says so in the chat. */
+function freshIfAsked(laneId: string) {
+  if (!freshAfterTurn.delete(laneId)) return;
+  startFresh(laneId);
+}
+
+function startFresh(laneId: string) {
+  const found = store.taskByThread(laneId);
+  if (!found) return;
+  store.startFreshSession(laneId);
+  const notice = store.appendMessage(laneId, {
+    role: "bot",
+    kind: "notice",
+    text: `${found.bot.name} starts its next turn here in a fresh session, without the earlier context. Everything above stays in the conversation.`,
+  });
+  broadcast({ kind: "message", threadId: laneId, message: notice });
+}
+
+/** Closes a lane its agent asked to close, once nothing is running or
+ * waiting in it. A message queued meanwhile goes first; the close then
+ * follows that turn instead. */
+function closeIfAsked(laneId: string) {
+  if (!closeAfterTurn.has(laneId)) return;
+  if ([...steerQueues.keys()].includes(laneId)) return;
+  const owner = store.taskByThread(laneId)?.bot;
+  if (!owner) return void closeAfterTurn.delete(laneId);
+  const outcome = deleteLane(owner.id, laneId);
+  if (outcome === "busy") return;
+  if (outcome === "ok") claudeCatalogs.delete(laneId);
+  closeAfterTurn.delete(laneId);
+  if (outcome === "ok") broadcast({ kind: "bot", bot: clientBot(store.bot(owner.id)!) });
+}
+
+/** Room lines for agents that were mid-turn, or held by a drain
+ * (server/room-tags.ts). On disk, so a restart does not lose them. */
+const roomTags = new RoomTagQueues(join(DATA_DIR, "room-lines.json"));
+
+function queueRoomTag(botId: string, roomId: string, text: string, requester: string | undefined, hops: number) {
+  // with the count its turn would have started with, so a delivery later
+  // counts against the same hop limit
+  roomTags.add(botId, roomId, text, requester, hops);
+}
+
+/** A refusal that means "not now" rather than "no": the agent is busy,
+ * or Bloks is finishing up to restart. The line waits for it. */
+function waitsForTurn(e: unknown): boolean {
+  const refused = e as { busy?: boolean; draining?: boolean } | null;
+  return Boolean(refused?.busy || refused?.draining);
+}
+
+/** Deliver an agent's waiting room lines once it is free. Called whenever
+ * one of its turns settles. */
+function drainRoomTags(botId: string) {
+  const waiting = roomTags.of(botId);
+  if (!waiting.length || drain.on) return;
+  const bot = store.bot(botId);
+  // a message queued in one of its own lanes was there first, and its
+  // turn is about to start; the room waits for the settle after it
+  if (bot && [...steerQueues.values()].some((q) => q.botId === botId)) return;
+  for (const entry of waiting) {
+    const { roomId } = entry;
+    const blok = bloks.get(roomId);
+    if (!bot || !blok || !blok.memberIds.includes(botId)) {
+      roomTags.take(botId, entry);
+      continue;
+    }
+    if (blok.sharing ? laneBusy(bot, roomId) : bot.busy) continue;
+    // claimed before any async work, so two racing settles fire it once
+    roomTags.take(botId, entry);
+    const previous = roomPosting.get(roomId);
+    const run = (previous ?? Promise.resolve())
+      .catch(() => {})
+      .then(() => dispatchRound(roomId, [[botId, entry.texts.join("\n")]], entry.hops, entry.requester));
+    roomPosting.set(roomId, run);
+    void run.finally(() => {
+      if (roomPosting.get(roomId) === run) roomPosting.delete(roomId);
+    }).catch(() => {});
+  }
 }
 
 /**
@@ -3332,24 +6668,30 @@ async function postToRoomNow(blok: BlokRecord, text: string, author: RoomAuthor,
  */
 async function speakInTurn(
   roomId: string,
-  work: ReadonlyArray<readonly [string, string]>,
-  hops: number,
+  work: ReadonlyArray<readonly [botId: string, text: string, hops: number]>,
   requester?: string,
+  byYou?: boolean,
 ) {
   // In a shared room an agent speaks in the room's own lane, so what it is
   // doing elsewhere is no reason to skip it or to wait on it.
   const shared = Boolean(bloks.get(roomId)?.sharing);
   const idleHere = (bot: BotRecord) => (shared ? !laneBusy(bot, roomId) : !bot.busy);
-  const ordered = work
-    .map(([id, text]) => [store.bot(id), text] as const)
-    .filter((entry): entry is readonly [BotRecord, string] => entry[0] !== null && idleHere(entry[0]))
+  const named = work
+    .map(([id, text, hops]) => [store.bot(id), text, hops] as const)
+    .filter((entry): entry is readonly [BotRecord, string, number] => entry[0] !== null);
+  // a busy agent hears it when its turn ends, rather than never
+  for (const [member, text, hops] of named) if (!idleHere(member)) queueRoomTag(member.id, roomId, text, requester, hops);
+  const ordered = named
+    .filter(([member]) => idleHere(member))
     .sort(([a], [b]) => (a.seniority ?? 1) - (b.seniority ?? 1));
 
-  for (const [member, text] of ordered) {
-    // one agent failing must not silence the rest of the room
-    await startTurn(member.id, text, { roomId, hops, requester }).catch((e) => sayTurnedAway(roomId, e));
-    if (shared) await waitForLaneIdle(member.id, roomId);
-    else await waitForIdle(member.id);
+  for (const [member, text, hops] of ordered) {
+    // one agent failing must not silence the rest of the room; one that
+    // got busy while it waited its turn to speak hears it later
+    await startTurn(member.id, text, { roomId, hops, requester, byYou }).catch((e) =>
+      waitsForTurn(e) ? queueRoomTag(member.id, roomId, text, requester, hops) : sayTurnedAway(roomId, e),
+    );
+    await waitForRoomTurn(member.id, roomId);
   }
 }
 
@@ -3364,13 +6706,25 @@ function isSharedLane(laneId: string): boolean {
   return bloks.bloks.some((b) => b.lanes && Object.values(b.lanes).includes(laneId));
 }
 
-/** waitForIdle, for one shared room's lane rather than the whole agent. */
-function waitForLaneIdle(botId: string, roomId: string, timeoutMs = 120_000): Promise<void> {
+/** How long the next speaker in a room waits for the last one's turn. A
+ * room turn on Claude Code can run for many minutes, and the two minutes
+ * this used to be let the next speaker talk over one still working and
+ * ended the round before its handoffs came in. */
+const ROOM_TURN_WAIT_MS = 30 * 60_000;
+
+/** Resolves once an agent's turn in this room has ended, so the next
+ * speaker sees it. That turn's own lane, not the whole agent: what it is
+ * doing in another lane is no reason to hold the room. A lane still
+ * marked as speaking here but no longer busy has no turn under it, so it
+ * holds nothing either. */
+function waitForRoomTurn(botId: string, roomId: string, timeoutMs = ROOM_TURN_WAIT_MS): Promise<void> {
   return new Promise((resolve) => {
     const started = Date.now();
     const tick = () => {
-      const bot = store.bot(botId);
-      if (!bot || !laneBusy(bot, roomId) || Date.now() - started > timeoutMs) return resolve();
+      const speaking = store
+        .bot(botId)
+        ?.tasks.some((t) => activeRoom.get(t.id) === roomId && (t.busy || claimedLanes.has(t.id)));
+      if (!speaking || Date.now() - started > timeoutMs) return resolve();
       setTimeout(tick, 250);
     };
     setTimeout(tick, 250);
@@ -3452,40 +6806,63 @@ function unresume(threadId: string, error: unknown): boolean {
   return true;
 }
 
-/** Resolves once an agent's turn has settled, so the next speaker sees it. */
-function waitForIdle(botId: string, timeoutMs = 120_000): Promise<void> {
+/** Resolves once an agent has nothing running in any lane. */
+function waitForIdle(botId: string, timeoutMs = 120_000, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     const started = Date.now();
     const tick = () => {
-      if (!store.bot(botId)?.busy || Date.now() - started > timeoutMs) return resolve();
+      if (signal?.aborted || !store.bot(botId)?.busy || Date.now() - started > timeoutMs) return resolve();
       setTimeout(tick, 250);
     };
     setTimeout(tick, 250);
   });
 }
 
-/** After an agent speaks, pass the room to anyone it named. */
-async function relayMentions(roomId: string, fromBotId: string, text: string, requester?: string) {
+/** Says in a room that a mention woke nobody (heldMention), marked as a
+ * chain hold is, so the person is told where they are. Once when the
+ * same hold is met twice with nothing said in between: a line an agent
+ * said into the room with `bloks say` is passed on as it is posted, and
+ * again as its turn ends if the turn said nothing there after it. */
+function sayMentionHeld(roomId: string, notice: string) {
+  if (store.messagesFor(roomId).at(-1)?.text === notice) return;
+  const said = store.appendMessage(roomId, { role: "bot", kind: "notice", text: notice, chainHeld: true });
+  broadcast({ kind: "message", threadId: roomId, message: said });
+}
+
+/** After an agent speaks, pass the room to anyone it named. `chain` and
+ * `hops` are the places a turn this starts would take: one more than the
+ * speaking turn's own (agentChain, turnHops). */
+async function relayMentions(roomId: string, fromBotId: string, text: string, requester: string | undefined, chain: number, hops: number) {
   const blok = bloks.get(roomId);
   if (!blok) return;
-  const hops = (agentHops.get(fromBotId) ?? 0) + 1;
-  if (hops > MAX_AGENT_HOPS) return;
 
   const members = blok.memberIds.map((id) => store.bot(id)).filter(Boolean) as BotRecord[];
   const named = members.filter(
     (m) => m.id !== fromBotId && text.toLowerCase().includes(`@${m.name.toLowerCase()}`),
   );
+  if (!named.length) return;
+  // no further than a room lets agents pass it along, and no further than
+  // any chain of agents' messages may go, before the person has a say.
+  // Asked once somebody is known to be named, so the room hears of it.
+  const held = heldMention(store.bot(fromBotId)?.name ?? "An agent", named.map((m) => m.name), { hops, chain }, agentLimit(), chainExcerpt(text, redactSecrets));
+  if (held) return sayMentionHeld(roomId, held);
+  roomChain.set(roomId, chain);
   const queue = dispatching.get(roomId);
   for (const target of named) {
-    agentHops.set(target.id, hops);
     // the room is mid-round: take a number rather than talk over it
     if (queue) {
-      queue.set(target.id, text);
+      queue.set(target.id, { text, from: fromBotId, hops: Math.max(hops, queue.get(target.id)?.hops ?? 0) });
       continue;
     }
     const bot = store.bot(target.id);
-    if (!bot || (blok.sharing ? laneBusy(bot, roomId) : bot.busy)) continue;
-    await startTurn(target.id, text, { roomId, hops, requester }).catch((e) => sayTurnedAway(roomId, e));
+    if (!bot) continue;
+    if (blok.sharing ? laneBusy(bot, roomId) : bot.busy) {
+      queueRoomTag(target.id, roomId, text, requester, hops);
+      continue;
+    }
+    await startTurn(target.id, text, { roomId, hops, requester, chain }).catch((e) =>
+      waitsForTurn(e) ? queueRoomTag(target.id, roomId, text, requester, hops) : sayTurnedAway(roomId, e),
+    );
   }
 }
 
@@ -3497,11 +6874,22 @@ relayLink.memberFrame = (frame, personId) => memberFrame(frame, (roomId) => view
 relayLink.previewOf = previewOf;
 relayLink.onHook = (hook) => (hook.platform === "email" ? onEmailHook(hook) : onWhatsAppHook(hook));
 relayLink.pairSecret = (linkId) => pairLinkSecret(linkId);
+// A second Bloks on this ~/.bloks (the app beside a headless server) that
+// activated Cloud again saved new tokens this process still has the old
+// ones of. Read them from disk rather than dial a retired space forever.
+relayLink.onRejected = () => {
+  const disk = loadConfig().relay;
+  if (disk?.agentToken && disk.agentToken !== cfg.relay?.agentToken) {
+    cfg.relay = disk;
+    syncRelay();
+  }
+};
 relayLink.pairClaim = (linkId, body) => {
   const b = (body ?? {}) as { name?: unknown; tokenHash?: unknown };
-  const device = claimPairLink(linkId, b.name, b.tokenHash);
+  const device = claimPairLink(linkId, b.name, b.tokenHash, (saved) => {
+    broadcast({ kind: "pairing", ...pairingStatus(saved) });
+  });
   if (!device) return null;
-  broadcast({ kind: "pairing", ...pairingStatus() });
   return { deviceId: device.id, host: hostName() };
 };
 relayLink.inviteSecret = (inviteId) => {
@@ -3527,13 +6915,13 @@ function relayBase(): string {
   return url.trim().replace(/\/+$/, "");
 }
 
-function syncRelay() {
+function syncRelay(config?: AppConfig) {
   // Pairing is the master switch. Turning pairing off is the documented
   // way to cut every remote device loose, and it must cut the relay too;
   // otherwise a relay phone keeps reaching the remote surface after the
   // owner believes they closed the door.
   const on =
-    remoteEnabled() && cfg.relay?.enabled && cfg.relay.url && cfg.relay.agentToken;
+    remoteEnabled(config) && cfg.relay?.enabled && cfg.relay.url && cfg.relay.agentToken;
   relayLink.configure(on ? { url: cfg.relay!.url!, agentToken: cfg.relay!.agentToken! } : null);
 }
 syncRelay();
@@ -3585,6 +6973,9 @@ function candidates(): Candidate[] {
   }));
 }
 
+/** Jobs posted or passed on during a drain, to offer when it ends. */
+const jobsHeld = new Set<string>();
+
 /**
  * Put a job to whoever looks most suited, and start them on it.
  *
@@ -3594,7 +6985,25 @@ function candidates(): Candidate[] {
 async function offerJob(jobId: string): Promise<Job | null> {
   const job = jobs.get(jobId);
   if (!job || (job.state !== "open" && job.state !== "claimed")) return job;
+  // Left open on the board while Bloks finishes up to restart, and
+  // offered when the drain is called off (endDrain). After a restart it
+  // waits on the board for Offer, as one nobody was free for does.
+  if (drain.on) {
+    jobsHeld.add(job.id);
+    return job;
+  }
+  // Jobs agents post for one another are a chain like their messages
+  // are: past the limit the job is left for the person to offer again.
   const agent = nextFor(job, candidates());
+  if (chainPastLimit(job.chain ?? 0)) {
+    const held = jobs.finish(job.id, {
+      ok: false,
+      result: chainLimitText(`A job offer from the job board to ${chainName(agent?.name ?? "an available agent")} was not delivered.`, job.chain!, agentLimit(), chainExcerpt(job.title, redactSecrets)),
+      now: Date.now(),
+    });
+    broadcast({ kind: "jobs" });
+    return held;
+  }
   if (!agent) {
     broadcast({ kind: "jobs" });
     return job;
@@ -3609,7 +7018,7 @@ async function offerJob(jobId: string): Promise<Job | null> {
   openJobs.set(laneId, job.id);
   broadcast({ kind: "jobs" });
   broadcast({ kind: "bot", bot: clientBot(store.bot(agent.id)) });
-  await startTurn(agent.id, offerText(job), { taskId: laneId }).catch((e) => {
+  await startTurn(agent.id, offerText(job), { taskId: laneId, ...(job.chain ? { chain: job.chain } : {}) }).catch((e) => {
     openJobs.delete(laneId);
     jobs.finish(job.id, {
       ok: false,
@@ -3647,6 +7056,394 @@ function settleJob(threadId: string, ok: boolean, said: string) {
   void offerJob(jobId);
 }
 
+// ── compacting a quiet conversation before its cache expires ─────────
+// See server/context.ts for why and when (GitHub 162). A minute timer
+// looks over the lanes; one that is due gets `/compact` sent into its
+// resumed Claude Code session as a turn of its own. It runs as the lane's
+// turn so everything that waits for a busy lane waits for it too: a
+// message said meanwhile is queued, a room mention is held, and both go
+// when it ends. Nothing else about a turn happens. It writes nothing in
+// the person's name, marks nothing unread, reaches no other agent or
+// room, and only the marker the engine's compact_boundary leaves is
+// posted. What it spends is counted in Usage like any turn.
+
+/** Each lane's last model request, as Claude Code reported it. In memory
+ * only: after a restart nobody knows when a cache was last touched, and a
+ * lane that is not compacted costs what it always did. */
+const lastRequest = new Map<string, { at: number; context: number; cacheTtl?: "5m" | "1h" }>();
+
+/** What each lane's last Claude Code turn was sent, less its words. */
+const lastSent = new Map<string, { instanceId: string; input: Omit<SendTurnInput, "threadId" | "text"> }>();
+
+/** Lanes compacting now, to the agent they belong to, and what the
+ * engine said the session came down to. One compacted before a turn
+ * (compactThenSend) has `beforeTurn`: where its marker goes, and what to
+ * call when it ends instead of freeing the lane, which the turn behind it
+ * still holds. */
+const idleCompacting = new Map<
+  string,
+  {
+    botId: string;
+    after?: number | null;
+    beforeTurn?: { roomId: string; inRoom: boolean; ended: () => void };
+  }
+>();
+
+/** Idle compactions only; one before a turn is part of that turn. */
+const idleCount = () => [...idleCompacting.values()].filter((run) => !run.beforeTurn).length;
+
+/** A compaction takes about a minute, and many agents can go quiet at
+ * the same moment. Two at a time; a lane whose window passes while it
+ * waits is skipped (idleCompactionDue). */
+const IDLE_COMPACTIONS_AT_ONCE = 2;
+
+/** How long one may run before it is stopped. They took about a
+ * minute in the reports that asked for this. */
+const IDLE_COMPACTION_LIMIT_MS = 5 * 60_000;
+
+/** The cache lifetime the timing is cut from. Tests shorten it. */
+const IDLE_CACHE_MS = Number(process.env.BLOKS_IDLE_CACHE_MS) || CACHE_LIFETIME_MS;
+
+function noteRequest(event: Extract<RuntimeEvent, { type: "thread.token-usage.updated" }>) {
+  // only an engine that reports the whole prompt can be judged by it
+  if (typeof event.context !== "number" || !Number.isFinite(event.context) || event.context <= 0) return;
+  const seen = lastRequest.get(event.threadId);
+  lastRequest.set(event.threadId, {
+    at: Date.now(),
+    context: event.context,
+    // a request that hit the cache entirely wrote nothing, and says nothing
+    cacheTtl: event.cacheTtl ?? seen?.cacheTtl,
+  });
+}
+
+/**
+ * Who made a reading: the engine the event came from, and the model the
+ * lane is running on it. The model is the turn's (or the last turn's, for
+ * an idle compaction), because a reading belongs to the engine and model
+ * that made it (GitHub 224).
+ */
+function readingBy(threadId: string, instanceId: string): { instanceId: string; model: string | null } {
+  const running = laneEngine.get(threadId);
+  if (running?.instanceId === instanceId) return { instanceId, model: running.model ?? null };
+  const sent = lastSent.get(threadId);
+  if (sent?.instanceId === instanceId) return { instanceId, model: sent.input.model ?? null };
+  const own = store.botByThread(threadId)?.modelSelection;
+  return { instanceId, model: own?.instanceId === instanceId ? (own.model ?? null) : null };
+}
+
+function noteLaneReading(event: RuntimeEvent, said: { used: number | null; window: number | null }) {
+  const instanceId = event.providerInstanceId ?? event.provider;
+  const by = readingBy(event.threadId, instanceId);
+  const used = typeof said.used === "number" && Number.isFinite(said.used) && said.used > 0 ? said.used : null;
+  const window = typeof said.window === "number" && Number.isFinite(said.window) && said.window > 0 ? said.window : null;
+  if (used !== null || window !== null) store.noteReading(event.threadId, by, { used, window });
+  // under the line again, so the next time it crosses is a new crossing
+  const reading = store.taskByThread(event.threadId)?.task.reading;
+  if (used !== null && readingFor(reading, by) && compactedFrom.has(event.threadId) && !overTheLine(reading!)) {
+    compactedFrom.delete(event.threadId);
+  }
+  const patched = store.resolveCompaction(event.threadId, by, used);
+  if (patched) broadcast({ kind: "message.patch", ...patched });
+}
+
+/** Where each lane last was when it was compacted before a turn, kept
+ * while it stays over the line, so a compaction that did not bring it
+ * down is not asked for again on every message (compactBeforeTurn). */
+const compactedFrom = new Map<string, number>();
+
+/** The settings for compacting before a turn: the ceiling in tokens (0 is
+ * off) and the share of the window. */
+function beforeTurnSettings(): { ceiling: number; at: number | undefined } {
+  const ceiling = cfg.compaction?.beforeTurn;
+  return {
+    ceiling: typeof ceiling === "number" && Number.isFinite(ceiling) && ceiling >= 0 ? ceiling : BEFORE_TURN_CEILING,
+    at: cfg.compaction?.beforeTurnAt,
+  };
+}
+
+/** The line is a budget only for a session Bloks can compact before a
+ * turn. Replay engines, missing cursors and guest mail keep the window. */
+function laneContext(bot: BotRecord, task: TaskRecord) {
+  const instance = registry.get(bot.modelSelection.instanceId);
+  const canCompact = instance && !instance.adapter.capabilities.replaysNatively &&
+    typeof task.resumeCursors[bot.modelSelection.instanceId] === "string" && !task.guestMail;
+  return laneFill(task.reading, bot.modelSelection, canCompact ? beforeTurnSettings() : undefined);
+}
+
+/** The reading's window: the engine's, or the table's when the model is
+ * in it; never the default, which is a guess and not a reason to act. */
+function readingWindow(reading: Reading): number | null {
+  return reading.window ?? knownLimitFor(reading.model);
+}
+
+function overTheLine(reading: Reading): boolean {
+  return compactBeforeTurn({ used: reading.used, window: readingWindow(reading), ...beforeTurnSettings() });
+}
+
+/** A marker uses the same own-origin request as the ring, before the
+ * boundary invalidates it. Native pre/post metadata counts differently. */
+function compactionBefore(event: RuntimeEvent): number | null {
+  const by = readingBy(event.threadId, event.providerInstanceId ?? event.provider);
+  const own = readingFor(store.taskByThread(event.threadId)?.task.reading, by);
+  return own && Number.isFinite(own.used) && own.used > 0 ? own.used : null;
+}
+
+function noteCompacted(event: RuntimeEvent, where: string, messageId: string) {
+  lastRequest.delete(event.threadId);
+  const by = readingBy(event.threadId, event.providerInstanceId ?? event.provider);
+  store.beginCompaction(event.threadId, by, where, messageId);
+}
+
+function sweepIdleLanes(now = Date.now()) {
+  // nothing new while Bloks finishes up to restart (server/drain.ts)
+  if (!cfg.compaction?.idle || idleCount() >= IDLE_COMPACTIONS_AT_ONCE || drain.on) return;
+  const due: Array<{ bot: BotRecord; task: TaskRecord; at: number }> = [];
+  for (const bot of store.bots) {
+    for (const task of bot.tasks) {
+      const seen = lastRequest.get(task.id);
+      const sent = lastSent.get(task.id);
+      if (!seen || !sent) continue;
+      // the session it would compact is the one the next message resumes
+      const engine = selectEngine(bot).instanceId;
+      if (sent.instanceId !== engine || task.lastInstanceId !== engine || typeof task.resumeCursors[engine] !== "string") continue;
+      const ready = idleCompactionDue({
+        enabled: true,
+        now,
+        lastRequestAt: seen.at,
+        context: seen.context,
+        cacheTtl: seen.cacheTtl,
+        // a claim, activeRoom and webhookLanes are set before a turn marks its lane busy
+        busy: Boolean(task.busy) || claimedLanes.has(task.id) || turnStarted.has(task.id) || activeRoom.has(task.id) || webhookLanes.has(task.id),
+        queued: steerQueues.has(task.id) || beingEdited.has(task.id),
+        waiting: Boolean(blockedOn(store.messagesFor(task.id), liveCards())),
+        paused:
+          Boolean(bot.archivedAt) ||
+          Boolean(wheel.heldBy(bot.id)) ||
+          Boolean(cooldowns.of(engine)) ||
+          isSharedLane(task.id) ||
+          Boolean(rehearsals.forTask(task.id)),
+        lifetime: IDLE_CACHE_MS,
+      });
+      if (ready) due.push({ bot, task, at: seen.at });
+    }
+  }
+  // the one closest to losing its cache first
+  due.sort((a, b) => a.at - b.at);
+  for (const { bot, task } of due.slice(0, IDLE_COMPACTIONS_AT_ONCE - idleCount())) compactWhileIdle(bot, task);
+}
+setInterval(() => sweepIdleLanes(), Math.min(60_000, IDLE_CACHE_MS / 60)).unref?.();
+
+function compactWhileIdle(bot: BotRecord, task: TaskRecord) {
+  const sent = lastSent.get(task.id);
+  const instance = sent ? registry.get(sent.instanceId) : undefined;
+  const cursor = sent ? task.resumeCursors[sent.instanceId] : undefined;
+  if (!sent || !instance || typeof cursor !== "string") return;
+  const run = { botId: bot.id };
+  idleCompacting.set(task.id, run);
+  // whatever happens next, this quiet stretch has had its chance
+  lastRequest.delete(task.id);
+  store.setTaskBusy(task.id, true);
+  turnStarted.set(task.id, Date.now());
+  turnTokens.delete(task.id);
+  broadcast({ kind: "bot", bot: clientBot(store.bot(bot.id)) });
+  instance.adapter
+    .sendTurn({ ...sent.input, threadId: task.id, text: "/compact", resumeCursor: cursor })
+    .catch(() => idleCompactionEnded(task.id));
+  // Nobody asked for this turn, so it must not hold the lane, and the
+  // messages queued behind it, for long. Stopped after a few minutes,
+  // and let go of if the engine does not say it stopped.
+  const stop = setTimeout(() => {
+    if (idleCompacting.get(task.id) !== run) return;
+    void instance.adapter.interruptTurn(task.id).catch(() => {});
+    const letGo = setTimeout(() => idleCompacting.get(task.id) === run && idleCompactionEnded(task.id), 30_000);
+    letGo.unref?.();
+  }, IDLE_COMPACTION_LIMIT_MS);
+  stop.unref?.();
+}
+
+/**
+ * Compact a Claude Code session before the turn about to resume it
+ * (compactBeforeTurn in server/context.ts), the way a quiet lane is
+ * compacted: /compact into the same session with the turn's own tools
+ * and system prompt, so it reads the cache the last turn left, and only
+ * the books and a marker come out of it. The lane stays the turn's
+ * throughout, so nothing else starts in it meanwhile.
+ *
+ * Resolves with whether the turn should still go, which it should unless
+ * somebody stopped it while the compaction ran. One that runs too long is
+ * stopped and the turn goes on the session as it is.
+ */
+function compactThenSend(
+  bot: BotRecord,
+  laneId: string,
+  roomId: string,
+  instance: ProviderInstance,
+  input: SendTurnInput,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let stop: ReturnType<typeof setTimeout> | null = null;
+    const run = {
+      botId: bot.id,
+      beforeTurn: {
+        roomId,
+        inRoom: roomId !== laneId,
+        ended: () => {
+          if (stop) clearTimeout(stop);
+          resolve(!cutOff.get(laneId)?.stopped);
+        },
+      },
+    };
+    idleCompacting.set(laneId, run);
+    lastRequest.delete(laneId);
+    turnTokens.delete(laneId);
+    const { handoff: _handoff, compactFirst: _compactFirst, ...same } = input;
+    instance.adapter
+      .sendTurn({ ...same, text: "/compact" })
+      .catch(() => idleCompacting.get(laneId) === run && idleCompactionEnded(laneId));
+    stop = setTimeout(() => {
+      if (idleCompacting.get(laneId) !== run) return;
+      void instance.adapter.interruptTurn(laneId).catch(() => {});
+      const letGo = setTimeout(() => idleCompacting.get(laneId) === run && idleCompactionEnded(laneId), 30_000);
+      letGo.unref?.();
+    }, IDLE_COMPACTION_LIMIT_MS);
+    stop.unref?.();
+  });
+}
+
+/** Events from an idle compaction. Only what keeps the books goes
+ * through: the session cursor, the tokens, the marker, and the end. */
+function onIdleCompaction(event: RuntimeEvent) {
+  const running = idleCompacting.get(event.threadId);
+  const bot = running ? store.bot(running.botId) : undefined;
+  if (!running || !bot) return;
+  const ahead = running.beforeTurn;
+  switch (event.type) {
+    case "turn.started":
+      // before a turn, the lane already reads as working, and the turn's
+      // own start is the one the app should hear
+      if (!ahead) broadcast({ kind: "runtime", event });
+      break;
+    case "session.started":
+      if (event.sessionId && event.providerInstanceId) {
+        store.setResumeCursor(event.threadId, event.providerInstanceId, event.sessionId);
+      }
+      break;
+    case "thread.token-usage.updated": {
+      usage.noteTokens(bot.id, event.providerInstanceId ?? event.provider, event.input, event.output);
+      const high = turnTokens.get(event.threadId) ?? { input: 0, output: 0 };
+      high.input = Math.max(high.input, event.input);
+      high.output = Math.max(high.output, event.output);
+      turnTokens.set(event.threadId, high);
+      noteRequest(event);
+      if (typeof event.context === "number") noteLaneReading(event, { used: event.context, window: null });
+      break;
+    }
+    case "context.reading":
+      noteLaneReading(event, event);
+      break;
+    case "context.compacted": {
+      running.after = event.after;
+      const before = compactionBefore(event);
+      // A compaction before a turn is said where the turn is: in the
+      // room, as this agent, when the lane is speaking in one.
+      const where = ahead?.roomId ?? event.threadId;
+      const marker = store.appendMessage(where, {
+        role: "bot",
+        ...(ahead?.inRoom ? { from: bot.id } : {}),
+        kind: "notice",
+        text: compactedNotice({ before, after: null, idle: !ahead }),
+        compaction: { before, after: null, ...(ahead ? {} : { idle: true }) },
+      });
+      noteCompacted(event, where, marker.id);
+      broadcast({ kind: "message", threadId: where, message: marker });
+      break;
+    }
+    case "request.opened":
+      // nothing should ask during /compact, and nobody is there to answer
+      if (event.requestId) {
+        void registry
+          .get(event.providerInstanceId ?? "")
+          ?.adapter.respondToRequest(event.threadId, event.requestId, { behavior: "deny" })
+          .catch(() => {});
+      }
+      break;
+    case "turn.completed": {
+      if (!ahead) broadcast({ kind: "runtime", event });
+      usage.recordTurn(bot.id, event.providerInstanceId ?? event.provider, event.cost ?? null, undefined, event.ok !== false);
+      const spent = turnTokens.get(event.threadId);
+      turnTokens.delete(event.threadId);
+      if (spent) store.addTaskUsage(event.threadId, spent.input, spent.output, running.after ?? undefined);
+      idleCompactionEnded(event.threadId);
+      break;
+    }
+  }
+}
+
+/** The lane is free again, and whatever waited for it goes now. One
+ * compacted before a turn is not free: the turn goes on. */
+function idleCompactionEnded(laneId: string) {
+  const running = idleCompacting.get(laneId);
+  if (!running) return;
+  idleCompacting.delete(laneId);
+  if (running.beforeTurn) {
+    running.beforeTurn.ended();
+    return;
+  }
+  store.setTaskBusy(laneId, false);
+  turnStarted.delete(laneId);
+  broadcast({ kind: "bot", bot: clientBot(store.bot(running.botId)) });
+  drainRoomTags(running.botId);
+  freshIfAsked(laneId);
+  drainSteer(laneId);
+  closeIfAsked(laneId);
+  // a slot is free, and another lane may be in its window now
+  sweepIdleLanes();
+}
+
+/** How long the fold after a turn waits before each new try when its
+ * summary request fails: three more tries, the last about forty seconds
+ * after the turn ended. */
+const FOLD_RETRY_MS = [2_000, 10_000, 30_000];
+
+/** The latest fold after a turn each lane has going, so an older one
+ * still waiting to try again stands down for it. */
+const foldsAfterTurn = new Map<string, symbol>();
+
+/**
+ * The fold a turn's end asks for, tried again when its summary request
+ * fails. Such a request fails for reasons that pass: the provider busy or
+ * limiting how often it is asked, the network gone for a moment, the
+ * computer short of connections. Nothing used to try again until the
+ * lane's next turn, which then started full and folded on its way in, if
+ * the person came back at all. Not once the lane is working again, since
+ * that turn folds on its way in if it needs to, nor once it is gone or
+ * something else has folded it.
+ */
+async function foldAfterTurn(botId: string, threadId: string): Promise<void> {
+  const mine = Symbol(threadId);
+  foldsAfterTurn.set(threadId, mine);
+  const through = store.bot(botId)?.tasks.find((t) => t.id === threadId)?.context?.through ?? 0;
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await foldContext(botId, threadId);
+        return;
+      } catch (error) {
+        const wait = FOLD_RETRY_MS[attempt];
+        if (wait === undefined) {
+          console.error(`[fold] gave up on folding ${threadId} after ${attempt + 1} tries:`, (error as Error)?.message ?? error);
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, wait).unref?.());
+      }
+      const lane = store.bot(botId)?.tasks.find((t) => t.id === threadId);
+      if (foldsAfterTurn.get(threadId) !== mine || !lane || lane.busy || (lane.context?.through ?? 0) !== through) return;
+    }
+  } finally {
+    if (foldsAfterTurn.get(threadId) === mine) foldsAfterTurn.delete(threadId);
+  }
+}
+
 /**
  * Fold the older half of a lane into a summary.
  *
@@ -3654,9 +7451,15 @@ function settleJob(threadId: string, ok: boolean, said: string) {
  * uses the same engine the lane runs on. If the summary cannot be made,
  * nothing changes: the next turn sends a slightly-too-long transcript and
  * the provider says so, which is recoverable. Losing the messages instead
- * would not be.
+ * would not be. A summary request that fails throws, so the fold after a
+ * turn can try it again (foldAfterTurn); every other caller reads that
+ * as no fold.
+ *
+ * `handoff` is the budget of a story about to be handed to a new session
+ * (boundHandoff in server/context.ts), which is much smaller than the
+ * window: what does not fit in it is summarised rather than left out.
  */
-async function foldContext(botId: string, threadId: string, force = false): Promise<boolean> {
+async function foldContext(botId: string, threadId: string, force = false, handoff?: number): Promise<boolean> {
   const bot = store.bot(botId);
   const task = bot?.tasks.find((t) => t.id === threadId);
   if (!bot || !task) return false;
@@ -3665,7 +7468,7 @@ async function foldContext(botId: string, threadId: string, force = false): Prom
 
   const settled = store
     .messagesFor(threadId)
-    .filter((m) => m.kind === "text" && m.text && !m.deleted);
+    .filter((m) => m.kind === "text" && m.text && !m.deleted && !m.queued && !m.unsent);
   const already = task.context?.through ?? 0;
   const carried = settled.slice(already);
   const asTurns: Turn[] = carried.map((m) => ({
@@ -3677,16 +7480,11 @@ async function foldContext(botId: string, threadId: string, force = false): Prom
   // provider has already refused the request, our estimate has been shown
   // to be wrong and its word is the one that counts, so fold hard: keep
   // the last exchange and summarise the rest.
-  const budget = force ? 1 : Math.max(2_000, Math.floor(limit * COMPACT_AT) - 4_000);
+  const budget = force ? 1 : (handoff ?? Math.max(2_000, Math.floor(limit * COMPACT_AT) - 4_000));
   const plan = planCompaction(asTurns, budget, force ? 2 : 6);
   if (!plan.fold.length) return false;
 
-  let summary: string;
-  try {
-    summary = (await instance.generateText(summaryPrompt(task.context?.summary ?? null, plan.fold))).trim();
-  } catch {
-    return false;
-  }
+  const summary = (await instance.generateText(summaryPrompt(task.context?.summary ?? null, plan.fold))).trim();
   if (!summary) return false;
 
   store.setTaskContext(threadId, {
@@ -3698,7 +7496,7 @@ async function foldContext(botId: string, threadId: string, force = false): Prom
   const notice = store.appendMessage(threadId, {
     role: "bot",
     kind: "notice",
-    text: compactionNotice(plan.fold.length),
+    text: compactionNotice(plan.fold.length, handoff !== undefined && !force ? "handoff" : "limit"),
   });
   broadcast({ kind: "message", threadId, message: notice });
   broadcast({ kind: "bot", bot: clientBot(store.bot(botId)) });
@@ -3727,7 +7525,7 @@ async function microFold(botId: string, threadId: string): Promise<boolean> {
 
   const settled = store
     .messagesFor(threadId)
-    .filter((m) => m.kind === "text" && m.text && !m.deleted);
+    .filter((m) => m.kind === "text" && m.text && !m.deleted && !m.queued && !m.unsent);
   const asTurns: Turn[] = settled.map((m) => ({
     role: m.role === "user" ? ("user" as const) : ("assistant" as const),
     text: m.text!,
@@ -3791,7 +7589,7 @@ async function reviewForSkill(botId: string, threadId: string): Promise<boolean>
 
   const turns: Turn[] = store
     .messagesFor(threadId)
-    .filter((m) => m.kind === "text" && m.text && !m.deleted)
+    .filter((m) => m.kind === "text" && m.text && !m.deleted && !m.queued && !m.unsent)
     .map((m) => ({
       role: m.role === "user" ? ("user" as const) : ("assistant" as const),
       text: m.text!,
@@ -3857,7 +7655,7 @@ async function reviewForSkill(botId: string, threadId: string): Promise<boolean>
   return true;
 }
 
-function closeRun(threadId: string, outcome: { ok: boolean; summary?: string; error?: string }) {
+function closeRun(threadId: string, outcome: { ok: boolean; summary?: string; error?: string; quiet?: boolean }) {
   const open = openRuns.get(threadId);
   if (!open) return;
   openRuns.delete(threadId);
@@ -3865,10 +7663,18 @@ function closeRun(threadId: string, outcome: { ok: boolean; summary?: string; er
     state: outcome.ok ? "ok" : "failed",
     summary: outcome.summary,
     error: outcome.error,
+    ...(outcome.quiet ? { quiet: true } : {}),
   });
   // Work that happened without anyone asking for it, which is exactly the
   // kind a person wants an account of afterwards.
   const routine = routines.get(open.routineId);
+  // Not a quiet check-in: it found nothing, and one every quarter of an
+  // hour would push everything else out of the record's recent view. Its
+  // run history has it, and any approval it needed is recorded on its own.
+  if (outcome.ok && outcome.quiet) {
+    broadcast({ kind: "routines" });
+    return;
+  }
   record({
     at: Date.now(),
     kind: "routine.ran",
@@ -3959,9 +7765,45 @@ function finishRun(runId: string, state: "done" | "failed" | "stopped", error?: 
   broadcast({ kind: "workflows" });
 }
 
+/** The last thing an agent said in a lane after one message, or "" when
+ * that message is gone or nothing has been said since. */
+function saidAfter(threadId: string, messageId: string): string {
+  const all = store.messagesFor(threadId);
+  const from = all.findIndex((msg) => msg.id === messageId);
+  if (from < 0) return "";
+  const said = all.slice(from + 1).reverse().find((msg) => msg.role === "bot" && msg.kind === "text" && msg.text && !msg.deleted);
+  return said?.text ?? "";
+}
+
 /** The last thing an agent actually said in a lane, which is what a step
  * hands on to the next one. A row that only says "ok" answers half the
  * question people are asking. */
+/**
+ * Folds away a check-in that ended quiet, and says whether it did: the
+ * routine's prompt, the QUIET answer, and what the turn did in between
+ * are marked `quiet`, which the chat shows as one muted line. Only a turn
+ * that left nothing to look at counts: its words, its tool calls, the
+ * screen it ended on and a compaction marker. A card, a file or a chart
+ * is something for the person, and so is any answer but QUIET at the end.
+ */
+function foldQuietRun(laneId: string): boolean {
+  const list = store.messagesFor(laneId);
+  // what is still waiting is not part of this turn, and joins after it
+  const said = list.filter((m) => !m.queued && !m.unsent);
+  let at = said.length - 1;
+  while (at >= 0 && said[at].role !== "user") at--;
+  const prompt = said[at];
+  if (!prompt || prompt.deleted || prompt.via !== "routine" || !prompt.routine?.quiet) return false;
+  const turn = said.slice(at + 1);
+  const quietKind = (m: Message) =>
+    m.role === "bot" && !m.deleted && (m.kind === "text" || m.kind === "activity" || m.kind === "screen" || (m.kind === "notice" && Boolean(m.compaction)));
+  const answer = [...turn].reverse().find((m) => m.kind === "text");
+  if (!answer || !isQuietReply(answer.text) || !turn.every(quietKind)) return false;
+  const folded = store.patchMessages(laneId, [prompt.id, ...turn.map((m) => m.id)], () => ({ quiet: true }));
+  for (const message of folded) broadcast({ kind: "message.patch", threadId: laneId, message });
+  return true;
+}
+
 function lastSaid(threadId: string): string {
   const said = [...store.messagesFor(threadId)]
     .reverse()
@@ -4035,10 +7877,12 @@ async function walkRun(runId: string): Promise<void> {
         const bot = step.targetId ? store.bot(step.targetId) : null;
         if (!bot) throw new Error("that agent is not here any more");
         if (!text) throw new Error("there was nothing left to ask once the values were filled in");
-        const laneId = backgroundTaskId(bot.id, "Workflows");
         // A busy lane is a wait, not a failure. The step row is taken
         // back off so the history does not fill with attempts, the run
         // stays running, and the tick finds it again in half a minute.
+        // Bloks finishing up to restart is the same wait, and the run is
+        // found again the same way once it is back.
+        const laneId = drain.on ? undefined : backgroundTaskId(bot.id, "Workflows");
         if (!laneId) {
           workflows.update(runId, (r) => {
             const at = r.steps.findIndex((sp) => sp.stepId === step.id && !sp.endedAt);
@@ -4285,6 +8129,10 @@ setTimeout(() => {
 }, 2_000).unref?.();
 
 async function runDueRoutines() {
+  // A routine has no queue to wait in. It stays due instead, unmarked,
+  // and fires once Bloks is back, inside the grace window a late routine
+  // has anyway (server/drain.ts keeps a drain shorter than that).
+  if (drain.on) return;
   const now = new Date();
   for (const routine of routines.due(now)) {
     if (routine.targetKind === "room") {
@@ -4327,15 +8175,29 @@ async function runDueRoutines() {
       // to do it, and restoring or handing back would bring back a
       // schedule that had already spent itself.
       if (bot.archivedAt || wheel.heldBy(bot.id)) continue;
-      const laneId = backgroundTaskId(bot.id, "Routines");
+      // the conversation it names, or the agent's first (GitHub 237)
+      const laneId = workLaneId(bot.id, routine.thread);
       if (!laneId) continue;
+      // A blocked attempt is a record, not a consumed scheduled slot.
+      if (chainPastLimit(routine.chain ?? 0)) {
+        const why = chainHeld(routine.chain!, `The routine ${chainName(routine.name ?? "without a name")} did not start a scheduled turn for ${chainName(bot.name)}.`)
+          + " It can run at its next scheduled time if the limit allows, within the missed-run grace, or by hand. A one-time routine past that grace needs a manual run.";
+        const slot = lastScheduledBefore(routine, now)!;
+        if (routines.holdRun(routine.id, slot.getTime(), laneId, why)) {
+          chainNotice(bot, laneId, why);
+          broadcast({ kind: "routines" });
+        }
+        continue;
+      }
       routines.markRan(routine.id, now.getTime());
       const run = routines.beginRun(routine.id, laneId);
       if (run) openRuns.set(laneId, { routineId: routine.id, runId: run.id });
       broadcast({ kind: "routines" });
-      await startTurn(bot.id, routine.prompt, {
+      await startTurn(routine.targetId, routine.prompt, {
         taskId: laneId,
         computerOverride: routine.runsOn,
+        routine: routineMark(routine, false),
+        ...(routine.chain ? { chain: routine.chain } : {}),
       }).catch((e) => {
         // it never even started; that is a finished run, not a hung one
         closeRun(laneId, {
@@ -4351,93 +8213,426 @@ async function runDueRoutines() {
 // as it needs to be and cheap enough not to care.
 const routineTimer = setInterval(() => void runDueRoutines().catch(() => {}), 30_000);
 
-// ── messages arriving from Telegram ───────────────────────────────────
-// A loop rather than an interval: long polling already blocks for as
-// long as we want to wait, and a timer on top of it would stack calls
-// whenever Telegram was slow. Chats we have refused once are remembered
-// for the life of the process, so somebody who found the bot and keeps
-// typing gets one answer rather than one per message.
-const telegramRefused = new Set<number>();
-let telegramRunning = false;
+// ── messages arriving from each agent's Telegram bot ──────────────────
+// A bot belongs to one agent (server/telegram-bots.ts), and each bot that
+// is switched on has one of these: its own polling loop and everything
+// that loop is in the middle of. A loop rather than an interval: long
+// polling already blocks for as long as we want to wait, and a timer on
+// top of it would stack calls whenever Telegram was slow.
+//
+// `generation` is the connection's name. It changes whenever the token,
+// the switch or the pairing does, and everything in flight carries the
+// one it began under: a poll, a card's buttons, the rest of a long reply,
+// a message waiting for a turn. Work that belongs to a connection that
+// has since been replaced or removed stops where it is, so a bot taken
+// off an agent, or a new bot put on it, never finishes the old one's
+// business (currentTelegram, telegramConnectionCurrent).
+interface TelegramRuntime {
+  botId: string;
+  generation: string;
+  token: string;
+  abort: AbortController;
+  inbox: telegram.Inbox;
+  /** Chats refused once, remembered for the life of the connection, so
+   * somebody who found the bot and keeps typing gets one answer rather
+   * than one per message. */
+  refused: Set<number>;
+  /** Cards forwarded to a chat and not yet answered, by chat. */
+  asks: Map<number, { requestId: string; botId: string; options: string[]; permission: boolean }>;
+  /** "typing" in each chat whose message the agent is working on. */
+  typing: Map<number, { now(): void; stop(): Promise<void> }>;
+  /** Turns started from each chat, one after another. Kept off the
+   * polling loop so a turn that is running does not stop the next
+   * message being read: that next message may be the answer to a card
+   * the turn raised, or the rest of an album. */
+  turns: Map<number, Promise<void>>;
+  /** Each chat's messages, taken in the order they came: asking an engine
+   * to take one mid-turn is a round trip, and the next must not pass it. */
+  intake: Map<number, Promise<void>>;
+  /** This connection's share of telegramWorking, to stop when it goes. */
+  working: Map<string, TurnProgress>;
+}
+const telegramRuntimes = new Map<string, TelegramRuntime>();
 /** Agents currently answering a phone, so a card they raise can follow
  * the conversation there instead of waiting on a screen nobody is at. */
-const telegramLive = new Map<string, number>();
-/** Cards forwarded to a chat and not yet answered, by chat. */
-const telegramAsks = new Map<
-  number,
-  { requestId: string; botId: string; options: string[]; permission: boolean }
->();
+const telegramLive = new Map<string, { chatId: number; generation: string }>();
+/** Every card forwarded to a chat, by request, with the buttons it was
+ * sent with (server/telegram-cards.ts). */
+const telegramCards = new CardButtons();
+/** Visible notes for a Telegram request, scoped to its consuming lane. */
+const telegramWorking = new Map<string, TurnProgress>();
 
-async function telegramRound(): Promise<void> {
-  const state = cfg.telegram;
-  if (!state?.enabled || !state.token) return;
-  const messages = await telegram.poll(state.token, state.offset ?? 0);
-  const offset = telegram.nextOffset(state.offset ?? 0, messages);
-  if (offset !== (state.offset ?? 0)) {
-    // Saved before anything is acted on. A crash mid-turn should lose
-    // the reply, not replay the message on every restart forever.
-    cfg.telegram = { ...state, offset };
-    saveConfig({ telegram: cfg.telegram } as Partial<AppConfig>);
-  }
-  for (const message of messages) {
-    const decision = telegram.decide(cfg.telegram ?? {}, message);
-    if (decision.kind === "pair") {
-      const paired = [...(cfg.telegram?.chatIds ?? []), decision.chatId];
-      cfg.telegram = { ...cfg.telegram, chatIds: paired, pairing: null };
-      saveConfig({ telegram: cfg.telegram } as Partial<AppConfig>);
-      broadcast({ kind: "config", config: await configStatus() });
-      await telegram
-        .send(state.token, decision.chatId, "Paired. Message me and your agent will answer.")
-        .catch(() => {});
-      continue;
+/** Whether the connection a message came in on is still the agent's. */
+function telegramConnectionCurrent(binding: NonNullable<Message["telegramBinding"]>): boolean {
+  const state = telegramBinding(binding.botId);
+  return Boolean(store.bot(binding.botId) && state?.token && state.enabled && state.generation === binding.generation);
+}
+
+function telegramBinding(botId: string): AgentTelegram | undefined {
+  return cfg.telegram?.bots?.[botId];
+}
+
+/** This loop's saved state, while it is still the agent's connection:
+ * not stopped, the agent still here, the bot switched on, and the same
+ * token and generation it started with. Asked before every send. */
+function currentTelegram(runtime: TelegramRuntime): AgentTelegram | undefined {
+  const state = telegramBinding(runtime.botId);
+  return !runtime.abort.signal.aborted && store.bot(runtime.botId) && state?.enabled && state.token === runtime.token && state.generation === runtime.generation ? state : undefined;
+}
+
+function liveTelegram(botId: string): TelegramRuntime | undefined {
+  const runtime = telegramRuntimes.get(botId);
+  return runtime && currentTelegram(runtime) ? runtime : undefined;
+}
+
+function saveTelegram(next: TelegramConfig): void {
+  saveConfig({ telegram: next });
+  cfg.telegram = next;
+}
+
+function saveTelegramBinding(botId: string, state?: AgentTelegram): void {
+  const bots = { ...(cfg.telegram?.bots ?? {}) };
+  if (state) bots[botId] = state;
+  else delete bots[botId];
+  saveTelegram({ ...cfg.telegram, version: 1, bots });
+}
+
+function refusedTelegramToken(error: unknown): boolean {
+  return (error instanceof telegram.TelegramError && (error.status === 401 || error.status === 403)) ||
+    (error instanceof Error && error.message === "that token was refused");
+}
+
+/** A restored key without its agent is not a connection. Identify only
+ * existing agents, and let a revoked key be replaced. A failed network
+ * check stays distinct from refusal of the new token. */
+async function identifyTelegramBindings(token: string, me: { id: number; username: string }): Promise<void> {
+  for (const [id, other] of Object.entries(cfg.telegram?.bots ?? {})) {
+    if (!store.bot(id) || !other.token || other.telegramId !== undefined) continue;
+    let identified: { id: number; username: string };
+    try { identified = other.token === token ? me : await telegram.whoAmI(other.token); }
+    catch (error) {
+      if (refusedTelegramToken(error)) continue;
+      throw new Error("Could not verify a saved Telegram bot. Try again when Telegram is reachable.");
     }
-    if (decision.kind === "refuse") {
-      if (telegramRefused.has(decision.chatId)) continue;
-      telegramRefused.add(decision.chatId);
-      await telegram
-        .send(state.token, decision.chatId, "This bot is not paired with you.")
-        .catch(() => {});
-      continue;
+    const current = telegramBinding(id);
+    if (store.bot(id) && current?.token === other.token && current.generation === other.generation) {
+      saveTelegramBinding(id, { ...current, telegramId: identified.id, username: identified.username });
     }
-    if (decision.kind !== "deliver") continue;
-    // A card is waiting on this chat: this message is its answer, not a
-    // new request. Free text answers a question; an approval needs one
-    // of its options, so anything else asks again rather than guessing.
-    const waiting = telegramAsks.get(decision.chatId);
-    if (waiting) {
-      const read = telegram.interpretAnswer(decision.text, waiting.options);
-      if (waiting.permission && !read.option) {
-        await telegram
-          .send(state.token, decision.chatId, "Reply 1 or 2, or yes / no.")
-          .catch(() => {});
-        continue;
-      }
-      telegramAsks.delete(decision.chatId);
-      const asked = store.bot(waiting.botId);
-      const askThread = askThreadByRequest.get(waiting.requestId) ?? asked?.threadId ?? "";
-      const instance = asked ? laneInstance(asked, askThread) : null;
-      const behavior = waiting.permission
-        ? read.option === waiting.options[0] ? "allow" : "deny"
-        : "answer";
-      await instance?.adapter
-        .respondToRequest(askThread, waiting.requestId, {
-          behavior,
-          message: waiting.permission ? undefined : (read.option ?? read.free),
-        })
-        .catch(() => {});
-      await telegram.send(state.token, decision.chatId, "Sent.").catch(() => {});
-      continue;
-    }
-    const bot = store.bot(cfg.telegram?.botId ?? "") ?? store.bots.find((b) => !b.hidden);
-    if (!bot) continue;
-    // The reply goes back to the chat that asked, and the exchange lands
-    // in the agent's own thread like any other conversation.
-    const answer = await answerOverTelegram(bot.id, decision.text, decision.chatId).catch(
-      (error: unknown) => `Could not answer: ${(error as Error).message}`,
-    );
-    await telegram.send(state.token, decision.chatId, answer).catch(() => {});
   }
 }
+
+/** One bot answering for two agents would have both speak under one
+ * name, so a bot some other agent here already has is refused. */
+function duplicateTelegramBot(botId: string, telegramId: number): boolean {
+  return Object.entries(cfg.telegram?.bots ?? {}).some(([id, other]) => id !== botId && store.bot(id) && other.telegramId === telegramId);
+}
+
+/** Where an answer held through a restart may still go: the bot of the
+ * agent whose lane it is, and only the connection it was asked on. One
+ * saved before bots had generations goes to the agent the old workspace
+ * bot moved to. */
+function telegramReturnState(laneId: string, reply: TelegramReply): telegram.TelegramState {
+  const bot = store.bots.find((item) => item.tasks.some((lane) => lane.id === laneId));
+  if (!bot || (reply.botId && reply.botId !== bot.id)) return {};
+  const state = telegramBinding(bot.id);
+  if (!state || (reply.generation ? reply.generation !== state.generation : cfg.telegram?.migratedBotId !== bot.id)) return {};
+  return { ...state, botId: bot.id, chatIds: pairedChats(state) };
+}
+
+const telegramReturns = new TelegramReturns(
+  store, telegramReturnState,
+  (threadId, message) => broadcast({ kind: "message.patch", threadId, message }),
+  (threadId, text) => {
+    const message = store.appendMessage(threadId, { role: "bot", kind: "notice", text });
+    broadcast({ kind: "message", threadId, message });
+  },
+  // a request held through a restart gets its files back too
+  async (laneId, chatId, said, reply) => {
+    const owner = store.bots.find((bot) => bot.tasks.some((lane) => lane.id === laneId));
+    const runtime = owner ? liveTelegram(owner.id) : undefined;
+    if (runtime && telegramReturnState(laneId, reply).token) await telegramFiles(runtime, chatId, deliverablesIn(runtime.botId, said));
+  },
+  redactSecrets,
+);
+
+/** A reply to a chat. A failed send is not worth a crash. Only what an
+ * agent wrote is read as Markdown: the bot's own lines and a card's
+ * summary of a command are shown exactly as they are. */
+async function telegramSay(runtime: TelegramRuntime, chatId: number, text: string, markdown = false): Promise<void> {
+  if (currentTelegram(runtime)) await telegram.send(runtime.token, chatId, text, markdown, undefined, () => Boolean(currentTelegram(runtime))).catch(() => {});
+}
+
+/** Silent notes in this chat, paused while a card waits on the person. */
+function telegramProgress(runtime: TelegramRuntime, chatId: number): telegram.Progress {
+  return new telegram.Progress({
+    post: (text) => currentTelegram(runtime) ? telegram.post(runtime.token, chatId, text, undefined, true, () => Boolean(currentTelegram(runtime))) : Promise.resolve(undefined),
+    // Cleanup uses the captured old token, never a replacement bot's.
+    remove: (messageId) => telegram.remove(runtime.token, chatId, messageId),
+  }, () => runtime.asks.has(chatId));
+}
+
+/**
+ * Hand an answer given on a phone, typed or tapped, to the ask it is for.
+ * False when nothing was waiting on it any more: the turn ended, or its
+ * engine went. An approval is allowed only by its first choice.
+ */
+async function answerTelegramAsk(
+  ask: { requestId: string; botId: string; options: string[]; permission: boolean },
+  read: { option?: string; free?: string },
+): Promise<boolean> {
+  const asked = store.bot(ask.botId);
+  const askThread = askThreadByRequest.get(ask.requestId) ?? asked?.threadId ?? "";
+  const instance = asked ? askInstance(asked, askThread, ask.requestId) : null;
+  const behavior = ask.permission ? (read.option === ask.options[0] ? "allow" : "deny") : "answer";
+  const message = ask.permission ? undefined : (read.option ?? read.free);
+  telegramCards.expect(ask.requestId, message);
+  if (!instance) return false;
+  return instance.adapter.respondToRequest(askThread, ask.requestId, { behavior, message }).then(() => true, () => false);
+}
+
+/** A forwarded card's message, rewritten to say how it was answered and
+ * without its buttons. Only a nicety: the answer itself has already gone
+ * where it was going, so a failure here is let pass. */
+function rewriteTelegramCard(card: ForwardedCard): void {
+  const runtime = liveTelegram(card.botId);
+  if (!runtime || card.generation !== runtime.generation || card.messageId === undefined) return;
+  void telegram.edit(runtime.token, card.chatId, card.messageId, settledText(card)).catch(() => {});
+}
+
+/** A card answered or closed anywhere. The chat it went to is told, and
+ * its next line is a message again rather than an answer to it. */
+function settleTelegramCard(requestId: string, outcome: (card: ForwardedCard) => string): void {
+  const card = telegramCards.settle(requestId, outcome);
+  if (card) rewriteTelegramCard(card);
+  for (const runtime of telegramRuntimes.values()) for (const [chatId, waiting] of runtime.asks) {
+    if (waiting.requestId !== requestId) continue;
+    runtime.asks.delete(chatId);
+    // the agent is working again, so the chat says so at once
+    runtime.typing.get(chatId)?.now();
+  }
+}
+
+/** One connection's inbox. The rules (who is paired, what answers a
+ * card, what happens to a voice message or a photo) are in
+ * server/telegram.ts; these are its hands, and each one checks that the
+ * connection is still the agent's before it touches anything. */
+function makeTelegramRuntime(botId: string, state: AgentTelegram): TelegramRuntime {
+  const runtime: TelegramRuntime = {
+    botId, generation: state.generation, token: state.token!, abort: new AbortController(),
+    refused: new Set(), asks: new Map(), typing: new Map(), turns: new Map(), intake: new Map(), working: new Map(),
+    inbox: null as unknown as telegram.Inbox,
+  };
+  const active = () => {
+    const current = currentTelegram(runtime);
+    if (!current) throw new Error("the Telegram connection changed");
+    return current;
+  };
+  runtime.inbox = new telegram.Inbox({
+    state: () => { const current = currentTelegram(runtime); return current ? inboxState(current) : {}; },
+    send: (chatId, text) => telegramSay(runtime, chatId, text),
+    // The owner is the Telegram account that sent the word in a private
+    // chat (decide), kept by its user id: a chat id or a display name
+    // says where a message came from, not who wrote it.
+    async pair(chatId, userId) {
+      const current = active();
+      if (!Number.isSafeInteger(userId) || userId! <= 0) return;
+      saveTelegramBinding(botId, { ...current, ownerUserId: userId, ownerChatId: chatId, pairing: null });
+      broadcast({ kind: "config", ...(await configStatus()) });
+      await telegramSay(runtime, chatId, "Paired. Message me and your agent will answer.");
+    },
+    async refuse(chatId) {
+      if (runtime.refused.has(chatId) || runtime.refused.size >= 500) return;
+      runtime.refused.add(chatId);
+      await telegramSay(runtime, chatId, "This bot is not paired with you.");
+    },
+    download: (fileId, maxBytes) => { active(); return telegram.download(runtime.token, fileId, maxBytes); },
+    transcriber: () => speech.transcriptionVendor(cfg) ? (audio) => { active(); return speech.transcribe(cfg, audio, "voice.ogg", "audio/ogg"); } : null,
+    saveImage: (bytes) => { active(); return attachments.saveImage(bytes); },
+    saveVoice: (bytes) => { active(); return attachments.saveBytes(bytes, "ogg"); },
+    saveFile: (bytes, extension) => { active(); return attachments.saveBytes(bytes, extension); },
+    waiting: (chatId) => runtime.asks.get(chatId),
+    async answer(chatId, read) {
+      if (!currentTelegram(runtime)) return;
+      const waiting = runtime.asks.get(chatId);
+      if (!waiting) return;
+      runtime.asks.delete(chatId);
+      await answerTelegramAsk(waiting, read);
+      // The turn goes on, so the chat says so again without waiting for
+      // the next tick.
+      runtime.typing.get(chatId)?.now();
+    },
+    async press(chatId, press) {
+      if (!currentTelegram(runtime)) return;
+      const found = telegramCards.press(chatId, press.messageId, press.data, Date.now(), { botId, generation: runtime.generation });
+      if (found && !('settled' in found) && (found.card.botId !== botId || found.card.generation !== runtime.generation)) return;
+      if (!found || "settled" in found) {
+        // Answered already, by this button or some other way, or a card
+        // from before a restart or another connection, which nothing is
+        // waiting on any more.
+        await telegram.answerPress(runtime.token, press.id, found ? found.settled : "That card has already closed.").catch(() => {});
+        if (!found) await telegram.unbutton(runtime.token, chatId, press.messageId).catch(() => {});
+        return;
+      }
+      const { card, option } = found;
+      if (runtime.asks.get(chatId)?.requestId === card.requestId) runtime.asks.delete(chatId);
+      if (!(await answerTelegramAsk(card, { option }))) telegramCards.reword(card, "That card had already closed, so nothing was done.");
+      await telegram.answerPress(runtime.token, press.id, card.settled).catch(() => {});
+      rewriteTelegramCard(card);
+      runtime.typing.get(chatId)?.now();
+    },
+    deliver(chatId, text) {
+      const intake = (runtime.intake.get(chatId) ?? Promise.resolve()).then(async () => {
+        if (!currentTelegram(runtime)) return;
+        const bot = store.bot(botId);
+        const lane = bot?.tasks.find((task) => task.id === activeLaneOf(bot));
+        const binding = { botId, generation: runtime.generation };
+        // A follow-up while this chat waits on an answer goes into the turn
+        // being answered, and that one reply covers it, rather than waiting
+        // for the answer to come back before it is even read (GitHub 213).
+        // A drain request recovered its own return address. A follow-up
+        // joins that answer when steered, or gets one for its queued turn.
+        // Neither path starts the normal busy wait and sends a second copy.
+        if (bot && lane?.busy && telegramReturns.answering(lane.id, chatId, binding)) {
+          if (!(await steerLane(bot, lane, text, { fromTelegram: true, telegramBinding: { botId, generation: runtime.generation } }).catch(() => null)) && currentTelegram(runtime)) {
+            queueOnLane(bot.id, lane.id, text, { telegramReply: queuedTelegramReply(chatId, binding), fromTelegram: true, telegramBinding: { botId, generation: runtime.generation } });
+            drainSteer(lane.id);
+          }
+          return;
+        }
+        if (bot && lane && runtime.turns.has(chatId) && (await steerLane(bot, lane, text, { fromTelegram: true, telegramBinding: { botId, generation: runtime.generation } }).catch(() => null))) return;
+        const turn = (runtime.turns.get(chatId) ?? Promise.resolve()).then(async () => {
+          if (!currentTelegram(runtime)) return;
+          if (!bot) return telegramSay(runtime, chatId, "There is no agent here to answer yet, so that did not reach anyone.");
+          // The reply goes back to the chat that asked, and the exchange lands
+          // in the agent's own thread like any other conversation.
+          const answer = await answerOverTelegram(bot.id, text, chatId, runtime).catch(
+            (error: unknown): TelegramAnswer => ({ text: `Could not answer: ${redactSecrets((error as Error).message)}`, markdown: false, files: [] }),
+          );
+          await telegramSay(runtime, chatId, answer.text, answer.markdown);
+          await telegramFiles(runtime, chatId, answer.files);
+        });
+        runtime.turns.set(chatId, turn);
+        void turn.finally(() => { if (runtime.turns.get(chatId) === turn) runtime.turns.delete(chatId); }).catch(() => {});
+      });
+      runtime.intake.set(chatId, intake);
+      void intake.finally(() => { if (runtime.intake.get(chatId) === intake) runtime.intake.delete(chatId); }).catch(() => {});
+    },
+  });
+  return runtime;
+}
+
+/** Brings an agent's loop in line with what is saved for it: starts one,
+ * leaves a current one alone, or retires one whose connection changed,
+ * along with everything that one still had in hand. Called at startup
+ * for every agent and after every change to a bot. */
+function startTelegramBot(botId: string): void {
+  const previous = telegramRuntimes.get(botId);
+  const configured = telegramBinding(botId);
+  // A restart has no old runtime to retire. Reconcile saved queues too.
+  for (const lane of store.bot(botId)?.tasks ?? []) {
+    for (const message of store.messagesFor(lane.id)) {
+      const binding = message.telegramBinding ?? message.telegramReply;
+      if (message.queued && binding?.generation && (!configured?.token || !configured.enabled || binding.generation !== configured.generation)) dropQueuedTelegram(botId, binding.generation);
+    }
+  }
+  if (previous && currentTelegram(previous)) return;
+  if (previous) {
+    previous.abort.abort();
+    dropQueuedTelegram(botId, previous.generation);
+    for (const typing of previous.typing.values()) void typing.stop().catch(() => {});
+    for (const [laneId, progress] of previous.working) {
+      if (telegramWorking.get(laneId) === progress) telegramWorking.delete(laneId);
+      void progress.stop().catch(() => {});
+    }
+    if (telegramLive.get(botId)?.generation === previous.generation) telegramLive.delete(botId);
+    previous.asks.clear();
+    telegramRuntimes.delete(botId);
+  }
+  const state = telegramBinding(botId);
+  if (!state?.token || !state.enabled || !store.bot(botId)) return;
+  const runtime = makeTelegramRuntime(botId, state);
+  telegramRuntimes.set(botId, runtime);
+  void telegramLoop(runtime);
+}
+
+/** Removal takes queued transport work out at once; it does not stop a
+ * turn already working in the app. Keep the words visible as unsent. */
+function dropQueuedTelegram(botId: string, generation: string): void {
+  for (const lane of store.bot(botId)?.tasks ?? []) {
+    const waiting = store.messagesFor(lane.id).filter((message) => message.queued && !message.deleted &&
+      (message.telegramBinding?.generation === generation || message.telegramReply?.generation === generation));
+    for (const message of waiting) {
+      const patch = store.patchMessage(lane.id, message.id, { queued: false, unsent: true, ...(message.telegramReply ? { telegramReply: { ...message.telegramReply, state: "failed" as const } } : {}) });
+      if (patch) broadcast({ kind: "message.patch", threadId: lane.id, message: patch });
+    }
+    if (waiting.length) {
+      const notice = store.appendMessage(lane.id, { role: "bot", kind: "notice", text: "Queued Telegram messages were not sent because this agent's Telegram connection changed. Their words remain in the app." });
+      broadcast({ kind: "message", threadId: lane.id, message: notice });
+    }
+  }
+}
+
+async function telegramRound(runtime: TelegramRuntime): Promise<void> {
+  let state = currentTelegram(runtime);
+  if (!state) return;
+  if (state.telegramId === undefined) {
+    const me = await telegram.whoAmI(runtime.token, runtime.abort.signal);
+    state = currentTelegram(runtime);
+    if (!state) return;
+    if (duplicateTelegramBot(runtime.botId, me.id)) throw new Error("This Telegram bot is already used by another agent");
+    saveTelegramBinding(runtime.botId, { ...state, telegramId: me.id, username: me.username });
+    state = currentTelegram(runtime)!;
+  }
+  const messages = await telegram.poll(runtime.token, state.offset ?? 0, runtime.abort.signal);
+  const current = currentTelegram(runtime);
+  if (!current) return;
+  const offset = telegram.nextOffset(current.offset ?? 0, messages);
+  // Saved before anything is acted on. A crash mid-turn should lose
+  // the reply, not replay the message on every restart forever. And
+  // only then kept: a save refused (an unreadable config.json) throws
+  // with the old offset still in place, so the next poll asks for the
+  // same messages again rather than acknowledging ones never handled.
+  if (offset !== (current.offset ?? 0)) saveTelegramBinding(runtime.botId, { ...current, offset });
+  for (const message of messages) {
+    if (!currentTelegram(runtime)) return;
+    await runtime.inbox.take(message);
+  }
+}
+
+async function telegramLoop(runtime: TelegramRuntime): Promise<void> {
+  try {
+    while (currentTelegram(runtime)) {
+      try { await telegramRound(runtime); }
+      // Telegram unreachable, a bad token, a laptop that just woke.
+      // Wait before asking again rather than spinning on the failure.
+      catch { if (currentTelegram(runtime)) await telegramPause(runtime, 15_000); }
+      if (currentTelegram(runtime)) await telegramPause(runtime, 500);
+    }
+  } finally {
+    runtime.abort.abort();
+    if (telegramRuntimes.get(runtime.botId) === runtime) telegramRuntimes.delete(runtime.botId);
+    if (telegramLive.get(runtime.botId)?.generation === runtime.generation) telegramLive.delete(runtime.botId);
+    for (const typing of runtime.typing.values()) void typing.stop().catch(() => {});
+    for (const [laneId, progress] of runtime.working) {
+      if (telegramWorking.get(laneId) === progress) telegramWorking.delete(laneId);
+      void progress.stop().catch(() => {});
+    }
+  }
+}
+
+/** A wait that ends early when the connection is retired, so a bot that
+ * was removed stops now and not at the end of a quarter minute. */
+function telegramPause(runtime: TelegramRuntime, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = () => { clearTimeout(timer); runtime.abort.signal.removeEventListener("abort", finish); resolve(); };
+    const timer = setTimeout(finish, ms);
+    if (runtime.abort.signal.aborted) finish();
+    else runtime.abort.signal.addEventListener("abort", finish, { once: true });
+  });
+}
+
+// Reconcile retired queued work even when its whole binding was removed.
+for (const bot of store.bots) startTelegramBot(bot.id);
 
 /**
  * Run a turn for a message that arrived from a phone, and read back what
@@ -4447,53 +8642,169 @@ async function telegramRound(): Promise<void> {
  * started on a phone is the same conversation when you open the Mac.
  * The reply is whatever it said that was not already there, which is
  * how a turn that ran tools and then answered comes back as the answer
- * rather than as the running commentary.
+ * rather than as the running commentary, with whatever files it left.
  */
-async function answerOverTelegram(botId: string, text: string, chatId: number): Promise<string> {
+async function answerOverTelegram(botId: string, text: string, chatId: number, runtime: TelegramRuntime): Promise<TelegramAnswer> {
   const bot = store.bot(botId);
   if (!bot) throw new Error("that agent is gone");
-  const laneId = bot.activeTaskId ?? bot.threadId;
+  const laneId = activeLaneOf(bot);
   const before = store.messagesFor(laneId).length;
-  telegramLive.set(botId, chatId);
+  if (!currentTelegram(runtime)) throw new Error("the Telegram connection changed");
+  telegramLive.set(botId, { chatId, generation: runtime.generation });
+  // only chats the person allowed get this far: this is them, on a phone
+  withYou({ bot });
+  // Bloks is finishing up to restart. The words wait in the lane like any
+  // queued message, with the chat that asked saved as its return address.
+  if (drain.on) {
+    if (telegramLive.get(botId)?.generation === runtime.generation) telegramLive.delete(botId);
+    queueOnLane(botId, laneId, text, { telegramReply: queuedTelegramReply(chatId, { botId, generation: runtime.generation }), waitsFor: "restart", fromTelegram: true, telegramBinding: { botId, generation: runtime.generation } });
+    return {
+      text: "Your message is saved. The answer will come here once Bloks is back, and it will also be in the app.",
+      markdown: false,
+      files: [],
+    };
+  }
+  // The phone shows "typing" for as long as the turn runs, the way the
+  // app shows "working…", except while a card forwarded to this chat
+  // waits: then the agent is waiting on the person, not working.
+  const typing = telegram.keepTyping(
+    () => currentTelegram(runtime) ? telegram.chatAction(runtime.token, chatId) : Promise.resolve(),
+    () => runtime.asks.has(chatId),
+  );
+  runtime.typing.set(chatId, typing);
+  // Completed visible notes belong to the request's consuming turn,
+  // never a turn it waited behind. Resolve the row before engine text
+  // can arrive, also when startTurn has not returned yet.
+  let requestId: string | undefined;
+  const asked = () => requestId ??= store.messagesFor(laneId).slice(before)
+    .find((m) => m.role === "user" && m.kind === "text" && m.fromTelegram)?.id;
+  const progress = new TurnProgress(telegramProgress(runtime, chatId),
+    () => store.messagesFor(laneId), asked, () => turnStarted.get(laneId));
+  telegramWorking.set(laneId, progress);
+  runtime.working.set(laneId, progress);
+  const settled = async () => {
+    if (telegramLive.get(botId)?.generation === runtime.generation) telegramLive.delete(botId);
+    runtime.asks.delete(chatId);
+    // However the turn ended, nothing is working on this chat now.
+    if (runtime.typing.get(chatId) === typing) runtime.typing.delete(chatId);
+    runtime.working.delete(laneId);
+    if (telegramWorking.get(laneId) === progress) telegramWorking.delete(laneId);
+    await typing.stop();
+    await progress.stop();
+  };
+  // Busy with a turn that did not start here: the words go into it if
+  // its engine can take them, and wait in the lane like any queued
+  // message if not. Either way the answer comes back here. Turning them
+  // away lost the message (GitHub 213). A held or archived agent is
+  // refused by startTurn below, as it always was.
+  const lane = bot.tasks.find((t) => t.id === laneId);
+  if (lane && laneWaits(lane) && !wheel.heldBy(botId) && !bot.archivedAt) {
+    try {
+      const steered = await steerLane(bot, lane, text, { fromTelegram: true, telegramBinding: { botId, generation: runtime.generation } });
+      if (!steered && !currentTelegram(runtime)) throw new Error("the Telegram connection changed");
+      const sent = steered ?? queueOnLane(botId, laneId, text, { fromTelegram: true, telegramBinding: { botId, generation: runtime.generation } });
+      requestId = sent.id;
+      progress.observe();
+      // the turn may have ended while its engine was asked
+      if (!steered) drainSteer(laneId);
+      await answeredAfter(botId, laneId, sent.id, 20 * 60_000, runtime.abort.signal);
+      const list = store.messagesFor(laneId);
+      const from = list.findIndex((m) => m.id === sent.id);
+      return replyIn(botId, from >= 0 ? list.slice(from + 1) : [], progress.answerSpan());
+    } finally {
+      await settled();
+    }
+  }
   try {
-    await startTurn(botId, text);
+    await startTurn(botId, text, { byYou: true, fromTelegram: true, telegramBinding: { botId, generation: runtime.generation } });
+    progress.observe();
     // Longer than an ordinary wait, because a card forwarded to the
     // phone is answered on the phone's schedule, not the app's.
-    await waitForIdle(botId, 20 * 60_000);
+    await waitForIdle(botId, 20 * 60_000, runtime.abort.signal);
   } finally {
-    telegramLive.delete(botId);
-    telegramAsks.delete(chatId);
+    await settled();
   }
-  const said = store
-    .messagesFor(laneId)
-    .slice(before)
-    .filter((message) => message.role === "bot" && message.kind === "text" && message.text)
-    .map((message) => message.text as string)
-    .join("\n\n")
-    .trim();
-  return said || "(the agent finished without saying anything)";
+  return replyIn(botId, store.messagesFor(laneId).slice(before), progress.answerSpan());
 }
 
-async function telegramLoop(): Promise<void> {
-  if (telegramRunning) return;
-  telegramRunning = true;
-  for (;;) {
-    try {
-      await telegramRound();
-    } catch {
-      // Telegram unreachable, a bad token, a laptop that just woke.
-      // Wait before asking again rather than spinning on the failure.
-      await new Promise((resolve) => setTimeout(resolve, 15_000));
-    }
-    if (!cfg.telegram?.enabled) {
-      telegramRunning = false;
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
+/** A Telegram turn's reply: what the agent said, and what it left. */
+interface TelegramAnswer extends TelegramText {
+  files: telegram.Deliverable[];
 }
 
-if (cfg.telegram?.enabled) void telegramLoop();
+function replyIn(botId: string, messages: readonly Message[], said: readonly Message[]): TelegramAnswer {
+  return { ...telegramReply(said, redactSecrets), files: deliverablesIn(botId, messages) };
+}
+
+/**
+ * The files a turn left in these messages, for a phone: whatever it saved
+ * to its deliverables folder, and the last look at its screen. Each is
+ * read only when it is sent, as it is then; one saved twice goes once.
+ */
+function deliverablesIn(botId: string, messages: readonly Message[]): telegram.Deliverable[] {
+  const files = new Map<string, telegram.Deliverable>();
+  const keep = (file: telegram.Deliverable) => {
+    files.delete(file.name);
+    files.set(file.name, file);
+  };
+  for (const message of messages) {
+    if (message.deleted) continue;
+    if (message.kind === "artifact" && message.artifact) {
+      const { name } = message.artifact;
+      const path = artifacts.artifactPath(botId, name);
+      if (!path) continue;
+      let size: number;
+      try {
+        size = statSync(path).size;
+      } catch {
+        continue;
+      }
+      const mime = artifacts.mimeOf(name);
+      keep({ name, mime, size, blob: () => openAsBlob(path, { type: mime }) });
+    } else if (message.kind === "screen" && message.png) {
+      const bytes = Buffer.from(message.png, "base64");
+      const mime = message.mime || "image/png";
+      keep({ name: mime === "image/jpeg" ? "screen.jpg" : "screen.png", mime, size: bytes.length, blob: async () => new Blob([bytes], { type: mime }) });
+    }
+  }
+  return [...files.values()];
+}
+
+/** What a turn left, sent after its answer, to the chat that asked. The
+ * pairing is asked again here, since a turn can outlast it. */
+async function telegramFiles(runtime: TelegramRuntime, chatId: number, files: telegram.Deliverable[]): Promise<void> {
+  const state = currentTelegram(runtime);
+  if (!files.length || !state || !pairedChats(state).includes(chatId)) return;
+  const note = await telegram.sendFiles(runtime.token, chatId, files, telegram.FILES_PER_TURN, () => Boolean(currentTelegram(runtime))).catch(() => "");
+  if (note) await telegramSay(runtime, chatId, note);
+}
+
+/** Resolves once the turn that took this message has ended: at once
+ * for words handed to a running turn, and for words that waited, once
+ * they went and the turn they started is over. Watches the lane, since
+ * the turn that takes a queued message is started by the drain and
+ * nobody hands this its result. Gives up when the message is taken
+ * back, and at the deadline. */
+function answeredAfter(botId: string, laneId: string, messageId: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    let ran = false;
+    const tick = () => {
+      const lane = store.bot(botId)?.tasks.find((t) => t.id === laneId);
+      const list = store.messagesFor(laneId);
+      const at = list.findIndex((m) => m.id === messageId);
+      const m = list[at];
+      if (signal?.aborted || !lane || !m || m.deleted || m.unsent || Date.now() - started > timeoutMs) return resolve();
+      if (!m.queued && lane.busy) ran = true;
+      // A turn too quick to be seen busy still leaves its words, or a
+      // notice that it could not start, after the message.
+      const answered = list.slice(at + 1).some((later) => later.role === "bot");
+      if (!m.queued && !lane.busy && (ran || answered)) return resolve();
+      setTimeout(tick, 250);
+    };
+    tick();
+  });
+}
 
 // ── shared rooms in Slack and Discord ──────────────────────────────────
 // The rules are in server/chat-bridge.ts and the wire in server/slack.ts
@@ -4596,7 +8907,7 @@ const mailSeen = new Set<string>();
 /** Mail waiting for its agent's Email lane to be free. */
 const mailQueue: Array<{ botId: string; mail: InboundMail }> = [];
 /** The mail each Email lane is answering, for the reply. */
-const mailAnswering = new Map<string, { botId: string; mail: InboundMail; until?: number }>();
+const mailAnswering = new Map<string, { botId: string; mail: InboundMail; until?: number; messageId?: string }>();
 
 /** The part of an address that names an agent: lowercase letters, digits
  * and dashes, from its name. */
@@ -4617,10 +8928,19 @@ function mailAddressOf(bot: BotRecord): string | null {
 }
 
 function mayMail(from: string): boolean {
-  const allow = (cfg.chat?.email?.allowFrom ?? []).map((a) => a.trim().toLowerCase()).filter(Boolean);
-  if (!allow.length) return true;
+  return !mailAllowList().length || mailListed(from);
+}
+
+function mailAllowList(): string[] {
+  return (cfg.chat?.email?.allowFrom ?? []).map((a) => a.trim().toLowerCase()).filter(Boolean);
+}
+
+/** Whether the owner named this sender, by address or @domain. Asked
+ * when the mail's turn starts, so a list changed while it waited decides,
+ * and a list emptied in that time vouches for nobody. */
+function mailListed(from: string): boolean {
   const address = from.toLowerCase();
-  return allow.some((a) => (a.startsWith("@") ? address.endsWith(a) : address === a));
+  return mailAllowList().some((a) => (a.startsWith("@") ? address.endsWith(a) : address === a));
 }
 
 async function onEmailHook(hook: { platform: string; body: string }): Promise<number> {
@@ -4648,12 +8968,47 @@ async function onEmailHook(hook: { platform: string; body: string }): Promise<nu
   return 202;
 }
 
+/**
+ * The lane an agent answers strangers' mail in: the one marked for it,
+ * made and marked when there is none, or undefined while it is busy. Not
+ * found by its title, which the person may change, and never another lane
+ * at the cap: the mail waits for room instead.
+ */
+function guestMailLaneId(botId: string): string | undefined {
+  const bot = store.bot(botId);
+  if (!bot) return undefined;
+  const marked = bot.tasks.find((t) => t.guestMail);
+  if (marked) return marked.busy || claimedLanes.has(marked.id) ? undefined : marked.id;
+  const active = bot.activeTaskId;
+  const made = store.createTask(botId, UNLISTED_MAIL);
+  if (!made) return undefined;
+  store.markGuestMail(made.id);
+  // background work keeps the person's screen where it was
+  store.setActiveTask(botId, active);
+  broadcast({ kind: "bot", bot: clientBot(store.bot(botId)) });
+  return made.id;
+}
+
 /** Starts a turn for each waiting mail whose agent's Email lane is free. */
 async function drainMail() {
   for (const item of [...mailQueue]) {
-    const laneId = backgroundTaskId(item.botId, "Email");
+    // waits in the line, as it does for a busy Email lane, until Bloks is
+    // back or the drain is called off. Asked before each one, since a
+    // drain can begin while the last one's turn was starting.
+    if (drain.on) return;
+    // Another pass over the line may have taken this one while this pass
+    // waited on a turn starting. It is being answered already, and
+    // splicing at -1 would drop whichever mail is last in the line.
+    const at = mailQueue.indexOf(item);
+    if (at < 0) continue;
+    // Mail from someone the owner has not listed has a conversation of its
+    // own. The owner's turns in "Email" resume that lane's session, and
+    // would read whatever such a mail told the agent with the owner's
+    // trust; and at the lane cap it waits rather than borrow one of theirs.
+    const listed = mailListed(String(item.mail.from ?? ""));
+    const laneId = listed ? backgroundTaskId(item.botId, "Email") : guestMailLaneId(item.botId);
     if (!laneId) continue;
-    mailQueue.splice(mailQueue.indexOf(item), 1);
+    mailQueue.splice(at, 1);
     const { mail } = item;
     const text = [
       `An email from ${mail.fromName && mail.fromName !== mail.from ? `${mail.fromName} <${mail.from}>` : mail.from}${mail.subject ? `, subject "${mail.subject}"` : ""}:`,
@@ -4664,9 +9019,21 @@ async function drainMail() {
     ].join("\n");
     const said = store.appendMessage(laneId, { role: "user", kind: "text", text, via: "email" });
     broadcast({ kind: "message", threadId: laneId, message: said });
-    mailAnswering.set(laneId, item);
-    await startTurn(item.botId, text, { taskId: laneId, presetMessage: true }).catch((e) => {
+    // the reply is what is said after this mail, and only that
+    mailAnswering.set(laneId, { ...item, messageId: said.id });
+    // mail from an address the owner listed is the owner's business; mail
+    // from anyone else runs on none of the owner's standing trust
+    const requester = listed ? undefined : MAIL_FROM_ANYONE;
+    await startTurn(item.botId, text, { taskId: laneId, presetMessage: true, answersMail: true, ...(requester ? { requester } : {}) }).catch((e) => {
       mailAnswering.delete(laneId);
+      // Bloks began finishing up to restart: back in line, and out of the
+      // lane until it is answered, so it is not there twice
+      if ((e as { draining?: boolean }).draining) {
+        mailQueue.unshift(item);
+        const gone = store.patchMessage(laneId, said.id, { deleted: true });
+        if (gone) broadcast({ kind: "message.patch", threadId: laneId, message: gone });
+        return;
+      }
       const notice = store.appendMessage(laneId, { role: "bot", kind: "notice", text: `The email could not be answered: ${(e as Error).message}` });
       broadcast({ kind: "message", threadId: laneId, message: notice });
     });
@@ -4688,7 +9055,9 @@ function replyByMail(laneId: string, ok: boolean) {
   mailAnswering.delete(laneId);
   const bot = store.bot(answering.botId);
   const address = bot ? mailAddressOf(bot) : null;
-  const said = lastSaid(laneId);
+  // Said after the mail, or nothing: the last words in the lane may be an
+  // earlier sender's reply, when this turn's answer was only a component.
+  const said = answering.messageId ? saidAfter(laneId, answering.messageId) : lastSaid(laneId);
   if (!bot || !address || !ok || !said) return;
   const subject = answering.mail.subject ? (/^re:/i.test(answering.mail.subject) ? answering.mail.subject : `Re: ${answering.mail.subject}`) : "A reply from your agent";
   void relayLink
@@ -4755,7 +9124,6 @@ async function onChatMessage(message: ChatMessage) {
   );
   if (decision.kind === "ignore") return;
   if (decision.kind === "post") {
-    for (const id of blok.memberIds) agentHops.delete(id);
     try {
       enqueueRoomPost(blok, decision.text, { personId: decision.personId, via: message.platform, hops: 0 });
     } catch {}
@@ -4894,6 +9262,9 @@ function plantSecretCard(
   if (!label) return "The secret needs a name, e.g. \"Transistor API key\". Try again with one.";
   const envName = secretEnvName(label);
   if (!envName) return "That name has no usable characters; try a plainer one.";
+  if (reservedEnvName(envName)) {
+    return `${envName} is a name the system and the engines read for themselves, so a secret cannot be saved under it. Ask again with a name for what the key is for, e.g. "Transistor API key".`;
+  }
   const message = store.appendMessage(threadId, {
     role: "bot",
     kind: "secret",
@@ -4929,7 +9300,7 @@ function maybeResumeAfterConnect(botId: string, threadId: string, resumeKey: str
   void startTurn(
     botId,
     `${names} ${live.length === 1 ? "is" : "are"} now connected. Continue the task you were working on before asking for the connection.`,
-    { taskId: threadId, presetMessage: true },
+    { taskId: threadId, presetMessage: true, byYou: turnsForYou.has(threadId) },
   ).catch((e) => {
     // The cards are already marked resumed, and this guard only fires
     // once, so a swallowed refusal leaves the task parked on a
@@ -4947,19 +9318,390 @@ function maybeResumeAfterConnect(botId: string, threadId: string, resumeKey: str
 }
 
 // ── steering a busy agent ─────────────────────────────────────────────
-// Words said to a busy lane are not an error; they are the next thing to
-// say. They land in the transcript immediately (flagged queued), wait in
-// memory, and drain into one follow-up turn when the lane settles. A
-// restart loses only the auto-send intent; the words are already saved.
+// Words the person says to a busy lane go into the turn that is running,
+// when its engine can take them (steerLane): the agent reads them after
+// the step it is on, so it can change course before it finishes work
+// that was asked to change (GitHub 213). So do another agent's, when it
+// asks for that and may (`bloks say --now`, GitHub 238). Everything
+// else said to a busy lane is not an error either; it is the next thing
+// to say. It is written down immediately (flagged queued), waits in
+// memory, and drains into one follow-up turn when the lane settles; only
+// then does it join the conversation (deliverQueued). A restart rebuilds
+// the waiting from the transcript (recoverQueued), so nothing flagged
+// queued is left behind waiting forever.
+// An item with a messageId carries no words of its own. They are read
+// from the transcript when the burst goes, because the person can still
+// edit a waiting message or take it back, and what the agent hears has
+// to be what the chat shows (GitHub 155).
 // An item with no messageId is a note from Bloks itself, like the one
 // that resumes a task after a secret is saved: nothing in the transcript
-// to wait on, so it is always still due.
-const steerQueues = new Map<string, { botId: string; items: Array<{ messageId?: string; text: string }> }>();
+// to wait on, so it is always still due, and its words travel with it.
+// An item an agent sent carries its place in a chain of agents' messages
+// (agentChain), which a restart forgets along with the rest of memory.
+const steerQueues = new Map<
+  string,
+  { botId: string; items: Array<{ messageId?: string; text?: string; source?: "webhook"; chain?: number }> }
+>();
 
-async function sendUserMessage(botId: string, text: string, options: { taskId?: string; replyTo?: ReplyRef } = {}) {
+/** What one waiting item says now, or null for a message that no longer
+ * says anything: taken back, rewound, or gone from the lane. A message
+ * from another agent is framed the way it would have been when it was
+ * queued, with who it is from and how to answer. */
+function steerWords(laneId: string, item: { messageId?: string; text?: string }): string | null {
+  if (!item.messageId) return item.text ?? null;
+  const m = store.messagesFor(laneId).find((msg) => msg.id === item.messageId);
+  if (!m || m.deleted || m.unsent || !m.text) return null;
+  if (m.telegramBinding && !telegramConnectionCurrent(m.telegramBinding)) return null;
+  return storedPrompt(m);
+}
+
+/** Waiting messages go. Until now they sat above the composer, outside
+ * the conversation; they enter it here, after everything said while
+ * they waited, because that is where the agent hears them. Moved on
+ * disk and not only on screen, so a room's history, a replayed
+ * transcript and an export all read in the order things happened
+ * (GitHub 170). One moment for a burst, because one turn takes all of
+ * it. The patch says it moved, so a screen moves it too. */
+function deliverQueued(threadId: string, messageIds: readonly string[]) {
+  const deliveredAt = Date.now();
+  const moved = store.moveToEnd(threadId, messageIds, (m) => ({
+    queued: false,
+    waitsFor: undefined,
+    deliveredAt,
+    at: deliveredAt,
+    queuedAt: m.queuedAt ?? m.at,
+  }));
+  for (const message of moved) broadcast({ kind: "message.patch", threadId, message, moved: true });
+}
+
+// ── rewording a queued message ──
+// While the person has a queued message open in its editor, the lane's
+// whole burst waits for them: the turn that would take it is held until
+// they save or cancel, so what goes is the words they settle on, in the
+// order they were said, and never the old ones from under the editor.
+// Kept in memory only. Nobody is mid-edit across a restart, and a restart
+// has its own way back to whatever was queued (recoverQueued).
+const beingEdited = new Map<string, Map<string, ReturnType<typeof setTimeout>>>();
+
+/** How long one open editor may hold a burst back. Generous, because
+ * rewording takes a while; bounded, because a window closed mid-edit
+ * never says it stopped, and what was queued has to go in the end.
+ * Tests shorten it through the environment. */
+const EDIT_HOLD_MS = Number(process.env.BLOKS_EDIT_HOLD_MS) || 3 * 60_000;
+
+/** The editor opened on a queued message. Opening it again starts the
+ * clock again, since that is the person, still there. */
+function editOpened(laneId: string, messageId: string) {
+  const open = beingEdited.get(laneId) ?? new Map<string, ReturnType<typeof setTimeout>>();
+  clearTimeout(open.get(messageId));
+  const timer = setTimeout(() => editClosed(laneId, messageId), EDIT_HOLD_MS);
+  timer.unref?.();
+  open.set(messageId, timer);
+  beingEdited.set(laneId, open);
+}
+
+/** The editor closed: saved, cancelled, taken back, or left open too
+ * long. With no other editor open on the lane, what waited goes now, if
+ * the lane is free to take it. */
+function editClosed(laneId: string, messageId: string) {
+  const open = beingEdited.get(laneId);
+  if (!open?.has(messageId)) return;
+  clearTimeout(open.get(messageId));
+  open.delete(messageId);
+  if (open.size) return;
+  beingEdited.delete(laneId);
+  drainSteer(laneId);
+}
+
+/** Whether words said to a lane now wait in its queue rather than start
+ * a turn: it is mid-turn, or a burst is held ahead of them for an open
+ * editor, and going first would put them before things said earlier; or
+ * Bloks is finishing up to restart (server/drain.ts). */
+function laneWaits(lane: { id: string; busy?: boolean }) {
+  return Boolean(lane.busy) || claimedLanes.has(lane.id) || beingEdited.has(lane.id) || drain.on || cardsPending.has(lane.id) || steerQueues.has(lane.id) || queueStarts.has(lane.id) || steerAttempts.has(lane.id);
+}
+
+/** Lanes whose last turn is still photographing its folder, until its
+ * change card is in. A message queued behind that turn is delivered
+ * after the card: delivered first, it would sit between the turn and its
+ * card, and the card would read as the answer's changes (GitHub 207). */
+const cardsPending = new Map<string, Promise<void>>();
+/** Longest a queued message waits for a card. A folder that takes longer
+ * to read than this gets its card below the message, which is the lesser
+ * harm than the message waiting on a slow disk. */
+const CARD_WAIT_MS = 10_000;
+
+/** Saves a message for a lane that is mid-turn, to go in the turn after.
+ * The transcript keeps the words; the engine is told who they are from. */
+function queueOnLane(
+  botId: string,
+  laneId: string,
+  text: string,
+  options: {
+    replyTo?: ReplyRef;
+    from?: { botId: string; name: string };
+    /** Not the person: a webhook, a watcher, or Bloks keeping a goal going. */
+    via?: "webhook" | "watcher" | "goal";
+    routine?: Message["routine"];
+    telegramReply?: TelegramReply;
+    /** The person said it from Telegram (Message.fromTelegram). */
+    fromTelegram?: boolean;
+    telegramBinding?: Message["telegramBinding"];
+    personal?: boolean;
+    waitsFor?: Message["waitsFor"];
+    /** An agent sent it: the place in a chain of agents' messages the
+     * turn that takes it would have (agentChain). */
+    chain?: number;
+  } = {},
+) {
+  // A routine's command keeps Claude Code's command path, as it does
+  // when it starts a turn directly; Codex takes one only from the
+  // person's own words.
+  const accepting = !options.from && !options.via && store.bot(botId) ? acceptingNative(store.bot(botId)!, laneId) : undefined;
+  const commandInstance = accepting && (options.personal !== false || (options.routine && registry.get(accepting)?.driverKind === "claudeAgent")) ? accepting : null;
+  const message = store.appendMessage(laneId, {
+    role: "user", kind: "text", text, queued: true, queuedAt: Date.now(),
+    ...(options.waitsFor ? { waitsFor: options.waitsFor } : {}),
+    namedSkills: !options.from && !options.via && !options.routine && options.personal !== false,
+    ...(options.replyTo ? { replyTo: options.replyTo } : {}),
+    ...(options.from ? { agent: { dir: "in" as const, peerId: options.from.botId, peerName: options.from.name } } : {}),
+    ...(options.via ? { via: options.via } : {}),
+    ...(options.routine ? { via: "routine" as const, routine: options.routine } : {}),
+    ...(options.telegramReply ? { telegramReply: options.telegramReply } : {}),
+    ...(options.fromTelegram ? { fromTelegram: true } : {}),
+    ...(options.telegramBinding ? { telegramBinding: options.telegramBinding } : {}),
+    ...(!options.from && !options.via && store.bot(botId) ? { commandInstance } : {}),
+  });
+  broadcast({ kind: "message", threadId: laneId, message });
+  const entry = steerQueues.get(laneId) ?? { botId, items: [] };
+  entry.items.push({
+    messageId: message.id,
+    ...(options.via === "webhook" ? { source: "webhook" as const } : {}),
+    ...(options.chain ? { chain: options.chain } : {}),
+  });
+  steerQueues.set(laneId, entry);
+  return message;
+}
+
+/** Each lane's latest steer still asking its engine, the next in line
+ * behind it (steerLane). */
+const steerAttempts = new Map<string, Promise<Message | null>>();
+
+/**
+ * Hands the person's words to the turn running in a lane, and writes
+ * them into the conversation as it takes them, after what the agent has
+ * said so far, since that is where it hears them. Null when they have to
+ * wait for the next turn instead: the engine cannot take words mid-turn
+ * or refused them, the turn is ending or not yet running, it is a room's
+ * turn, a quiet session being compacted, or one somebody else asked for
+ * (whoever asked sets its approvals and its spend), the person's own
+ * earlier words are still waiting and these would jump ahead of them,
+ * or Bloks is finishing up to restart.
+ * For the person, and for another agent that asked for its words to go
+ * now (`from`, GitHub 238) and may (mayJoin): the engine is told who
+ * they are from, the conversation keeps them as that agent's, and what
+ * the turn says from here on is still answering whoever it was. A
+ * webhook, a watcher or a routine is a request of its own and waits for
+ * a turn of its own.
+ *
+ * A Codex skill lookup must not let the next person's words overtake
+ * this one. Return this exact promise: on refusal its caller queues it
+ * before the next attempt returns null and queues behind it.
+ */
+function steerLane(
+  bot: BotRecord,
+  lane: TaskRecord,
+  text: string,
+  options: { replyTo?: ReplyRef; personal?: boolean; from?: { botId: string; name: string }; fromTelegram?: boolean; telegramBinding?: Message["telegramBinding"] } = {},
+): Promise<Message | null> {
+  const previous = steerAttempts.get(lane.id);
+  if (!previous && laneInstance(bot, lane.id)?.driverKind !== "codex") return steerOne(bot, lane, text, options);
+  const attempt = (async () => {
+    if (previous && !(await previous)) return null;
+    const current = store.bot(bot.id);
+    const currentLane = current?.tasks.find((task) => task.id === lane.id);
+    return current && currentLane ? steerOne(current, currentLane, text, options) : null;
+  })();
+  steerAttempts.set(lane.id, attempt);
+  const clear = () => {
+    if (steerAttempts.get(lane.id) !== attempt) return;
+    steerAttempts.delete(lane.id);
+    drainSteer(lane.id);
+  };
+  void attempt.then(clear, clear);
+  return attempt;
+}
+
+async function steerOne(
+  bot: BotRecord,
+  lane: TaskRecord,
+  text: string,
+  options: { replyTo?: ReplyRef; personal?: boolean; from?: { botId: string; name: string }; fromTelegram?: boolean; telegramBinding?: Message["telegramBinding"] } = {},
+): Promise<Message | null> {
+  // an agent's words reach the engine framed, so they are never a command
+  if (commandTurns.has(lane.id) || (!options.from && acceptingNative(bot, lane.id) && commandFor(text, acceptingNative(bot, lane.id)!))) return null;
+  if (!lane.busy || drain.on || beingEdited.has(lane.id) || wheel.heldBy(bot.id) || bot.archivedAt) return null;
+  // A Redo is stopping this turn to take it back (redoMessage): words
+  // that joined it now would be taken back with it, so they wait instead.
+  if (claimedLanes.has(lane.id)) return null;
+  // Bloks compacting a quiet session is not a turn anybody is talking in
+  if (idleCompacting.has(lane.id)) return null;
+  if ((activeRoom.get(lane.id) ?? lane.id) !== lane.id || (laneRequester.get(lane.id) ?? "owner") !== "owner") return null;
+  const waiting = steerQueues.get(lane.id)?.items ?? [];
+  const yoursWaiting = waiting.some((item) => {
+    const m = item.messageId ? store.messagesFor(lane.id).find((msg) => msg.id === item.messageId) : undefined;
+    return m && !m.deleted && !m.agent && !m.via;
+  });
+  if (yoursWaiting) return null;
+  const adapter = laneInstance(bot, lane.id)?.adapter;
+  if (!adapter?.steerTurn) return null;
+  if (options.telegramBinding && !telegramConnectionCurrent(options.telegramBinding)) return null;
+  const { from } = options;
+  const words = from ? fromAgentPrompt(from, text) : text;
+  // skills are named only in the person's own words
+  const names = !from && options.personal !== false && laneInstance(bot, lane.id)?.driverKind === "codex" ? codexSkillNames([text]) : [];
+  const took = await (names.length ? adapter.steerTurn(lane.id, words, { skillNames: names }) : adapter.steerTurn(lane.id, words)).catch(() => false);
+  if (!took) return null;
+  const message = store.appendMessage(lane.id, {
+    role: "user",
+    kind: "text",
+    text,
+    // it joined a turn and did not start one, which the transcript could
+    // not otherwise say once the turn is over (Message.midTurn)
+    midTurn: true,
+    ...(options.replyTo ? { replyTo: options.replyTo } : {}),
+    ...(from ? { agent: { dir: "in" as const, peerId: from.botId, peerName: from.name } } : {}),
+    ...(options.fromTelegram ? { fromTelegram: true } : {}),
+    ...(options.telegramBinding ? { telegramBinding: options.telegramBinding } : {}),
+  });
+  broadcast({ kind: "message", threadId: lane.id, message });
+  // what the turn says from here on is an answer to the person too, and
+  // with the person in it, a chain of agents' messages starts over
+  if (!from) {
+    turnsForYou.add(lane.id);
+    agentChain.delete(lane.id);
+    turnHops.delete(lane.id);
+  }
+  return message;
+}
+
+/** Why another agent's words may not go into the turn running in a lane
+ * (`bloks say --now`, GitHub 238), or null when they may: the sender's
+ * own message started that turn, so it is correcting its own request,
+ * or the sender may stop the agent anyway (mayStop), and joining is the
+ * gentler of the two. Anyone else's words are a request of their own. */
+function mayJoin(senderId: string, bot: BotRecord, lane: TaskRecord): string | null {
+  if (replyingTo.get(lane.id)?.peerId === senderId || mayStop(senderId, bot.id)) return null;
+  return `${bot.name}'s turn was not started by your message, and you may not stop ${bot.name}, so --now does not apply`;
+}
+
+/**
+ * After a restart, a message still flagged queued is waiting again and
+ * runs once its lane is free, as it would have before the restart. A lane
+ * in `joining` is picking up a turn the restart cut off, and that turn
+ * takes what waited (carryOn) instead of it running on its own. Only
+ * a recent one: being queued is not standing permission to act. A queued
+ * message older than MAX_QUEUED_RECOVERY_MS, or written before queued
+ * messages carried the time they were queued (so its age is unknown,
+ * and an older version may well have answered it already), is marked
+ * not sent instead. That clears the flag, so a later restart does not
+ * consider it again either.
+ */
+function recoverQueued(now = Date.now(), joining = new Set<string>()) {
+  for (const bot of store.bots) {
+    for (const lane of bot.tasks) {
+      const flagged = store.messagesFor(lane.id).filter((m) => m.queued && m.role === "user" && !m.deleted && m.text);
+      const fresh = (m: Message) => typeof m.queuedAt === "number" && now - m.queuedAt <= MAX_QUEUED_RECOVERY_MS && m.queuedAt <= now;
+      for (const m of flagged.filter((m) => !fresh(m))) {
+        const patched = store.patchMessage(lane.id, m.id, { queued: false, unsent: true });
+        if (patched) broadcast({ kind: "message.patch", threadId: lane.id, message: patched });
+      }
+      const waiting = flagged.filter(fresh);
+      if (!waiting.length) continue;
+      steerQueues.set(lane.id, {
+        botId: bot.id,
+        items: waiting.map((m) => ({
+          messageId: m.id,
+          ...(m.via === "webhook" ? { source: "webhook" as const } : {}),
+        })),
+      });
+      // a lane picking up a cut-off turn takes these in that turn
+      if (!joining.has(lane.id)) drainSteer(lane.id);
+    }
+  }
+}
+
+/** What an engine is told about a message another agent sent: who it is
+ * from and how to answer. The transcript keeps the words alone, with the
+ * sender as data, so the person's chat can say who it was. */
+function fromAgentPrompt(from: { botId: string; name: string }, text: string) {
+  return `(A message from ${from.name}, another agent. To answer them, use \`bloks say ${from.botId} <text>\`.)\n\n${text}`;
+}
+
+/** Name the source without claiming whether the person is here. A quiet
+ * routine also says it may answer QUIET, here in the turn and never in
+ * the system prompt, which a resumed session keeps byte for byte. `last`
+ * is what the routine reported last time (lastReportNote), said only in
+ * the turn as it goes: a replayed transcript has that answer in it
+ * already. */
+function fromRoutinePrompt(routine: NonNullable<Message["routine"]>, text: string, last?: string | null) {
+  const quoted = routine.name ? JSON.stringify(routine.name).replace(/[\u0085\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`) : "";
+  const name = quoted ? ` ${quoted}` : "";
+  const started = routine.manual ? "was run by hand." : "started this turn on its schedule.";
+  const quiet = routine.quiet ? ` ${QUIET_ASK}` : "";
+  return `(Your routine${name} ${started}${quiet})\n\n${last ? `${last}\n\n` : ""}${text}`;
+}
+
+/** How a routine's prompt is marked in the transcript: its name, whether
+ * the person ran it by hand, and whether it may answer QUIET, kept on
+ * the message so a replayed or retried turn is framed the same way. */
+function routineMark(routine: Routine, manual: boolean): NonNullable<Message["routine"]> {
+  return { name: routine.name, manual, ...(quietRoutine(routine) ? { quiet: true } : {}) };
+}
+
+/** What a routine run in this lane said last time it said anything, as
+ * the note its next turn carries, or null when it has not yet. */
+function lastReportFor(laneId: string): string | null {
+  const open = openRuns.get(laneId);
+  return open ? lastReportNote(routines.get(open.routineId)?.lastReport) : null;
+}
+
+/** Stored words stay unchanged; engines hear who started the message. */
+function storedPrompt(message: Message): string {
+  const text = message.text ?? "";
+  if (message.agent?.dir === "in") {
+    return fromAgentPrompt({ botId: message.agent.peerId, name: message.agent.peerName }, text);
+  }
+  return message.via === "routine" && message.routine && !(message.commandInstance && commandFor(text, message.commandInstance))
+    ? fromRoutinePrompt(message.routine, text) : text;
+}
+
+/** `yours` says the person wrote it, which moves the agent up the
+ * sidebar and makes its answer a reply to them. Said by the caller,
+ * because an agent writing to itself has no `from` either. */
+async function sendUserMessage(
+  botId: string,
+  text: string,
+  options: {
+    taskId?: string;
+    replyTo?: ReplyRef;
+    from?: { botId: string; name: string };
+    yours?: boolean;
+    personal?: boolean;
+    /** The person wrote this just now, so a running turn may take it
+     * (steerLane). Unset for words relayed on their behalf. */
+    steer?: boolean;
+    /** The agent in `from` asked for this to go into the turn running
+     * now, since it changes what that turn is doing (`bloks say --now`). */
+    now?: boolean;
+    /** An agent sent this, to another agent or to itself (chainFrom). */
+    chain?: AgentChain;
+  } = {},
+) {
   const bot = store.bot(botId);
   if (!bot) throw Object.assign(new Error("no such agent"), { status: 404 });
-  const taskId = options.taskId ?? bot.activeTaskId;
+  const taskId = options.taskId ?? activeLaneOf(bot);
   const lane = bot.tasks.find((t) => t.id === taskId);
   if (!lane) throw Object.assign(new Error("no such task"), { status: 404 });
   const holding = wheel.heldBy(bot.id);
@@ -4971,20 +9713,83 @@ async function sendUserMessage(botId: string, text: string, options: { taskId?: 
   if (bot.archivedAt) {
     throw Object.assign(new Error(`${bot.name} is archived. Restore it to give it work.`), { status: 409 });
   }
-  if (lane.busy) {
-    const message = store.appendMessage(lane.id, {
-      role: "user", kind: "text", text, queued: true,
-      ...(options.replyTo ? { replyTo: options.replyTo } : {}),
-    });
-    broadcast({ kind: "message", threadId: lane.id, message });
-    const entry = steerQueues.get(lane.id) ?? { botId: bot.id, items: [] };
-    entry.items.push({ messageId: message.id, text });
-    steerQueues.set(lane.id, entry);
-    return { ok: true, queued: true };
+  // Refused whether it would start a turn or wait for one: either way it
+  // is one more turn nobody but the agents asked for.
+  if (options.chain && chainPastLimit(options.chain.depth)) throw chainRefusal(bot, lane.id, options.chain, text);
+  // waiting behind a turn or not, it was said to this agent now
+  const yours = Boolean(options.yours && !options.from);
+  if (yours) withYou({ bot });
+  // A goal blocked on the person is waiting for exactly this: their
+  // answer. It goes on once the turn that hears it ends, judged as any
+  // turn is. One they paused stays paused; that was their decision.
+  if (yours && lane.goal?.status === "blocked") {
+    const { lastReason: _answered, ...goal } = lane.goal;
+    putGoal(bot.id, lane.id, { ...goal, status: "active" });
   }
-  await startTurn(bot.id, text, { taskId: lane.id, replyTo: options.replyTo });
+  if (laneWaits(lane)) {
+    if (yours && options.steer) {
+      const steered = await steerLane(bot, lane, text, { replyTo: options.replyTo, personal: options.personal });
+      if (steered) {
+        // A turn stopped on a question or an approval reads nothing until
+        // that is answered, and the step it is on is the person's own.
+        const asked = [...askThreadByRequest.values()].includes(lane.id);
+        return {
+          ok: true,
+          steered: true,
+          taskId: lane.id,
+          lane: lane.title,
+          note: asked
+            ? `${bot.name} is waiting on an answer in this conversation and reads this once it has one.`
+            : `${bot.name} is in the middle of a turn and reads this after the step it is on.`,
+        };
+      }
+    }
+    // Another agent saying this changes what the running turn is doing
+    // (GitHub 238). It goes in as the person's words do, when mayJoin
+    // lets it and the turn can take it; otherwise it waits as any
+    // agent's message does, and the sender is told why.
+    let notJoined = "";
+    let askedEngine = false;
+    if (options.from && options.now && lane.busy) {
+      const why = mayJoin(options.from.botId, bot, lane);
+      askedEngine = !why;
+      const steered = why ? null : await steerLane(bot, lane, text, { replyTo: options.replyTo, from: options.from, personal: false });
+      if (steered) {
+        return {
+          ok: true,
+          steered: true,
+          taskId: lane.id,
+          lane: lane.title,
+          note: `${bot.name} is in the middle of a turn and reads this after the step it is on.`,
+        };
+      }
+      notJoined = ` It did not join that turn: ${why ?? `${bot.name}'s turn could not take words mid-turn just then`}.`;
+    }
+    queueOnLane(bot.id, lane.id, text, {
+      replyTo: options.replyTo, from: options.from, personal: options.personal, chain: options.chain?.depth,
+      ...(drain.on && yours ? { waitsFor: "restart" as const } : {}),
+    });
+    // Asking the engine took a moment, and the turn may have ended in it,
+    // with nothing coming along after to take what now waits.
+    if ((yours && options.steer) || askedEngine) drainSteer(lane.id);
+    // Said to the sender too: an agent that thought its "stop" landed would
+    // carry on as if the other had stopped (GitHub 141).
+    const waits = drain.on
+      ? DRAINING_TEXT
+      : lane.busy
+        ? `${bot.name} is in the middle of a turn; this waits until that turn ends.`
+        : `Messages said to ${bot.name} before this one are still waiting to go; this goes with them.`;
+    const stop =
+      lane.busy && options.from && mayStop(options.from.botId, bot.id) ? ` To stop it now, use \`bloks stop ${bot.id} "<why>"\`.` : "";
+    const takeBack = options.from ? ` To take back your messages while they wait, use \`bloks take-back ${bot.id}\`.` : "";
+    return { ok: true, queued: true, taskId: lane.id, lane: lane.title, note: waits + notJoined + stop + takeBack };
+  }
+  await startTurn(bot.id, text, { taskId: lane.id, replyTo: options.replyTo, from: options.from, byYou: yours, personal: options.personal, chain: options.chain?.depth });
   triggersFired({ kind: "message", targetId: bot.id, text, fromUser: true });
-  return { ok: true };
+  // which conversation it went to, so a caller outside the app (the MCP
+  // connector) reads the answer from there and not from whichever lane
+  // happens to be open
+  return { ok: true, taskId: lane.id, lane: lane.title };
 }
 
 const choosingDecisions = new Set<string>();
@@ -4998,36 +9803,643 @@ function drainSteer(threadId: string) {
     steerQueues.delete(threadId);
     return;
   }
-  if (lane.busy) return;
-  // claimed before any async work, so two racing settles fire it once
-  steerQueues.delete(threadId);
-  const alive = entry.items.filter(
-    (item) => !item.messageId || store.messagesFor(threadId).some((m) => m.id === item.messageId),
-  );
-  if (alive.length === 0) return;
-  for (const item of alive) {
-    if (!item.messageId) continue;
-    const patched = store.patchMessage(threadId, item.messageId, { queued: false });
-    if (patched) broadcast({ kind: "message.patch", threadId, message: patched });
+  if (lane.busy || claimedLanes.has(threadId) || queueStarts.has(threadId) || steerAttempts.has(threadId)) return;
+  const card = cardsPending.get(threadId);
+  if (card) {
+    void Promise.race([card, new Promise((done) => setTimeout(done, CARD_WAIT_MS).unref?.())]).then(() => {
+      if (cardsPending.get(threadId) === card) cardsPending.delete(threadId);
+      drainSteer(threadId);
+    });
+    return;
   }
+  // held, on disk, until Bloks is back or the drain is called off
+  if (drain.on) return;
+  // Somebody is rewording one of these. The whole burst waits rather than
+  // the rest going ahead, so the edited one does not arrive after words
+  // that were said after it; closing the editor drains it (editClosed).
+  if (beingEdited.has(threadId)) return;
+  // An agent archived or held cannot take them (startTurn refuses it).
+  // Delivered first, they read as heard when nothing heard them, and a
+  // restored agent never would. They are marked not sent instead, as a
+  // stale queue is after a restart, for the person to send again.
+  const hold = wheel.heldBy(bot.id);
+  if (bot.archivedAt || hold) {
+    steerQueues.delete(threadId);
+    const why = hold ? heldRefusal(hold, bot.name) : archivedRefusal(bot).message;
+    const waiting = entry.items.flatMap((item) => {
+      const said = item.messageId ? store.messagesFor(threadId).find((m) => m.id === item.messageId) : undefined;
+      return said?.queued && !said.deleted ? [said.id] : [];
+    });
+    // a Telegram request among them is told why, before being marked
+    // not sent ends its return
+    telegramReturns.finish(threadId, `Could not answer: ${why}`, waiting);
+    for (const id of waiting) {
+      const patched = store.patchMessage(threadId, id, { queued: false, unsent: true });
+      if (patched) broadcast({ kind: "message.patch", threadId, message: patched });
+    }
+    if (waiting.length) {
+      if (hold) wheel.noteTurnedAway(bot.id);
+      const notice = store.appendMessage(threadId, {
+        role: "bot",
+        kind: "notice",
+        text: `${waiting.length === 1 ? "A message" : `${waiting.length} messages`} waiting for ${bot.name} ${waiting.length === 1 ? "was" : "were"} not sent. ${why}`,
+      });
+      broadcast({ kind: "message", threadId, message: notice });
+    }
+    // a goal whose next turn was among them has nothing to go on with
+    if (waiting.some((id) => store.messagesFor(threadId).find((m) => m.id === id)?.via === "goal")) {
+      pauseGoal(bot.id, threadId, goalPausedNotice("unstarted", why), "its next turn could not start");
+    }
+    drainRoomTags(entry.botId);
+    closeIfAsked(threadId);
+    return;
+  }
+  // Claim only this segment before any async work; a command is a turn
+  // of its own, and the suffix stays ahead of any newly arriving words.
+  const segment = queuedSegment(threadId, entry.items);
+  if (segment.rest.length) steerQueues.set(threadId, { ...entry, items: segment.rest });
+  else steerQueues.delete(threadId);
+  // the words as they stand now, not as they stood when they were queued
+  const alive = segment.items.flatMap((item) => {
+    const words = steerWords(threadId, item);
+    return words === null ? [] : [{ item, words }];
+  });
+  if (alive.length === 0) {
+    // Everything that waited was taken back, so no turn starts, and no
+    // settle comes along after it to do what a settle does once the
+    // queue is clear: the room lines and the close that stood aside for
+    // this burst would wait for a turn that never runs.
+    drainRoomTags(entry.botId);
+    closeIfAsked(threadId);
+    return;
+  }
+  // into the conversation before the turn that answers them
+  deliverQueued(threadId, alive.flatMap(({ item }) => (item.messageId ? [item.messageId] : [])));
   // one turn answers the whole burst
-  const joined = alive.map((item) => item.text).join("\n");
-  void startTurn(entry.botId, joined, { taskId: threadId, presetMessage: true }).catch((e) => {
+  const joined = alive.map((said) => said.words).join("\n");
+  // a burst that is all one agent's messages is that exchange's to answer
+  const notes = alive.map(({ item }) => store.messagesFor(threadId).find((m) => m.id === item.messageId)?.agent);
+  const peer = notes[0];
+  const answering =
+    peer && notes.every((n) => n?.dir === "in" && n.peerId === peer.peerId) ? { peerId: peer.peerId, peerName: peer.peerName } : undefined;
+  // The person's own words wait here with nothing on them; another
+  // agent's carry who sent them, a watcher's or a webhook's say so. A
+  // burst of Bloks' own notes (a key saved, say) carries on the turn
+  // it resumes, so it answers whoever that one did.
+  const said = alive.map(({ item }) => (item.messageId ? store.messagesFor(threadId).find((m) => m.id === item.messageId) : undefined));
+  const byYou = said.some((m) => m && !m.agent && !m.via) || (said.every((m) => !m) && turnsForYou.has(threadId));
+  const telegramMessages = alive.flatMap(({ item }) => item.messageId ? [item.messageId] : []);
+  const telegramBinding = said.find((message) => message?.telegramBinding)?.telegramBinding;
+  const chain = burstChain(threadId, alive.map(({ item }) => item));
+  queueStarts.add(threadId);
+  void startTurn(entry.botId, joined, { taskId: threadId, presetMessage: true, answering, byYou, telegramMessages, telegramBinding, personalMessages: telegramMessages, commandInstance: queuedCommand(threadId, alive[0].item), chain }).catch((e) => {
+    telegramReturns.finish(threadId, `Could not answer: ${redactSecrets(e instanceof Error ? e.message : String(e))}`, telegramMessages);
     const failure = store.appendMessage(threadId, {
       role: "bot",
       kind: "notice",
       text: `Your queued message could not start a turn: ${redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 200)}`,
     });
     broadcast({ kind: "message", threadId, message: failure });
+    // nor does one whose next turn was refused
+    if (said.some((m) => m?.via === "goal")) {
+      pauseGoal(entry.botId, threadId, goalPausedNotice("unstarted", redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 200)), "its next turn could not start");
+    }
+  }).finally(() => { queueStarts.delete(threadId); drainSteer(threadId); });
+}
+
+// ── stopping, rewinding, redoing ───────────────────────────────────────
+// Three things the person does to a conversation with one agent, each
+// made of the one before. Stop ends the turn that is running. Rewind
+// takes the conversation and the folder back to before one of their
+// messages. Redo (GitHub 258, server/redo.ts) is what editing a message
+// the agent already read does: stop, rewind to the start of the turn
+// the message was part of, and send the person's words from that turn
+// again with the change.
+
+/** The person stopping a lane's turn: the stop button, Esc in the
+ * composer, and the first step of a Redo. */
+async function stopForYou(bot: BotRecord, laneId: string) {
+  cutOff.stop(laneId);
+  // The person stopping a lane's turn stops its goal too, whichever
+  // turn it was: a goal that started the next one as soon as this
+  // ended would be the Stop not working. Before the interrupt, so
+  // the turn's end finds it paused and says nothing more.
+  if (store.taskByThread(laneId)?.task.goal?.status === "active" && store.taskByThread(laneId)?.task.busy) {
+    pauseGoal(bot.id, laneId, goalPausedNotice("stopped"), "you stopped the turn");
+  }
+  await interruptLane(bot, laneId);
+}
+
+/**
+ * Takes a lane back to before the message at `index`: every message from
+ * it on, every file the turns since then changed (newest first, and only
+ * where nobody has changed it since), and the engine's sessions, so the
+ * next turn has heard only what is left. Says so in the conversation and
+ * on the record. `keepWaiting` is a Redo's: what waits above the composer
+ * was never read, so it stays where it is (takenBack).
+ */
+async function rewindLane(found: BotRecord, task: TaskRecord, index: number, keepWaiting = false) {
+  const laneId = task.id;
+  const messages = store.messagesFor(laneId);
+  const target = messages[index];
+  const now = Date.now();
+  const restored = new Set<string>();
+  const skipped = new Map<string, string>();
+  for (const record of checkpoints.undoableSince(laneId, target.at)) {
+    const result = await checkpoints.revert(record.id).catch(() => null);
+    if (!result) continue;
+    for (const path of result.restored) {
+      restored.add(path);
+      skipped.delete(path);
+    }
+    for (const s of result.skipped) if (!restored.has(s.path)) skipped.set(s.path, s.why);
+    patchChangesCard(record);
+  }
+
+  const later = takenBack(messages, index, keepWaiting);
+  for (const msg of later) {
+    const patched = store.patchMessage(laneId, msg.id, { deleted: true, rewound: now });
+    if (patched) broadcast({ kind: "message.patch", threadId: laneId, message: patched });
+  }
+  // A summary that covers part of what was taken back would hand it
+  // straight back to the agent, so it goes; the next turn replays what
+  // is left instead, and summarises again when that fills up.
+  const kept = messages.slice(0, index).filter((msg) => msg.kind === "text" && msg.text && !msg.deleted).length;
+  if (task.context && task.context.through > kept) store.setTaskContext(laneId, null);
+  store.forgetLaneSessions(laneId);
+  undoneSince.delete(laneId);
+
+  const files = [...restored];
+  const left = [...skipped.entries()];
+  const named = (paths: string[]) =>
+    paths.slice(0, 6).join(", ") + (paths.length > 6 ? `, and ${paths.length - 6} more` : "");
+  const parts = [
+    `Rewound to before your message. ${found.name} no longer remembers anything said after it.`,
+    files.length
+      ? `${files.length === 1 ? "1 file is" : `${files.length} files are`} back as they were: ${named(files)}.`
+      : "",
+    left.length
+      ? `Left alone, because they changed since: ${named(left.map(([path]) => path))}.`
+      : "",
+    "Its memory notes are unchanged.",
+  ].filter(Boolean);
+  const notice = store.appendMessage(laneId, { role: "bot", kind: "notice", text: parts.join(" ") });
+  broadcast({ kind: "message", threadId: laneId, message: notice });
+  record({
+    at: now,
+    kind: "conversation.rewound",
+    actor: "you",
+    summary: `Rewound a conversation with ${found.name}`,
+    detail: { agent: found.name, messages: String(later.length), files: String(files.length) },
+  });
+  broadcast({ kind: "bot", bot: clientBot(store.bot(found.id)) });
+  return {
+    text: target.text ?? "",
+    rewound: later.length,
+    restored: files,
+    skipped: left.map(([path, why]) => ({ path, why })),
+  };
+}
+
+const REDO_IN_A_ROOM = "Redo works in a conversation with one agent, not in a room.";
+const REDO_NOT_YOURS = "Redo is for a message you wrote here.";
+const REDO_REFUSED: Record<RedoRefusal, { status: number; error: string }> = {
+  waiting: { status: 409, error: "This message is still waiting for its turn. Edit it where it waits." },
+  "not-yours": { status: 400, error: REDO_NOT_YOURS },
+  "others-turn": {
+    status: 409,
+    error: "This message joined a turn you did not start, so it cannot be redone. Save the words, or send a new message.",
+  },
+};
+
+/** How long a Redo waits for the turn it stopped to end. An engine that
+ * takes longer than this to let go has not stopped in any way the person
+ * would call stopped, and nothing has been taken back yet. */
+const REDO_STOP_MS = 20_000;
+
+/** Why a lane cannot take a Redo right now, or null when it can. What
+ * stops a rewind stops it (a room's turn, a rehearsal), and so does what
+ * would stop the send after it: better refused whole than rewound with
+ * nothing sent. */
+function redoBlocked(bot: BotRecord, laneId: string): { status: number; error: string } | null {
+  const speaking = activeRoom.get(laneId);
+  if (speaking && speaking !== laneId) {
+    return { status: 409, error: `${bot.name} is speaking in a room right now. Try again when it is done.` };
+  }
+  if (rehearsals.forTask(laneId)) {
+    return { status: 409, error: "This is a rehearsal. Discard it instead: nothing in it reached your folder." };
+  }
+  // another Redo of this lane, or a turn still getting ready that cannot
+  // be stopped yet
+  if (claimedLanes.has(laneId)) return { status: 409, error: `${bot.name} is starting a turn. Try again in a moment.` };
+  const hold = wheel.heldBy(bot.id);
+  if (hold) return { status: 409, error: heldRefusal(hold, bot.name) };
+  if (bot.archivedAt) return { status: 409, error: archivedRefusal(bot).message };
+  if (drain.on) return { status: 503, error: "Bloks is finishing what is running before it restarts. Redo this once it is back." };
+  return null;
+}
+
+/**
+ * What a Redo of this message would do, for the line under its editor,
+ * or why it is not offered. Read-only, and decided here rather than in
+ * the app so the line is true: the messages are the ones the rewind
+ * would take back, and the files the ones it would put back as the
+ * folder stands now. While the agent is working the files of the turn
+ * it is in are not known yet (a turn's changes are measured when it
+ * ends), so `working` says so and the count is of the turns before it.
+ */
+function redoPreview(laneId: string, messageId: string) {
+  const no = (why: string) => ({ offered: false as const, why });
+  const found = store.botByThread(laneId);
+  const task = found?.tasks.find((t) => t.id === laneId);
+  if (!found || !task) return no(REDO_IN_A_ROOM);
+  const blocked = redoBlocked(found, laneId);
+  if (blocked) return no(blocked.error);
+  const messages = store.messagesFor(laneId);
+  const plan = redoPlan(messages, messageId);
+  if (!plan) return no(REDO_NOT_YOURS);
+  if (typeof plan === "string") return no(REDO_REFUSED[plan].error);
+  return {
+    offered: true as const,
+    ...redoCounts(takenBack(messages, plan.start, true)),
+    files: checkpoints.wouldRestore(checkpoints.undoableSince(laneId, messages[plan.start].at)).length,
+    working: Boolean(task.busy),
+    /** How many of the person's messages go again: more than one when
+     * the message was part of a turn other words of theirs joined. */
+    resend: plan.resend.length,
+  };
+}
+
+/** Resolves true once a lane's turn has ended, false at the deadline. */
+function laneSettled(laneId: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const tick = () => {
+      if (!store.taskByThread(laneId)?.task.busy) return resolve(true);
+      if (Date.now() - started > timeoutMs) return resolve(false);
+      setTimeout(tick, 100);
+    };
+    tick();
   });
 }
 
-/** Per-agent hop depth for the current chain of agent-to-agent turns. */
-const agentHops = new Map<string, number>();
+/**
+ * Redo: the agent starts again from the new words, as if the old ones
+ * were never sent. One call rather than a stop, a rewind and a send from
+ * the app, so nothing between them can go ahead on the old words and a
+ * failure cannot leave the app holding the pieces.
+ *
+ * The lane is claimed from the first check to the send, the way a turn
+ * getting ready claims it: nothing else starts there, what is said to it
+ * meanwhile waits in its queue, and nothing joins the turn being taken
+ * back. In order: stop the turn if one is running and wait for it to
+ * end; wait for its change card, since its files are on record only
+ * then; rewind to the start of the message's turn; send. Everything up
+ * to the rewind refuses with nothing taken back. A send that fails
+ * after it leaves what Rewind to here leaves, the conversation rewound
+ * and the words handed back for the box (`sent: false`).
+ */
+async function redoMessage(laneId: string, messageId: string, text: string): Promise<{ status: number; body: Record<string, unknown> }> {
+  const refuse = (status: number, error: string) => ({ status, body: { error } });
+  const found = store.botByThread(laneId);
+  const task = found?.tasks.find((t) => t.id === laneId);
+  if (!found || !task) return refuse(400, REDO_IN_A_ROOM);
+  const blocked = redoBlocked(found, laneId);
+  if (blocked) return refuse(blocked.status, blocked.error);
+  // `/goal` is Bloks' own and never reaches an engine (see the send route)
+  if (parseGoalCommand(text)) return refuse(400, "A goal is set from the box below, not by redoing a message.");
+  const asked = redoPlan(store.messagesFor(laneId), messageId);
+  if (!asked) return refuse(400, REDO_NOT_YOURS);
+  if (typeof asked === "string") return refuse(REDO_REFUSED[asked].status, REDO_REFUSED[asked].error);
+
+  const claim: LaneClaim = { lane: laneId };
+  claimedLanes.set(laneId, claim);
+  const release = () => {
+    if (claimedLanes.get(laneId) === claim) claimedLanes.delete(laneId);
+  };
+  try {
+    if (task.busy) {
+      await stopForYou(found, laneId).catch(() => {});
+      if (!(await laneSettled(laneId, REDO_STOP_MS))) {
+        return refuse(409, `${found.name} has not stopped yet. Try Redo again once it has.`);
+      }
+    }
+    const card = cardsPending.get(laneId);
+    if (card) {
+      await Promise.race([card, new Promise((done) => setTimeout(done, CARD_WAIT_MS).unref?.())]);
+      if (cardsPending.get(laneId) === card) {
+        return refuse(409, `Bloks is still reading what ${found.name} changed in its folder. Try Redo again in a moment.`);
+      }
+    }
+    // Read again: the turn went on saying things until it stopped, and
+    // the message may have been taken back meanwhile.
+    const plan = redoPlan(store.messagesFor(laneId), messageId);
+    if (!store.taskByThread(laneId) || !plan || typeof plan === "string" || !plan.resend.some((m) => m.id === messageId)) {
+      return refuse(409, "That message is no longer there to redo. Nothing was taken back.");
+    }
+    const words = plan.resend.map((m) => ({ text: m.id === messageId ? text : (m.text ?? ""), replyTo: m.replyTo }));
+    const { text: _old, ...rewound } = await rewindLane(found, task, plan.start, true);
+
+    // One message and nothing waiting is an ordinary send: the lane is
+    // let go, and the send starts its turn. Several are one turn's worth,
+    // as they were, and go the way a burst does: said to a lane still
+    // claimed, they wait in its queue, and one turn takes them together
+    // once it is let go below. So does one message when something was
+    // already waiting here, which goes with it.
+    const alone = words.length === 1 && !steerQueues.has(laneId);
+    if (alone) release();
+    try {
+      for (const said of words) await sendUserMessage(found.id, said.text, { taskId: laneId, replyTo: said.replyTo, yours: true });
+    } catch (e) {
+      return {
+        status: 200,
+        body: { ...rewound, sent: false, text, error: redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 300) },
+      };
+    }
+    // these were said before whatever was already waiting, so they go first
+    const entry = alone ? undefined : steerQueues.get(laneId);
+    if (entry) entry.items = [...entry.items.slice(-words.length), ...entry.items.slice(0, -words.length)];
+    return { status: 200, body: { ...rewound, sent: true } };
+  } finally {
+    // what waited for the lane goes now, as it would after any turn
+    release();
+    drainSteer(laneId);
+    drainRoomTags(found.id);
+  }
+}
+
+// ── goals ──────────────────────────────────────────────────────────────
+// A lane can keep working toward a goal the person set, turn after turn,
+// until it is done, blocked or out of turns (server/goals.ts has the
+// rules and the words). This is where that meets the turns. When a turn
+// ends well the goal is judged, and the next turn goes in through the
+// lane's queue as a note from Bloks, so it waits behind anything already
+// waiting there, for a change card, a drain or an open editor, exactly as
+// anything else said to the lane would, and nothing here has to know
+// about any of those.
+
+/** Longest the judge's one question may take. The engines' own one-shot
+ * calls have shorter limits of their own; this is for one that has none. */
+const GOAL_JUDGE_MS = 2 * 60_000;
+
+/** Why a goal cannot be set in this lane, or null when it can. A goal
+ * runs turns as the owner's own, so never where somebody else's words
+ * are answered (a shared room's lane, strangers' mail), and never in a
+ * rehearsal, whose copy is applied or discarded as one piece of work. */
+function goalRefusal(bot: BotRecord, lane: TaskRecord): string | null {
+  if (bot.archivedAt) return archivedRefusal(bot).message;
+  const hold = wheel.heldBy(bot.id);
+  if (hold) return heldRefusal(hold, bot.name);
+  return laneGoalRefusal(lane);
+}
+
+/** The part of goalRefusal that is about the lane itself and never
+ * changes, which every screen is told so none offers a goal there. */
+function laneGoalRefusal(lane: TaskRecord): string | null {
+  if (lane.guestMail) return "This conversation answers mail from people you have not listed, so it does not take goals.";
+  if (isSharedLane(lane.id)) return "This conversation belongs to a shared room, so it does not take goals.";
+  if (rehearsals.forTask(lane.id)) return "A rehearsal does not take goals. Set one in an ordinary conversation.";
+  return null;
+}
+
+/** Where a goal's check runs: the folder the lane's turns run in. */
+function laneFolder(bot: BotRecord, lane: TaskRecord): string {
+  const project = projects.forAgent(bot.id);
+  const folder = lane.cwd ?? bot.cwd ?? (project ? workingFolder(standingOf(project)) : null);
+  return folder && existsSync(folder) ? folder : workspace.ensureWorkspace(bot.id);
+}
+
+/** A lane's goal, changed, and every screen told. */
+function putGoal(botId: string, laneId: string, goal: Goal | undefined) {
+  store.setTaskGoal(laneId, goal);
+  broadcast({ kind: "bot", bot: clientBot(store.bot(botId)) });
+}
+
+/** Something about the goal, said in its lane for the person to read. */
+function goalNotice(laneId: string, text: string, goal: NonNullable<Message["goal"]>) {
+  const notice = store.appendMessage(laneId, { role: "bot", kind: "notice", text, goal });
+  broadcast({ kind: "message", threadId: laneId, message: notice });
+}
+
+/** Sets a lane's goal, replacing any it had, and queues its first turn,
+ * which goes after a turn already running there as anything said to the
+ * lane would. */
+function startGoal(bot: BotRecord, lane: TaskRecord, input: GoalInput): Goal {
+  const refused = goalRefusal(bot, lane);
+  if (refused) throw Object.assign(new Error(refused), { status: 409 });
+  const goal: Goal = {
+    text: input.text,
+    ...(input.check ? { check: input.check } : {}),
+    budget: input.budget,
+    turns: 0,
+    status: "active",
+    startedAt: Date.now(),
+  };
+  putGoal(bot.id, lane.id, goal);
+  goalNotice(lane.id, goalSetNotice(goal), "set");
+  queueGoalTurn(bot.id, lane.id, firstGoalNote(goal));
+  return store.taskByThread(lane.id)?.task.goal ?? goal;
+}
+
+/**
+ * The next turn toward a lane's goal. Counted before it is queued, so the
+ * budget holds whatever becomes of the turn, and never once it is spent.
+ * Written into the lane as a note from Bloks (`via: "goal"`), never as
+ * the person's words: it names no skill, runs no engine command, and a
+ * chain of agents' messages keeps the place of the turn it follows, so a
+ * goal cannot carry one past its cap.
+ */
+function queueGoalTurn(botId: string, laneId: string, note: string | ((goal: Goal) => string)) {
+  const goal = store.taskByThread(laneId)?.task.goal;
+  if (!goal || goal.status !== "active" || goal.turns >= goal.budget) return;
+  const counted: Goal = { ...goal, turns: goal.turns + 1 };
+  putGoal(botId, laneId, counted);
+  const chain = agentChain.get(laneId);
+  queueOnLane(botId, laneId, typeof note === "string" ? note : note(counted), { via: "goal", ...(chain ? { chain } : {}) });
+  drainSteer(laneId);
+}
+
+/** Takes back a goal's next turn that has not gone yet (waiting for a
+ * change card, say) when the person pauses, replaces or clears the goal:
+ * a turn toward a goal they just stopped is the pause not working. The
+ * turn it was counted as is given back. */
+function withdrawGoalNotes(botId: string, laneId: string) {
+  let taken = 0;
+  for (const m of store.messagesFor(laneId)) {
+    if (m.via !== "goal" || !m.queued || m.deleted) continue;
+    const patched = store.patchMessage(laneId, m.id, { deleted: true, text: "" });
+    if (patched) broadcast({ kind: "message.patch", threadId: laneId, message: patched });
+    taken++;
+  }
+  const goal = store.taskByThread(laneId)?.task.goal;
+  if (taken && goal) putGoal(botId, laneId, { ...goal, turns: Math.max(0, goal.turns - taken) });
+}
+
+/** The goal stops going on by itself until the person resumes it, and a
+ * next turn already queued for it is taken back with it. */
+function pauseGoal(botId: string, laneId: string, notice: string, reason: string) {
+  if (store.taskByThread(laneId)?.task.goal?.status !== "active") return;
+  withdrawGoalNotes(botId, laneId);
+  const goal = store.taskByThread(laneId)?.task.goal;
+  if (!goal) return;
+  putGoal(botId, laneId, { ...goal, status: "paused", lastReason: reason });
+  goalNotice(laneId, notice, "paused");
+}
+
+/**
+ * The person resumes a goal: paused, blocked, or out of turns once they
+ * have given it more. Its next turn is queued straight away, told that
+ * the person resumed it, since whatever stopped it may be sorted now and
+ * judging the old reply again would only stop it on the same words.
+ */
+function resumeGoal(bot: BotRecord, lane: TaskRecord, budget?: number): Goal {
+  const goal = lane.goal;
+  if (!goal) throw Object.assign(new Error("this conversation has no goal"), { status: 404 });
+  const refused = goalRefusal(bot, lane);
+  if (refused) throw Object.assign(new Error(refused), { status: 409 });
+  if (goal.status === "done") throw Object.assign(new Error("this goal is done. Set a new one to keep going."), { status: 409 });
+  const next: Goal = { ...goal, ...(budget ? { budget } : {}) };
+  if (next.turns >= next.budget) {
+    throw Object.assign(new Error(`this goal has used its ${next.budget} turns. Give it more to keep going.`), { status: 409 });
+  }
+  const wasActive = goal.status === "active";
+  delete next.lastReason;
+  putGoal(bot.id, lane.id, { ...next, status: "active" });
+  if (!wasActive) queueGoalTurn(bot.id, lane.id, (g) => nextGoalNote(g, "Pick up where you left off.", null, true));
+  return store.taskByThread(lane.id)?.task.goal ?? next;
+}
+
+/**
+ * A turn ended in a lane: whether its goal goes on. A turn that will be
+ * picked up again, handed to a backup or asked again after a fold is not
+ * over yet. One of the goal's own lane that was stopped or failed pauses
+ * it. Otherwise the goal is judged, unless something else waits for the
+ * lane, which goes first and is judged when it ends: the person's words
+ * never wait for a goal. A room's turn in the lane, or an engine command,
+ * is not the goal's work, and how it went says nothing about the goal;
+ * but it took the lane between two of the goal's turns, so the goal is
+ * judged after it, on the lane's own last reply, rather than left with
+ * nothing to start its next turn.
+ */
+function goalTurnEnded(
+  bot: BotRecord,
+  laneId: string,
+  ended: { ok: boolean; stopReason: string | null; goesOn: boolean; inRoom: boolean; command: boolean; out: boolean },
+) {
+  const goal = store.taskByThread(laneId)?.task.goal;
+  if (!goal || goal.status !== "active" || ended.goesOn) return;
+  if (!ended.ok && !ended.inRoom && !ended.command) {
+    if (ended.stopReason === "interrupted") pauseGoal(bot.id, laneId, goalPausedNotice("stopped"), "the turn was stopped");
+    else pauseGoal(bot.id, laneId, goalPausedNotice("failed", ended.out ? "its engine is out" : undefined), "the last turn did not finish");
+    return;
+  }
+  if (steerQueues.has(laneId) || queueStarts.has(laneId) || claimedLanes.has(laneId)) return;
+  void judgeGoal(bot.id, laneId).catch((e) => console.error(`[bloks] a goal could not be judged: ${e instanceof Error ? e.message : String(e)}`));
+}
+
+/**
+ * Whether a lane's goal is met, and what follows. The check runs first,
+ * in the lane's folder, then the agent's own engine is asked once, with
+ * the goal, the turn's last reply and what the check said; with no small
+ * model, or an answer that is not a verdict, the check and the agent's
+ * own last line decide (fallbackVerdict). Whatever comes back is acted
+ * on only if it is still the same goal, still active, and the lane is
+ * quiet: anything that started or waits meanwhile is judged when it ends.
+ */
+async function judgeGoal(botId: string, laneId: string): Promise<void> {
+  const found = store.taskByThread(laneId);
+  const goal = found?.task.goal;
+  if (!found || !goal || goal.status !== "active" || goalJudging.has(laneId)) return;
+  const seq = laneTurns.get(laneId) ?? 0;
+  const reply = finalReply(store.messagesFor(laneId));
+  goalJudging.add(laneId);
+  broadcast({ kind: "bot", bot: clientBot(store.bot(botId)) });
+  let check: GoalCheck | null = null;
+  let verdict: Verdict | null = null;
+  try {
+    if (goal.check) {
+      // the person's own command, so a shell, as a watcher's check runs:
+      // its own process group, stopped whole at the limit, output capped
+      const ran = await runCheck(goal.check, laneFolder(found.bot, found.task), checkEnv(), GOAL_CHECK_TIMEOUT_MS, { tail: true });
+      check = {
+        command: goal.check,
+        code: ran.code,
+        timedOut: ran.timedOut,
+        output: [ran.output, ran.errors].filter((part) => part.trim()).join("\n"),
+      };
+    }
+    // the engine the agent is on, as a fold uses: what the turn said
+    // goes nowhere it was not already going
+    const instance = registry.get(found.bot.modelSelection.instanceId);
+    if (instance?.generateText) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<string>((done) => {
+        timer = setTimeout(() => done(""), GOAL_JUDGE_MS);
+        timer.unref?.();
+      });
+      const answer = await Promise.race([instance.generateText(judgePrompt(goal, reply, check)).catch(() => ""), late]);
+      clearTimeout(timer);
+      verdict = parseVerdict(answer);
+    }
+  } finally {
+    goalJudging.delete(laneId);
+  }
+  const now = store.taskByThread(laneId);
+  const current = now?.task.goal;
+  const same = Boolean(current && current.status === "active" && current.startedAt === goal.startedAt);
+  const quiet = Boolean(
+    now && !now.task.busy && (laneTurns.get(laneId) ?? 0) === seq &&
+      !claimedLanes.has(laneId) && !queueStarts.has(laneId) && !steerQueues.has(laneId) &&
+      !steerAttempts.has(laneId) && !beingEdited.has(laneId),
+  );
+  if (!current || !same || !quiet) {
+    broadcast({ kind: "bot", bot: clientBot(store.bot(botId)) });
+    return;
+  }
+  const step = decideGoal(current, verdict ?? fallbackVerdict(reply, check), check);
+  if (step.kind === "continue") {
+    putGoal(botId, laneId, { ...current, ...(step.reason ? { lastReason: step.reason } : {}) });
+    queueGoalTurn(botId, laneId, (counted) => nextGoalNote(counted, step.next, check));
+    return;
+  }
+  putGoal(botId, laneId, { ...current, status: step.kind, lastReason: step.reason });
+  if (step.kind === "done") goalNotice(laneId, goalDoneNotice(step.reason, current.turns), "done");
+  else if (step.kind === "blocked") goalNotice(laneId, goalBlockedNotice(step.reason), "blocked");
+  else goalNotice(laneId, goalOutNotice(current, step.reason), "out");
+  // where it ended up is news in the lane, whichever one is on screen
+  store.markLane(botId, laneId, true);
+  broadcast({ kind: "bot", bot: clientBot(store.bot(botId)) });
+}
+
+/**
+ * After a restart, a goal still active with nothing running or waiting in
+ * its lane was between turns when Bloks stopped: the judge that would
+ * have started the next one did not survive. It is paused rather than
+ * judged again unattended, and says so. One whose turn is being picked
+ * up, or whose next note waited on disk, goes on by itself.
+ */
+function pauseStrandedGoals() {
+  for (const bot of store.bots) {
+    for (const lane of bot.tasks) {
+      if (lane.goal?.status !== "active" || laneWaits(lane)) continue;
+      pauseGoal(bot.id, lane.id, goalPausedNotice("restart"), "Bloks restarted between its turns");
+    }
+  }
+}
+
+/** Someone named in a room while a round was running there: the line
+ * that named them, who said it, and the count their turn starts with
+ * (turnHops). Named twice in one round, they hear the later line at the
+ * further count. */
+interface RoundTag {
+  text: string;
+  from: string;
+  hops: number;
+}
 
 /** Rooms with a dispatch loop in flight, holding whoever got named while
- * it ran and the line that named them. One room, one speaker at a time. */
-const dispatching = new Map<string, Map<string, string>>();
+ * it ran. One room, one speaker at a time. */
+const dispatching = new Map<string, Map<string, RoundTag>>();
 
 // ── reacting to changed settings ──────────────────────────────────────
 function configStatus() {
@@ -5044,10 +10456,23 @@ function configStatus() {
     shortcuts: { quickAsk: cfg.shortcuts?.quickAsk ?? null },
     // off unless somebody turned it on; see server/context.ts for what it
     // trades against the fold it defers
-    compaction: { micro: Boolean(cfg.compaction?.micro) },
+    // beforeTurn is on unless turned off: the tokens a native session may
+    // carry into a turn before it is compacted first, 0 for never
+    compaction: {
+      micro: Boolean(cfg.compaction?.micro),
+      idle: Boolean(cfg.compaction?.idle),
+      beforeTurn: beforeTurnSettings().ceiling,
+    },
     // off unless asked for: reading a session back spends tokens on work
     // nobody requested, and what it finds is staged rather than installed
     skills: { propose: Boolean(cfg.skills?.propose) },
+    // on unless turned off: notes from an agent's other conversations
+    // ahead of the person's turn (recallAhead)
+    recall: { beforeTurn: cfg.recall?.beforeTurn !== false },
+    agents: { turnLimit: agentLimit() },
+    changes: { showShared: cfg.changes?.showShared !== false },
+    // how long a silent tool call may hold a turn, in minutes; 0 is never
+    turns: { stallMinutes: stallLimitMs() / 60_000 },
     // not a secret: a folder, a mode and a model, for the settings form
     agentDefaults: cfg.agentDefaults ?? {},
     // what is already here, so a first run can offer to keep it rather
@@ -5079,15 +10504,178 @@ function configStatus() {
   };
 }
 
-/** Rebuild every engine from the current config. A pasted key should
- * work in the next message, not after a restart. The cost is that turns
- * running right now die with the old fleet, which is the right trade for
- * something a person only does deliberately. */
-async function reloadProviders() {
-  bus.detachAll();
-  await registry.disposeAll();
-  await registry.load(instanceConfigs(cfg));
-  bus.attach(registry.instances());
+/** Lanes whose turn an engine rebuild cut off, with what picking it up
+ * needs, until that turn's end has been dealt with (GitHub 198). */
+const rebuiltLanes = new Map<string, { turn: TurnInFlight | null; instanceId: string }>();
+let reloading: Promise<unknown> = Promise.resolve();
+/** Engines whose CLI was updated, by driver kind, and which still have
+ * to be built again to read the new CLI's models. Each is rebuilt at the
+ * first reload that finds nothing running on it (GitHub 199). */
+const enginesUpdated = new Set<string>();
+
+/** Rebuild the engines the current config changes, so a pasted key works
+ * in the next message, not after a restart. Only those: an engine whose
+ * settings are as they were keeps running, and so do its turns. A turn
+ * running on one that is rebuilt is cut off, and the old engine's own
+ * end of it never reaches anyone, so it is ended here: the lane is free
+ * again, and the turn is picked up on the new engine the way a turn cut
+ * off by a restart is (GitHub 198). One at a time, so two reloads never
+ * build the same engine twice. */
+function reloadProviders(): Promise<boolean> {
+  const run = reloading.then(() => rebuildEngines());
+  reloading = run.catch(() => {});
+  return run;
+}
+
+/** Nothing running on this engine, and nothing on its way to it. */
+function engineQuiet(instanceId: string): boolean {
+  const live = registry.get(instanceId);
+  return !store.bots.some((bot) =>
+    bot.tasks.some(
+      (task) =>
+        task.busy &&
+        (Boolean(live?.adapter.hasSession(task.id)) ||
+          cutOff.get(task.id)?.instanceId === instanceId ||
+          laneEngine.get(task.id)?.instanceId === instanceId),
+    ),
+  );
+}
+
+/** The instances of updated engines that can be rebuilt now. */
+function updatedAndQuiet(): string[] {
+  const ready: string[] = [];
+  for (const kind of enginesUpdated) {
+    const mine = registry
+      .entries()
+      .filter((entry) => (entry.live?.driverKind ?? entry.shadow?.driverKind) === kind)
+      .map((entry) => entry.instanceId);
+    if (mine.every(engineQuiet)) ready.push(...mine);
+  }
+  return ready;
+}
+
+/** True when it rebuilt anything. */
+async function rebuildEngines(): Promise<boolean> {
+  const configs = instanceConfigs(cfg);
+  const stale = registry.stale(configs, updatedAndQuiet());
+  // an updated engine rebuilt for any reason has read its new CLI
+  for (const kind of enginesUpdated) {
+    if (registry.entries().every((entry) => (entry.live?.driverKind ?? entry.shadow?.driverKind) !== kind || stale.includes(entry.instanceId))) {
+      enginesUpdated.delete(kind);
+    }
+  }
+  if (!stale.length) return false;
+  for (const [laneId, report] of claudeCatalogs) if (stale.includes(report.instanceId)) claudeCatalogs.delete(laneId);
+  // read before anything changes: which lanes the old engines are in the
+  // middle of a turn for
+  const cut: Array<{ laneId: string; instanceId: string; driverKind: string }> = [];
+  for (const id of stale) {
+    const live = registry.get(id);
+    if (!live) continue;
+    for (const bot of store.bots) {
+      for (const task of bot.tasks) {
+        if (task.busy && live.adapter.hasSession(task.id)) cut.push({ laneId: task.id, instanceId: id, driverKind: live.driverKind });
+      }
+    }
+  }
+  bus.detach(stale);
+  await registry.reload(configs, stale);
+  const rebuilt = registry.instances().filter((instance) => stale.includes(instance.instanceId));
+  bus.attach(rebuilt);
+  for (const instance of rebuilt) {
+    void instance.catalogReady?.then(async () => {
+      broadcast({ kind: "instances", instances: await registry.describe() });
+    });
+  }
+  for (const { laneId, instanceId, driverKind } of cut) {
+    // an idle compaction just ends; nobody asked for it to be picked up
+    if (!idleCompacting.has(laneId)) rebuiltLanes.set(laneId, { turn: cutOff.get(laneId), instanceId });
+    settleRebuiltAsks(laneId);
+    bus.publish({
+      type: "turn.completed",
+      eventId: newId(),
+      provider: driverKind,
+      providerInstanceId: instanceId,
+      threadId: laneId,
+      createdAt: new Date().toISOString(),
+      ok: false,
+      stopReason: ENGINE_RELOADED,
+    });
+  }
+  return true;
+}
+
+/** An updated engine waiting for its turns to finish is rebuilt once
+ * they have, and the window told, which is what the update said would
+ * happen. */
+function rebuildUpdatedWhenQuiet() {
+  if (!enginesUpdated.size) return;
+  // after the turn's end has settled, so its lane reads as free
+  setTimeout(() => {
+    void reloadProviders()
+      .then(async (rebuilt) => {
+        if (rebuilt) broadcast({ kind: "providers", ...(await providerCatalog()) });
+      })
+      .catch(() => {});
+  }, 0);
+}
+bus.subscribe((event: RuntimeEvent) => {
+  if (event.type === "turn.completed") rebuildUpdatedWhenQuiet();
+});
+
+/** Questions and approvals the old engine was waiting on in this lane,
+ * settled as cut off and forgotten: the new engine may number its own
+ * requests the same way, and an answer to an old card must never reach
+ * it as permission, as after a restart. */
+function settleRebuiltAsks(laneId: string) {
+  for (const [requestId, lane] of askThreadByRequest) {
+    if (lane !== laneId) continue;
+    const messageId = askMessageByRequest.get(requestId);
+    // where the card is, as for an ask that closed on its own
+    const threadId = askCardThread.get(requestId) ?? activeRoom.get(laneId) ?? laneId;
+    forgetAsk(requestId);
+    const card = store.messagesFor(threadId).find((m) => m.id === messageId)?.card;
+    if (!messageId || !card || card.answered || card.dismissed) continue;
+    const patched = store.patchMessage(threadId, messageId, {
+      card: { ...card, answered: "Cut off when its engine restarted", cutOff: true },
+    });
+    if (patched) broadcast({ kind: "message.patch", threadId, message: patched });
+  }
+}
+
+/** The end a rebuild gives a turn it cut off. */
+const ENGINE_RELOADED = "engine_reloaded";
+
+/** A turn's end, for a turn an engine rebuild cut off: picked up on the
+ * engine that replaced the old one, or, when the engine is gone, said
+ * so. Never a workflow step or one somebody stopped, as after a restart.
+ * True when it was one. */
+function settleRebuiltLane(laneId: string): boolean {
+  const rebuilt = rebuiltLanes.get(laneId);
+  if (!rebuilt) return false;
+  rebuiltLanes.delete(laneId);
+  // and not picked up a second time when the Mac wakes
+  sleptLanes.delete(laneId);
+  const { turn } = rebuilt;
+  if (!turn || turn.stopped || turn.workflow || turn.waiting) {
+    telegramReturns.finish(laneId);
+    return true;
+  }
+  if (!registry.get(rebuilt.instanceId)) {
+    const threadId = turn.roomId ?? turn.laneId;
+    const notice = store.appendMessage(threadId, {
+      role: "bot",
+      kind: "notice",
+      ...(turn.roomId ? { from: turn.botId } : {}),
+      text: engineGoneNotice(store.bot(turn.botId)?.name ?? "The agent"),
+    });
+    broadcast({ kind: "message", threadId, message: notice });
+    telegramReturns.finish(laneId);
+    return true;
+  }
+  // after the ended turn has settled, so the lane is free again
+  carryOn(turn, "reload", 1_500);
+  return true;
 }
 
 // ── provider catalog ───────────────────────────────────────────────────
@@ -5137,10 +10725,9 @@ async function providerCatalog() {
 const oauthCallback = (kind: string) => `http://127.0.0.1:${PORT}/api/oauth/${kind}/callback`;
 
 async function connectProvider(kind: string, key: string, endpoint = "") {
-  saveConfig({
+  Object.assign(cfg, saveConfig({
     providers: { [kind]: { ...(key ? { key } : {}), ...(endpoint ? { url: endpoint } : {}) } },
-  });
-  Object.assign(cfg, loadConfig());
+  }));
   await reloadProviders();
   broadcast({ kind: "providers", ...(await providerCatalog()) });
 }
@@ -5168,10 +10755,9 @@ function customCatalog() {
 }
 
 async function persistCustom(next: CustomEndpoint[]) {
-  saveConfig({ custom: next } as Partial<AppConfig>);
-  Object.assign(cfg, loadConfig());
-  // loadConfig re-reads the file; keep the in-memory list aligned with
-  // what we just wrote so a follow-up in this request sees it.
+  Object.assign(cfg, saveConfig({ custom: next } as Partial<AppConfig>));
+  // Keep the in-memory list aligned with what was just written, so a
+  // follow-up in this request sees it.
   cfg.custom = next;
   await reloadProviders();
   broadcast({ kind: "providers", ...(await providerCatalog()) });
@@ -5355,8 +10941,7 @@ async function serveMember(
       const body = await readBody(req);
       const text = clamp(body.text, 8_000);
       if (!text) return json(res, 400, { error: "say something first" });
-      // a human message starts a fresh chain, so hop counters reset
-      for (const id of blok.memberIds) agentHops.delete(id);
+      // a human message starts a fresh chain: whoever it wakes is at no hops
       const { message } = enqueueRoomPost(blok, text, { personId, hops: 0, replyTo: replyRef(body.replyTo) });
       const view = viewOf(personId, blok.id)!;
       return json(res, 202, { message: memberMessage(message, view) });
@@ -5383,7 +10968,7 @@ async function serveMember(
         if (answer !== "Allow" && answer !== "Deny") return json(res, 400, { error: "Allow or Deny" });
         const bot = message.from ? store.bot(message.from) : null;
         const askThread = message.card.requestId ? askThreadByRequest.get(message.card.requestId) : undefined;
-        const instance = bot ? laneInstance(bot, askThread) : null;
+        const instance = bot && message.card.requestId ? askInstance(bot, askThread, message.card.requestId) : null;
         if (!bot || !instance || !askThread || !message.card.requestId) {
           return json(res, 409, { error: "that request has closed" });
         }
@@ -5399,7 +10984,7 @@ async function serveMember(
       if (message.card.requestId) {
         const bot = message.from ? store.bot(message.from) : null;
         const askThread = askThreadByRequest.get(message.card.requestId);
-        const instance = bot ? laneInstance(bot, askThread) : null;
+        const instance = bot ? askInstance(bot, askThread, message.card.requestId) : null;
         if (!bot || !instance || !askThread) return json(res, 409, { error: "that question has closed" });
         await instance.adapter
           .respondToRequest(askThread, message.card.requestId, { behavior: "answer", message: `${who.name} answered: ${answer}` })
@@ -5419,7 +11004,7 @@ async function serveMember(
 
     case "leave": {
       const blok = bloks.get(action.roomId)!;
-      const { roomless } = people.removeFromRoom(personId, blok.id);
+      const { roomless } = removeMemberFromRoom(personId, blok.id);
       if (roomless) await revokeMember(personId, who.relayTokenHash);
       const notice = store.appendMessage(blok.id, { role: "bot", kind: "notice", event: true, text: `${who.name} left the room.` });
       broadcast({ kind: "message", threadId: blok.id, message: notice });
@@ -5502,7 +11087,225 @@ function readBody(req: IncomingMessage): Promise<any> {
   });
 }
 
-const server = createServer(async (req, res) => {
+// ── backups of the whole workspace (server/backup.ts) ──
+
+/** The backup being written now. One at a time: two would read the same
+ * folder twice as slowly, and the daily one must not start beside one
+ * the person asked for. */
+let backupRunning: { kind: NonNullable<CreateOptions["kind"]>; startedAt: number } | null = null;
+
+interface RestoreProgress {
+  phase: "draining" | "backing-up" | "staging" | "restarting" | "failed" | "cancelled";
+  from: string;
+  startedAt: number;
+  /** Turns still running, while it waits for them. */
+  running?: number;
+  deadline?: number;
+  /** The backup taken of the workspace just before, by name. */
+  safety?: string;
+  /** Where the workspace it replaces goes at the next start. */
+  aside?: string;
+  keys?: "restored" | "kept";
+  error?: string;
+}
+
+/** The restore under way, or the last one that stopped short. In memory:
+ * one that finishes ends this process, and the next start reads what it
+ * did from the backups folder (lastRestore). */
+let restoring: RestoreProgress | null = null;
+const restoreUnderWay = () => Boolean(restoring && restoring.phase !== "failed" && restoring.phase !== "cancelled");
+
+/** How long a restore waits for running turns before it goes ahead. A
+ * person is watching, so shorter than an update's wait; what is still
+ * running is cut off, and its conversation stays in the folder moved
+ * aside. */
+const RESTORE_DRAIN_MS = 10 * 60_000;
+
+/** The daily backup is looked for this often. Tests shorten it through
+ * the environment. */
+const AUTO_BACKUP_LOOK_MS = Number(process.env.BLOKS_AUTO_BACKUP_MS) || 10 * 60_000;
+/** A daily backup that failed (a full disk, a folder it cannot write)
+ * is not tried again on every look. */
+let autoBackupFailedAt = 0;
+
+async function makeBackup(opts: CreateOptions): Promise<BackupInfo> {
+  if (backupRunning || restoreUnderWay()) {
+    throw new BackupError("A backup or a restore is already under way. Try again once it is done.", 409);
+  }
+  backupRunning = { kind: opts.kind ?? "manual", startedAt: Date.now() };
+  try {
+    return await createBackup(opts);
+  } finally {
+    backupRunning = null;
+  }
+}
+
+/** Made when Bloks is quiet: nothing running, no drain, no other backup,
+ * and none made in the last day. The newest seven are kept. */
+async function autoBackup() {
+  if (backupRunning || restoreUnderWay() || drain.on) return;
+  if (Date.now() - autoBackupFailedAt < 60 * 60_000) return;
+  const due = autoBackupDue({
+    enabled: cfg.backups?.auto !== false,
+    idle: drainStatus().idle,
+    newestAt: newestAutomatic(),
+    now: Date.now(),
+  });
+  if (!due) return;
+  try {
+    const made = await makeBackup({ kind: "automatic" });
+    const gone = pruneAutomatic();
+    console.log(`[bloks] daily backup: ${made.name}${gone.length ? `, ${gone.length} older removed` : ""}`);
+  } catch (e) {
+    autoBackupFailedAt = Date.now();
+    console.error(`[bloks] the daily backup did not finish: ${redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 300)}`);
+  }
+}
+setInterval(() => void autoBackup(), AUTO_BACKUP_LOOK_MS).unref?.();
+
+/** Folders as a person would look for them (~/.bloks-backups); each
+ * backup still carries its whole path. */
+function backupsStatus() {
+  const pending = pendingRestore();
+  const last = lastRestore();
+  return {
+    folder: shownPath(backupsDirFor()),
+    auto: cfg.backups?.auto !== false,
+    keep: AUTO_KEEP,
+    backups: listBackups(),
+    running: backupRunning,
+    restore: restoring,
+    pending: pending ? { from: pending.from, at: pending.at, aside: shownPath(pending.aside) } : null,
+    lastRestore: last ? { ...last, aside: last.aside && shownPath(last.aside) } : null,
+  };
+}
+
+const passphraseIn = (body: Record<string, unknown>) =>
+  typeof body.passphrase === "string" && body.passphrase ? body.passphrase : undefined;
+
+/**
+ * A restore, from the drain to the stop. Nothing new starts while it
+ * waits for what is running; then the workspace is backed up as it is,
+ * the archive is unpacked beside it and checked, and this process stops
+ * so the next start can swap the folders before any store reads one
+ * (server/pending-restore.ts). The desktop app relaunches when the page
+ * sees it stopping, and a server under a supervisor comes back by itself.
+ * Anything that goes wrong before the stop calls the drain off and
+ * leaves the workspace as it was.
+ */
+async function runRestore(file: string, passphrase: string | undefined, drainMs: number) {
+  const progress = restoring!;
+  try {
+    drain.start(drainMs);
+    armDrainLapse();
+    for (;;) {
+      if (progress.phase === "cancelled") return;
+      const status = drainStatus();
+      progress.running = status.running.length;
+      progress.deadline = status.deadline;
+      if (status.done) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    progress.phase = "backing-up";
+    const safety = existsSync(DATA_DIR) ? await createBackup({ kind: "before-restore" }) : null;
+    progress.safety = safety?.name;
+    progress.phase = "staging";
+    const pending = await stageRestore(file, { passphrase, safety: safety?.name });
+    progress.aside = pending.aside;
+    progress.keys = pending.keys;
+    progress.phase = "restarting";
+    console.log(`[bloks] restoring ${pending.from}: stopping so the next start puts it in place`);
+    // a moment for the page to read that it is restarting
+    setTimeout(shutDown, 1_500);
+  } catch (e) {
+    progress.phase = "failed";
+    progress.error = e instanceof BackupError ? e.message : redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 300);
+    endDrain();
+  }
+}
+
+async function serveBackups(req: IncomingMessage, res: ServerResponse, method: string, path: string) {
+  try {
+    if (method === "GET" && path === "/api/backups") return json(res, 200, backupsStatus());
+    if (method === "POST" && path === "/api/backups") {
+      const body = await readBody(req);
+      const backup = await makeBackup({
+        kind: "manual",
+        undo: body.undo === true,
+        passphrase: passphraseIn(body),
+        ...(typeof body.secrets === "boolean" ? { secrets: body.secrets } : {}),
+      });
+      return json(res, 200, { backup });
+    }
+    if (method === "PUT" && path === "/api/backups/settings") {
+      const body = await readBody(req);
+      if (typeof body.auto !== "boolean") return json(res, 400, { error: "auto is true or false" });
+      Object.assign(cfg, saveConfig({ backups: { auto: body.auto } }));
+      return json(res, 200, backupsStatus());
+    }
+    if (path === "/api/backups/restore" && method === "GET") return json(res, 200, { restore: restoring });
+    if (path === "/api/backups/restore" && method === "DELETE") {
+      if (!restoring || restoring.phase !== "draining") {
+        return json(res, 409, { error: "Only a restore still waiting for running work can be called off." });
+      }
+      restoring.phase = "cancelled";
+      endDrain();
+      return json(res, 200, { restore: restoring });
+    }
+    const m = path.match(/^\/api\/backups\/([^/]+)(?:\/(verify|reveal|restore))?$/);
+    if (m) {
+      const name = decodeURIComponent(m[1]);
+      const file = backupPath(name);
+      if (method === "DELETE" && !m[2]) {
+        if (restoreUnderWay() && restoring?.from === name) return json(res, 409, { error: "That backup is being restored." });
+        deleteBackup(name);
+        return json(res, 200, { deleted: name });
+      }
+      if (method === "POST" && m[2] === "verify") {
+        const body = await readBody(req);
+        return json(res, 200, await verifyBackup(file, passphraseIn(body)));
+      }
+      if (method === "POST" && m[2] === "reveal") return json(res, 200, { path: file, shown: revealBackup(file) });
+      if (method === "POST" && m[2] === "restore") {
+        if (backupRunning || restoreUnderWay()) {
+          return json(res, 409, { error: "A backup or a restore is already under way. Try again once it is done." });
+        }
+        const body = await readBody(req);
+        const passphrase = passphraseIn(body);
+        // said now, before anything stops: a wrong passphrase or a file
+        // that is not a backup should cost nothing
+        await checkBackup(file, passphrase);
+        const drainMs = body.drainSeconds === undefined ? RESTORE_DRAIN_MS : drainWindow(body.drainSeconds);
+        restoring = { phase: "draining", from: name, startedAt: Date.now() };
+        void runRestore(file, passphrase, drainMs);
+        return json(res, 202, { restore: restoring });
+      }
+    }
+    return json(res, 404, { error: "not found" });
+  } catch (e) {
+    if (e instanceof BackupError) {
+      return json(res, e.status, { error: e.message, ...(e.code === "passphrase" ? { needsPassphrase: true } : {}) });
+    }
+    if (e instanceof URIError) return json(res, 400, { error: "That is not the name of a backup." });
+    return json(res, (e as { status?: number }).status ?? 500, {
+      error: redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 300),
+    });
+  }
+}
+
+// A saved file that cannot be read now (server/atomic-write.ts) refuses
+// rather than reading as empty. The checks ahead of a route's own error
+// handling read some of them, so a refusal there is answered here: an
+// unanswered request hangs the phone that asked, and a 401 would tell it
+// it is no longer paired.
+const server = createServer((req, res) => {
+  void handleRequest(req, res).catch((e) => {
+    if (res.headersSent) return void res.end();
+    json(res, (e as { status?: number })?.status ?? 503, { error: redactSecrets(e instanceof Error ? e.message : String(e)) });
+  });
+});
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse) {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const path = url.pathname;
   const method = req.method ?? "GET";
@@ -5549,12 +11352,65 @@ const server = createServer(async (req, res) => {
     } catch {
       raw = "";
     }
-    webhooks.noteFired(hook.id, raw);
-    const text = webhookMessage(hook.name, raw);
+    // An agent that cannot take the event is refused before it is
+    // acknowledged. A 202 followed by a dropped turn looks delivered to the
+    // sender and never reaches the agent, so the sender has to see the
+    // refusal to retry (503) or to stop (409). A refused event records no
+    // delivery and leaves no lane behind.
+    const agentId = hook.workflowId || hook.blokId ? undefined : hook.botId;
+    const refusal = agentId ? webhookRefusal(agentId) : undefined;
+    if (refusal) {
+      if (refusal.retryAfter) res.setHeader("retry-after", refusal.retryAfter);
+      return json(res, refusal.status, { error: refusal.error });
+    }
+    const laneId = agentId && !drain.on ? claimWebhookLane(agentId, hook.thread) : undefined;
+    // Its lane (the agent's first, or the one the hook names) is mid-turn,
+    // or another event has just claimed it, or Bloks is finishing up to
+    // restart: this one waits in that lane and goes in the next turn, as a
+    // message to a busy chat does. The wait is bounded, and past it the
+    // sender is told to retry; a 202 always means the event is saved and
+    // will be handled.
+    let waitIn: string | undefined;
+    if (agentId && !laneId) {
+      const target = store.bot(agentId);
+      waitIn =
+        (target ? namedLane(target, hook.thread)?.id : undefined) ??
+        (drain.on ? workLaneId(agentId, hook.thread) : undefined);
+      const framed = webhookMessage(hook.name, raw);
+      const queued = waitIn ? (steerQueues.get(waitIn)?.items.filter((item) => item.source === "webhook") ?? []) : [];
+      const bytes = queued.reduce(
+        (sum, item) => sum + Buffer.byteLength(steerWords(waitIn!, item) ?? "") + 1,
+        Buffer.byteLength(framed) + 1,
+      );
+      if (!waitIn || queued.length >= MAX_WEBHOOK_QUEUE_ITEMS || bytes > MAX_WEBHOOK_QUEUE_BYTES) {
+        res.setHeader("retry-after", "30");
+        return json(res, 503, { error: "that agent is busy and has as many events waiting as it holds; retry this event shortly" });
+      }
+    }
 
-    // Answer before the turn runs: webhook senders time out fast and
-    // retry on failure, and an agent turn outlives both.
-    json(res, 202, { ok: true });
+    // From here to the async turn below, a throw must release the claim, or
+    // the lane would refuse every later event until the process restarts.
+    let text: string;
+    try {
+      webhooks.noteFired(hook.id, raw);
+      text = webhookMessage(hook.name, raw);
+
+      if (waitIn) queueOnLane(agentId!, waitIn, text, { via: "webhook" });
+
+      // Answer before the turn runs: webhook senders time out fast and
+      // retry on failure, and an agent turn outlives both.
+      json(res, 202, waitIn ? { ok: true, queued: true } : { ok: true });
+    } catch (e) {
+      // Answer, so the sender sees a failure rather than a hung connection.
+      if (laneId) webhookLanes.delete(laneId);
+      if (!res.headersSent) return json(res, 500, { error: "event not accepted; send it again" });
+      throw e;
+    }
+    if (waitIn) {
+      // the turn it waited on may have ended a moment ago; if so, now
+      if (!webhookLanes.has(waitIn)) drainSteer(waitIn);
+      return;
+    }
     void (async () => {
       try {
         if (hook.workflowId) {
@@ -5564,10 +11420,13 @@ const server = createServer(async (req, res) => {
         } else if (hook.blokId) {
           const blok = bloks.get(hook.blokId);
           if (blok) await postToRoom(blok, text, { hops: 0 });
-        } else if (hook.botId) {
-          const laneId = backgroundTaskId(hook.botId, "Webhooks");
-          if (!laneId) return; // lane busy; the sender's retry will land
-          await startTurn(hook.botId, text, { taskId: laneId });
+        } else if (hook.botId && laneId) {
+          // Written as the webhook's, as a watcher's is: in the agent's
+          // first conversation it would otherwise read as the person's own
+          // words, offered to edit and send again as theirs (GitHub 242).
+          const said = store.appendMessage(laneId, { role: "user", kind: "text", text, via: "webhook" });
+          broadcast({ kind: "message", threadId: laneId, message: said });
+          await startTurn(hook.botId, text, { taskId: laneId, presetMessage: true });
         }
       } catch (e) {
         // The sender is long gone; the failure belongs in the chat.
@@ -5580,6 +11439,14 @@ const server = createServer(async (req, res) => {
           text: `The webhook "${hook.name}" fired but the turn could not start: ${redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 300)}`,
         });
         broadcast({ kind: "message", threadId, message: failure });
+      } finally {
+        // by now startTurn has marked the lane busy (or failed before it
+        // could), so the lane's own busy flag carries the claim from here on
+        if (laneId) {
+          webhookLanes.delete(laneId);
+          // events that queued behind a turn that never started go now
+          drainSteer(laneId);
+        }
       }
     })();
     return;
@@ -5589,7 +11456,7 @@ const server = createServer(async (req, res) => {
   // itself. It is checked before anything else: an agent gets a narrower
   // surface than the person at the keyboard, and the narrowing has to
   // happen whatever else the request looks like.
-  const asAgent = agentTokens.identify(bearerToken(req), Date.now());
+  const asAgent = agentTokens.identify(bearerToken(req), Date.now(), turnAlive);
   if (asAgent) {
     if (!isLocalRequest(req)) {
       return json(res, 403, { error: "an agent's credential only works on this machine" });
@@ -5619,6 +11486,14 @@ const server = createServer(async (req, res) => {
   const viaRelay = relayDeviceFor(req);
   // Loopback is not a boundary in a browser, see server/http-guard.ts.
   const local = viaRelay ? false : isLocalRequest(req);
+  // A credential that was sent but is not one this server knows (a turn's
+  // token after the turn, a typo, an empty header) is refused rather than
+  // read as no credential: whoever sent it meant to be someone in
+  // particular, and it is not the person at the keyboard.
+  if (local && !asAgent && req.headers.authorization !== undefined && !deviceForToken(bearerToken(req))) {
+    res.setHeader("www-authenticate", 'Bearer error="invalid_token"');
+    return json(res, 401, { error: "this request's credential is not recognized. It may have expired or been revoked." });
+  }
   if (!local && !viaRelay) {
     // Everything below this point is the remote surface, and it only
     // exists once somebody has switched pairing on.
@@ -5642,6 +11517,24 @@ const server = createServer(async (req, res) => {
     : local
       ? null
       : deviceForToken(bearerToken(req));
+  if (caller) noteClient(caller.id, req.headers["x-bloks-client"]);
+  // One conversation's transcript as this caller may receive it: whole
+  // here and on the same network, its newest part through Bloks Cloud,
+  // with the count of what is left to ask for. olderMessages is always
+  // said, so switching lanes never keeps the last lane's count.
+  const laneFor = (threadId: string) =>
+    viaRelay
+      ? tailWithin(store.messagesFor(threadId), RELAY_TAIL, RELAY_TRANSCRIPT_BUDGET)
+      : { messages: store.messagesFor(threadId), olderMessages: 0 };
+
+  const earlierPage = (list: Message[], url: URL) => {
+    const before = url.searchParams.get("before");
+    const end = before ? list.findIndex((msg) => msg.id === before) : list.length;
+    if (end < 0) return { messages: [], olderMessages: 0 };
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || RELAY_TAIL));
+    return tailWithin(list.slice(0, end), limit, viaRelay ? RELAY_TRANSCRIPT_BUDGET : Infinity);
+  };
+
   if (caller?.personId) {
     try {
       return await serveMember(req, res, method, path, url, caller);
@@ -5696,13 +11589,32 @@ const server = createServer(async (req, res) => {
     if (method === "GET" && path === "/api/bots") {
       // ?messages=N trims each transcript to its tail. Phones hydrate
       // with a page and fetch history if someone actually scrolls.
-      const tail = Number(url.searchParams.get("messages") ?? NaN);
+      // Through Bloks Cloud the list is also held to what the relay can
+      // carry, and each agent says how many older messages stayed behind.
+      const tail = Number(url.searchParams.get("messages") || NaN);
+      // slice truncates fractional counts; below one means no messages,
+      // rather than slice(-0), which returns the entire conversation.
+      const zero = tail >= 0 && tail < 1;
       const trim = (list: Message[]) =>
         Number.isFinite(tail) && tail >= 0 ? list.slice(-tail) : list;
+      // What recall gave an agent came from its other conversations, which
+      // another agent reading this one's chat has no business seeing.
+      const lists = store.bots.map((b) => zero ? [] : trim(store.messagesFor(b.threadId)))
+        .map((list) => asAgent ? list.map(({ recalled: _recalled, ...message }) => message) : list);
+      // Through Bloks Cloud the cut is made from the whole conversation, so
+      // what stayed behind counts every older message, not only those past
+      // a list already trimmed to the tail; a client pages back by it.
+      const fitted = viaRelay
+        ? fitTranscripts(store.bots.map((b) => store.messagesFor(b.threadId)), Number.isFinite(tail) && tail >= 0 ? Math.floor(tail) : RELAY_TAIL)
+        : null;
+      // Another agent reads whether each one can answer now (GitHub 239);
+      // the person's app has its banner, and asks the engines itself.
+      const engines = asAgent ? await Promise.all(store.bots.map((b) => readinessOf(b))) : null;
       return json(res, 200, {
-        bots: store.bots.map((b) => ({
+        bots: store.bots.map((b, i) => ({
           ...clientBot(b)!,
-          messages: trim(store.messagesFor(b.threadId)),
+          ...(fitted ? fitted[i] : { messages: lists[i] }),
+          ...(engines ? { engine: { ...engines[i].readiness, ...(engines[i].engine ? { name: engines[i].engine } : {}) } } : {}),
         })),
       });
     }
@@ -5726,6 +11638,7 @@ const server = createServer(async (req, res) => {
       if (typeof body.shape === "string") profile.shape = body.shape as NewBotProfile["shape"];
       if (typeof body.seniority === "number") {
         profile.seniority = Math.max(1, Math.min(5, Math.round(body.seniority)));
+        if (asAgent) profile.seniority = Math.min(profile.seniority, store.bot(asAgent.botId)?.seniority ?? 1);
       }
       for (const key of ["skills", "skillIds"] as const) {
         const list = clampList(body[key], MAX_SKILL_CHARS, MAX_SKILLS);
@@ -5740,11 +11653,19 @@ const server = createServer(async (req, res) => {
         };
       }
 
+      // filed, pinned and placed at hire, by the same rules as a later move
+      const placing = readArrangement({ section: body.section, pinned: body.pinned, position: body.position });
+      if (!placing.ok) return json(res, 400, { error: placing.error });
+
       const bot = store.createBot(profile);
-      store.patchBot(
-        bot.id,
-        await newAgentSettings(asAgent ? (store.bot(asAgent.botId)?.approvals ?? "ask") : undefined),
-      );
+      store.patchBot(bot.id, {
+        ...(await newAgentSettings(asAgent ? (store.bot(asAgent.botId)?.approvals ?? "ask") : undefined)),
+        ...(asAgent ? { hiredBy: asAgent.botId } : {}),
+        // made by the person is time spent with them; hired by an agent
+        // is not, and it waits below until the person is
+        activeWithYouAt: asAgent ? 0 : Date.now(),
+      });
+      if (Object.keys(placing.ask).length) arrange("agent", bot.id, placing.ask, bot.id);
       record({
         at: Date.now(),
         kind: "agent.created",
@@ -5752,7 +11673,12 @@ const server = createServer(async (req, res) => {
         summary: `Made ${bot.name}${bot.title ? `, ${bot.title}` : ""}`,
         detail: { agent: bot.name },
       });
-      return json(res, 201, { bot: { ...clientBot(store.bot(bot.id))!, messages: store.messagesFor(bot.threadId) } });
+      // Every open window and phone hears about it, not only the one that
+      // asked: an agent hired by another agent, or during onboarding, or
+      // on the phone, otherwise stayed invisible until a reload.
+      const made = { ...clientBot(store.bot(bot.id))!, messages: store.messagesFor(bot.threadId) };
+      broadcast({ kind: "bot", bot: made });
+      return json(res, 201, { bot: made });
     }
     // ── an agent arriving from somewhere else ──
     // Two calls on purpose. The first only reads the file and says what
@@ -5805,8 +11731,16 @@ const server = createServer(async (req, res) => {
       if (carried.length) broadcast({ kind: "skills" });
 
       const { profile, patch } = profileFromFile(file);
-      const bot = store.createBot({ ...profile, skillIds: carried.length ? carried : undefined });
-      store.patchBot(bot.id, { ...(await newAgentSettings()), ...patch });
+      const bot = store.createBot({
+        ...profile,
+        skillIds: carried.length ? carried : undefined,
+      });
+      // The engines it ran on, where this workspace has them; otherwise
+      // the workspace default stands, as the preview said it would.
+      const engines: Partial<BotRecord> = {};
+      if (file.agent.model && registry.get(file.agent.model.instanceId)) engines.modelSelection = file.agent.model;
+      if (file.agent.backup && registry.get(file.agent.backup.instanceId)) engines.backupSelection = file.agent.backup;
+      store.patchBot(bot.id, { ...(await newAgentSettings()), ...engines, ...patch, activeWithYouAt: Date.now() });
 
       if (file.memory) {
         if (file.memory.text.trim()) workspace.writeMemoryFile(bot.id, file.memory.text);
@@ -5873,6 +11807,22 @@ const server = createServer(async (req, res) => {
     let m = path.match(/^\/api\/bots\/([\w-]+)$/);
     if (m && method === "PATCH") {
       const body = await readBody(req);
+      // Another agent may say where this one sits in the sidebar (its
+      // section, whether it is pinned, its place among the pins) and
+      // that is all: every other field is the agent's own, or the
+      // person's.
+      if (asAgent && asAgent.botId !== m[1]) {
+        const keys = Object.keys(body ?? {});
+        if (!keys.length || keys.some((key) => !SIDEBAR_FIELDS.has(key))) {
+          return json(res, 403, {
+            error: "an agent can change only where another agent sits in the sidebar: its section, whether it is pinned, and its place among the pins",
+          });
+        }
+      }
+      // checked before anything else is written, so a bad place cannot
+      // leave half a change behind
+      const placing = readArrangement(body);
+      if (!placing.ok) return json(res, 400, { error: placing.error });
       // Hiding is how an agent leaves the list, and archiving now moves
       // with it. PATCH /api/bots/:me is on the agent allowlist, so
       // without this an agent could take itself off its own routines and
@@ -5886,6 +11836,9 @@ const server = createServer(async (req, res) => {
       // either an agent in the list that refuses work, or one out of the
       // list that still does it, which is the exact split archiveBot
       // exists to make impossible.
+      //
+      // And it does what the menu's archive does to work: hiding used to
+      // put an agent away mid-turn and leave the turn running (GitHub 220).
       if (typeof body.hidden === "boolean") {
         const existing = store.bot(m[1]);
         if (!existing) return json(res, 404, { error: "no such agent" });
@@ -5898,11 +11851,35 @@ const server = createServer(async (req, res) => {
             summary: `${body.hidden ? "Archived" : "Restored"} ${moved.name}`,
             detail: { agent: moved.name, ...(body.hidden ? { key: "kept" } : {}) },
           });
+          if (body.hidden) await windDown(moved);
+          else resumeSchedules(moved);
         }
         delete body.hidden;
       }
       const patch: Record<string, unknown> = {};
-      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "shape", "skills", "skillIds", "seniority", "effort", "mascotExpression", "pinned", "hidden"] as const) {
+      // Read and unread are about the conversation on screen, not the whole
+      // agent: another lane that pinged you stays unread until it is opened.
+      if (typeof body.unread === "boolean") {
+        const target = store.bot(m[1]);
+        if (target) store.markLane(target.id, target.activeTaskId, body.unread);
+      }
+      // A model id can now be typed in by hand (an engine that takes any
+      // id), and it ends up as a process argument, so it is a model id
+      // and nothing else: an engine this workspace has, and a short name
+      // made of the characters model ids use.
+      if (body.modelSelection !== undefined) {
+        const pick = body.modelSelection as { instanceId?: unknown; model?: unknown } | null;
+        if (
+          typeof pick?.instanceId !== "string" ||
+          !registry.get(pick.instanceId) ||
+          typeof pick.model !== "string" ||
+          pick.model.length > MAX_MODEL_ID_CHARS ||
+          !/^[\w.:@/\[\]+-]+$/.test(pick.model)
+        ) {
+          return json(res, 400, { error: "modelSelection must name an engine this workspace has and a model id" });
+        }
+      }
+      for (const key of ["name", "title", "description", "notifications", "modelSelection", "computer", "color", "shape", "skills", "skillIds", "effort", "mascotExpression", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       if (body.cwd !== undefined) {
@@ -5910,14 +11887,16 @@ const server = createServer(async (req, res) => {
         if (!checked.ok) return json(res, 400, { error: checked.error });
         patch.cwd = checked.path;
       }
-      if (body.section !== undefined) {
-        const named = normalizeSection(body.section);
-        if (!named.ok) return json(res, 400, { error: named.error });
-        patch.section = named.section;
+      if (typeof body.seniority === "number") {
+        const seniority = Math.max(1, Math.min(5, Math.round(body.seniority)));
+        if (asAgent && seniority > (store.bot(m[1])?.seniority ?? 1)) {
+          return json(res, 403, { error: "an agent cannot raise its own seniority" });
+        }
+        patch.seniority = seniority;
       }
       if (body.approvals !== undefined) {
         if (!APPROVALS.includes(body.approvals as Approvals)) {
-          return json(res, 400, { error: "approvals is ask, edits or auto" });
+          return json(res, 400, { error: "approvals is ask, edits, auto or full" });
         }
         // Lowering is always allowed. Raising is the person's call, for
         // the same reason as the browser below: PATCH /api/bots/:me is on
@@ -5971,6 +11950,18 @@ const server = createServer(async (req, res) => {
         }
         patch.voice = voice ?? null;
       }
+      if (body.engineHooks !== undefined) {
+        if (typeof body.engineHooks !== "boolean") {
+          return json(res, 400, { error: "engineHooks must be true or false" });
+        }
+        patch.engineHooks = body.engineHooks;
+      }
+      if (body.recallBeforeTurn !== undefined) {
+        if (typeof body.recallBeforeTurn !== "boolean") {
+          return json(res, 400, { error: "recallBeforeTurn must be true or false" });
+        }
+        patch.recallBeforeTurn = body.recallBeforeTurn;
+      }
       if (body.speakReplies !== undefined) {
         if (typeof body.speakReplies !== "boolean") {
           return json(res, 400, { error: "speakReplies must be true or false" });
@@ -5986,10 +11977,70 @@ const server = createServer(async (req, res) => {
           return json(res, 400, { error: "backupSelection is an engine and a model, or null" });
         }
       }
+      // where it sits, last: moving it renumbers the pins around it, which
+      // go out on their own, and it goes out below with everything else
+      if (Object.keys(placing.ask).length) arrange("agent", m[1], placing.ask, m[1]);
       const bot = store.patchBot(m[1], patch);
       if (!bot) return json(res, 404, { error: "no such agent" });
+      // a browser taken away is closed, not left open for nobody
+      if (patch.browser === false) void closeBrowser(join(DATA_DIR, "browser", bot.id)).catch(() => {});
       broadcast({ kind: "bot", bot: clientBot(bot) });
       return json(res, 200, { bot: clientBot(bot) });
+    }
+    m = path.match(/^\/api\/bots\/([\w-]+)\/archive$/);
+    if (m && method === "POST") {
+      // An agent retiring one it hired, once that agent's work is done
+      // (GitHub 148). The hire was the delegation, the same relationship
+      // `bloks stop` rests on; seniority in a room is not, and neither is
+      // anything else. Archive only: conversations, files, rules, rooms
+      // and key all stay, and the person can restore it. The person's own
+      // archive is DELETE /api/bots/:id, which also winds work down; this
+      // one refuses instead of interrupting anything.
+      if (!asAgent) return json(res, 403, { error: "this route is for an agent; archive from the agent's own menu" });
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such agent" });
+      const caller = store.bot(asAgent.botId)!;
+      if (caller.id === bot.id) return json(res, 403, { error: "an agent cannot retire itself" });
+      if (bot.hiredBy !== caller.id) {
+        return json(res, 403, { error: `${caller.name} can archive only an agent it hired, and it did not hire ${bot.name}` });
+      }
+      // a second ask reports, and keeps who archived it and why
+      if (bot.archivedAt) return json(res, 200, { ok: true, archived: false, note: `${bot.name} is already archived.` });
+      const body = await readBody(req).catch(() => ({}) as Record<string, unknown>);
+      const note = clamp(body.note, 300)?.trim() || undefined;
+      const blockers = pendingWork(bot);
+      if (blockers.length) {
+        return json(res, 409, {
+          error: `${bot.name} is not finished: ${blockers.join("; ")}. Nothing was changed; archive it once that is done, or ask the person.`,
+          blockers,
+        });
+      }
+      // Nothing awaits between the check above and this line, so a
+      // message arriving now either started first (and was refused above
+      // as work) or finds the agent archived and is turned away.
+      let archived: BotRecord | null;
+      try {
+        archived = store.archiveBot(bot.id, Date.now(), { botId: caller.id, note });
+      } catch {
+        return json(res, 500, { error: `${bot.name} could not be archived: its record would not save. It is still in service.` });
+      }
+      if (!archived) return json(res, 200, { ok: true, archived: false, note: `${bot.name} is already archived.` });
+      record({
+        at: Date.now(),
+        kind: "agent.archived",
+        actor: caller.name,
+        summary: `${caller.name} archived ${bot.name}`,
+        detail: { agent: bot.name, by: caller.name, ...(note ? { note } : {}), key: "kept" },
+      });
+      // What the person's archive also does. There is no work to wind
+      // down, or it would have been refused above, but it goes through
+      // the same door, so a turn admitted since is dropped before it
+      // reaches its engine and its schedules sit out the same way.
+      await windDown(archived);
+      void stopSandbox(bot.id).catch(() => {});
+      void box.sleepBox(cfg, bot.id).catch(() => {});
+      broadcast({ kind: "bot", bot: clientBot(archived) });
+      return json(res, 200, { ok: true, archived: true, note: `${bot.name} is archived. The person can restore it.` });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/restore$/);
     if (m && method === "POST") {
@@ -6002,6 +12053,7 @@ const server = createServer(async (req, res) => {
         summary: `Restored ${bot.name}`,
         detail: { agent: bot.name },
       });
+      resumeSchedules(bot);
       broadcast({ kind: "bot", bot: clientBot(bot) });
       return json(res, 200, { bot: clientBot(bot) });
     }
@@ -6018,17 +12070,12 @@ const server = createServer(async (req, res) => {
       // other. One mis-click was the end of all of it.
       const forget = url.searchParams.get("forget") === "1";
 
-      // Whatever happens next, it stops working now.
-      for (const lane of bot.tasks.filter((t) => t.busy)) {
-        await laneInstance(bot, lane.id)?.adapter.interruptTurn(lane.id).catch(() => {});
-      }
-      stopScreenPoller(bot.id);
-      terminals.close(bot.id);
-      // A hold naming an agent that cannot act would sit in the activity
-      // panel forever.
-      wheel.release(bot.id);
-      // Per turn credentials, in memory, nothing to keep.
-      agentTokens.revokeBot(bot.id);
+      // Whatever happens next, it stops working now. The archive goes on
+      // record first, so a turn still getting ready finds it and is
+      // dropped rather than slipping out while the others are stopped.
+      const archived = forget ? null : store.archiveBot(bot.id, Date.now());
+      if (!forget && !archived) return json(res, 409, { error: "that agent is already archived" });
+      await windDown(bot);
       // A claimed job waiting on somebody who is not coming goes back on
       // the board rather than sitting there, and says which of the two
       // things happened rather than always claiming a deletion.
@@ -6044,8 +12091,6 @@ const server = createServer(async (req, res) => {
         void stopSandbox(bot.id).catch(() => {});
         // A dormant agent should not be billed for a box it is not using.
         void box.sleepBox(cfg, bot.id).catch(() => {});
-        const archived = store.archiveBot(bot.id, Date.now());
-        if (!archived) return json(res, 409, { error: "that agent is already archived" });
         record({
           at: Date.now(),
           kind: "agent.archived",
@@ -6053,7 +12098,7 @@ const server = createServer(async (req, res) => {
           summary: `Archived ${bot.name}`,
           detail: { agent: bot.name, conversations: bot.tasks.length, key: "kept" },
         });
-        broadcast({ kind: "bot", bot: clientBot(archived) });
+        broadcast({ kind: "bot", bot: clientBot(archived!) });
         return json(res, 200, { ok: true, archived: true });
       }
 
@@ -6071,13 +12116,15 @@ const server = createServer(async (req, res) => {
       // The fingerprint is read before the key is burned, because it is
       // the only checkable handle the record keeps on an identity that
       // no longer exists.
-      const fingerprint = identityFor(bot.id).fingerprint;
+      // Never one made just to be read: a key it does not have is not one
+      // to create and then destroy.
+      const fingerprint = existingFingerprint(bot.id);
       record({
         at: Date.now(),
         kind: "agent.deleted",
         actor: "you",
         summary: `Deleted ${bot.name} for good`,
-        detail: { agent: bot.name, fingerprint, conversations: bot.tasks.length, key: "destroyed" },
+        detail: { agent: bot.name, ...(fingerprint ? { fingerprint } : {}), conversations: bot.tasks.length, key: "destroyed" },
       });
       forgetIdentity(bot.id);
       proposals.removeForBot(bot.id);
@@ -6095,15 +12142,19 @@ const server = createServer(async (req, res) => {
       void destroySandbox(bot.id).catch(() => {});
       routines.removeForTarget(bot.id);
       usage.forget(bot.id);
+      if (telegramBinding(bot.id)) {
+        saveTelegramBinding(bot.id);
+        startTelegramBot(bot.id);
+      }
       store.deleteBot(bot.id);
       // Every lane, not just the first: an agent with three lanes used
-      // to leave two files behind.
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
-        for (const task of bot.tasks) {
-          try {
-            unlinkSync(join(dir, `${task.id}.ndjson`));
-          } catch {}
-        }
+      // to leave two files behind. The native copy goes with its gzipped
+      // older ones.
+      for (const task of bot.tasks) {
+        try {
+          unlinkSync(join(EVENTS_DIR, `${task.id}.ndjson`));
+        } catch {}
+        forgetNative(task.id);
       }
       broadcast({ kind: "bot.deleted", botId: bot.id });
       return json(res, 200, { ok: true, archived: false });
@@ -6231,20 +12282,53 @@ const server = createServer(async (req, res) => {
     if (m && method === "PATCH") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such agent" });
-      const existing = store.messagesFor(bot.threadId).find((msg) => msg.id === m![2]);
-      if (!existing?.card) return json(res, 404, { error: "no such card" });
       const body = await readBody(req);
-      const patched = store.patchMessage(bot.threadId, m[2], {
+      // a named conversation, since a card can be in any of the agent's
+      const thread = typeof body.taskId === "string" && bot.tasks.some((t) => t.id === body.taskId) ? body.taskId : bot.threadId;
+      const existing = store.messagesFor(thread).find((msg) => msg.id === m![2]);
+      if (!existing?.card) return json(res, 404, { error: "no such card" });
+      const patched = store.patchMessage(thread, m[2], {
         card: {
           ...existing.card,
           ...(body.answered !== undefined ? { answered: body.answered } : {}),
           ...(body.dismissed !== undefined ? { dismissed: body.dismissed } : {}),
         },
       });
-      broadcast({ kind: "message.patch", threadId: bot.threadId, message: patched });
+      broadcast({ kind: "message.patch", threadId: thread, message: patched });
       return json(res, 200, { message: patched });
     }
+    m = path.match(/^\/api\/bots\/([\w-]+)\/take-back$/);
+    if (m && method === "POST") {
+      // Only a turn's agent credential identifies a sender. Neither the
+      // person nor a paired client may select somebody else's messages.
+      if (!asAgent) return json(res, 403, { error: "take-back needs an agent's turn credential" });
+      const caller = store.bot(asAgent.botId);
+      const recipient = store.bot(m[1]);
+      if (!recipient) return json(res, 404, { error: "no such agent; take-back does not apply to rooms" });
+      if (!caller || caller.id === recipient.id) return json(res, 403, { error: "take-back is only for your messages to another agent" });
+      // No body selection and no await: the queue cannot claim words
+      // between this operation's selection and its last tombstone.
+      const result = takeBackWaiting({
+        store, queues: steerQueues, caller, callerLaneId: asAgent.taskId, recipient,
+        patched: (threadId, message) => broadcast({
+          kind: message.takeBack ? "message" : "message.patch", threadId, message,
+        }),
+        editClosed,
+      });
+      return json(res, result.takenBack.length ? 200 : 409, result.takenBack.length ? result : { ...result, error: result.note });
+    }
     m = path.match(/^\/api\/bots\/([\w-]+)\/messages$/);
+    if (m && method === "GET") {
+      // Earlier messages of one of this agent's conversations, the page
+      // before `before`, for a transcript that arrived trimmed.
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such agent" });
+      const thread = url.searchParams.get("thread") || bot.threadId;
+      if (thread !== bot.threadId && !(bot.tasks ?? []).some((t) => t.id === thread)) {
+        return json(res, 404, { error: "no such conversation" });
+      }
+      return json(res, 200, earlierPage(store.messagesFor(thread), url));
+    }
     if (m && method === "POST") {
       const body = await readBody(req);
       // Truncating would drop the tail of what someone wrote without
@@ -6254,8 +12338,75 @@ const server = createServer(async (req, res) => {
       }
       const text = clamp(body.text, MAX_MESSAGE_CHARS);
       if (!text) return json(res, 400, { error: "text required" });
-      const result = await sendUserMessage(m[1], text, { replyTo: replyRef(body.replyTo) });
-      return json(res, 202, result);
+      // a lane may be named; otherwise the one the person has open, or, for
+      // another agent writing, General: which lane the person happened to
+      // be reading is no business of an agent's message
+      let taskId = typeof body.taskId === "string" && body.taskId ? body.taskId : undefined;
+      if (!taskId && asAgent) {
+        const to = store.bot(m[1]);
+        if (to) taskId = mainLaneOf(to).id;
+      }
+      // `/goal` is Bloks' own, not the engine's: it sets the lane's goal
+      // and never reaches an engine, where a command of the same name
+      // would run as one. Only the person's: an agent may read its goal
+      // but not set one, and its words to another are only words.
+      const asked = asAgent ? null : parseGoalCommand(text);
+      if (asked) {
+        if ("error" in asked) return json(res, 400, { error: asked.error });
+        const bot = store.bot(m[1]);
+        if (!bot) return json(res, 404, { error: "no such agent" });
+        const lane = bot.tasks.find((t) => t.id === (taskId ?? activeLaneOf(bot)));
+        if (!lane) return json(res, 404, { error: "no such task" });
+        withYou({ bot });
+        const goal = startGoal(bot, lane, asked);
+        return json(res, 202, { ok: true, goal: goalSummary(goal), taskId: lane.id, lane: lane.title });
+      }
+      // Another agent writing: the recipient's chat says who it was from,
+      // and the sender's own conversation keeps a record of sending it,
+      // with whether it went, waited, or was refused.
+      const sender = asAgent ? store.bot(asAgent.botId) : undefined;
+      const recipient = store.bot(m[1]);
+      const from = sender && recipient && sender.id !== recipient.id ? { botId: sender.id, name: sender.name } : undefined;
+      const noteSent = (status: NonNullable<AgentNote["status"]>) => {
+        if (!from || !recipient || !asAgent?.taskId || !sender!.tasks.some((t) => t.id === asAgent.taskId)) return;
+        const note = store.appendMessage(asAgent.taskId, {
+          role: "bot",
+          kind: "activity",
+          text,
+          tool: { name: `messaged ${recipient.name}`, ok: status !== "failed" },
+          agent: { dir: "out", peerId: recipient.id, peerName: recipient.name, status },
+        });
+        broadcast({ kind: "message", threadId: asAgent.taskId, message: note });
+      };
+      // Whether the one written to can answer now, read as it is sent: a
+      // sender that will not be answered is told so with the ok, rather
+      // than waiting on a reply that is not coming (GitHub 239).
+      const reach = from && recipient ? readinessOf(recipient).catch(() => null) : null;
+      let result;
+      try {
+        result = await sendUserMessage(m[1], text, {
+          taskId,
+          replyTo: replyRef(body.replyTo),
+          from,
+          yours: !asAgent,
+          // A stop-and-send follow-up must not join the dying turn, even
+          // when its engine has not closed after acknowledging Stop.
+          steer: !asAgent && body.steer !== false,
+          // only another agent asks for this; the person's words normally try
+          now: Boolean(from) && body.now === true,
+          // an agent writing, to another or to itself, carries its turn's
+          // place in a chain of agents' messages one further; and never as
+          // the person's own words, which alone may name a skill or a command
+          ...(sender ? { chain: chainFrom(sender, asAgent!.taskId), personal: false } : {}),
+        });
+      } catch (e) {
+        noteSent("failed");
+        throw e;
+      }
+      noteSent(result.queued ? "queued" : "sent");
+      const ready = await reach;
+      const warning = ready ? readinessWarning(recipient!.name, ready.engine, ready.readiness) : null;
+      return json(res, 202, warning ? { ...result, engine: warning } : result);
     }
     // ── task lanes ──
     // ── voices: how agents sound ──
@@ -6373,9 +12524,8 @@ const server = createServer(async (req, res) => {
       if (typeof body.agentToken === "string") patch.agentToken = body.agentToken.trim();
       if (typeof body.clientToken === "string") patch.clientToken = body.clientToken.trim();
       if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
-      saveConfig({ relay: patch });
-      Object.assign(cfg, loadConfig());
-      syncRelay();
+      Object.assign(cfg, saveConfig({ relay: patch }));
+      syncRelay(cfg);
       return json(res, 200, {
         ...relayLink.state,
         url: cfg.relay?.url ?? "",
@@ -6467,14 +12617,13 @@ const server = createServer(async (req, res) => {
       if (!agentToken || !clientToken) {
         return json(res, 502, { error: "Bloks Cloud opened a space but sent no tokens for it" });
       }
-      saveConfig({ relay: { url, agentToken, clientToken, enabled: true } });
-      Object.assign(cfg, loadConfig());
+      Object.assign(cfg, saveConfig({ relay: { url, agentToken, clientToken, enabled: true } }));
       // Pairing stays exactly as the owner left it. It is the master
       // switch for every remote path (see syncRelay), and paying for
       // Cloud is not the same act as opening this Mac to the network, so
       // the answer below reports what is actually true instead: with
       // pairing off, `configured` and `connected` are both false.
-      syncRelay();
+      syncRelay(cfg);
       return json(res, 200, {
         ...relayLink.state,
         // the space that was just minted, which is the truth for the
@@ -6487,15 +12636,22 @@ const server = createServer(async (req, res) => {
 
     if (method === "GET" && path === "/api/relay/status") {
       if (!local) return json(res, 403, { error: "not from here" });
-      // Three facts, and they are not one fact. `enabled` is the switch
+      // Four facts, and they are not one fact, plus the switch above them. `enabled` is the switch
       // in the config, `connected` is whether the line is up this second,
-      // and `spaceId` only exists once the relay has said hello. A screen
+      // `delivering` is whether what we send back is landing, and
+      // `spaceId` only exists once the relay has said hello. A screen
       // that infers the last two from the first shows a green light while
       // the phone gets nothing.
       return json(res, 200, {
         enabled: Boolean(cfg.relay?.enabled),
         connected: relayLink.state.connected,
+        delivering: relayLink.state.delivering,
         spaceId: relayLink.state.spaceId,
+        problem: relayLink.state.problem,
+        // Pairing is the master switch for every remote path, the relay
+        // included (syncRelay), so a key can be accepted and the line
+        // still never dial. Said outright, or the screen waits forever.
+        pairing: remoteEnabled(),
       });
     }
 
@@ -6503,18 +12659,84 @@ const server = createServer(async (req, res) => {
     // moved aside with a timestamp, so a person who chose wrong can put
     // it back by renaming one folder. The harness then reseeds itself on
     // the next boot the way a first install does.
+    //
+    // That boot has to actually happen. This process still holds the old
+    // agents, rooms and settings in memory, so answering and carrying on
+    // served the old workspace straight back to the page, and the next
+    // save wrote it into the new folder. So the process ends as soon as
+    // the answer is out: the desktop app relaunches, and a server under a
+    // supervisor comes back on its own.
+    //
+    // Settings are not the workspace. Keys, engine connections and Bloks
+    // Cloud carry over, so starting fresh does not mean setting up the
+    // machine again; only the mark that setup was done is left behind.
     if (method === "POST" && path === "/api/workspace/reset") {
       if (!local) return json(res, 403, { error: "not from here" });
       try {
         const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
         const archive = `${DATA_DIR}-archived-${stamp}`;
         renameSync(DATA_DIR, archive);
-        return json(res, 200, { archivedTo: archive });
+        mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+        try {
+          const kept = JSON.parse(readFileSync(join(archive, "config.json"), "utf8"));
+          delete kept.setupDoneAt;
+          // your own phones stay paired; guests' devices belonged to rooms
+          // that are now in the archive, so they stay there with them
+          if (kept.remote) delete kept.remote.memberDevices;
+          writeFileSync(join(DATA_DIR, "config.json"), JSON.stringify(kept, null, 2), { mode: 0o600 });
+        } catch {
+          /* no settings yet: the fresh workspace starts with none either */
+        }
+        res.on("finish", () => setTimeout(() => process.exit(0), 50));
+        return json(res, 200, { archivedTo: archive, restarting: true });
       } catch (e) {
         return json(res, 500, {
           error: redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 200),
         });
       }
+    }
+
+    // ── bring your setup: what other agent tools already know ──
+    // Reading another tool's files is for the person at this computer to
+    // start. Not an agent, which would be reading the person's home on
+    // its own initiative, and not a phone or a remote window, which would
+    // carry the person's instructions and skills off this machine. The
+    // look and the import both read the files fresh; the import takes from
+    // the window only which items, and where.
+    if (path === "/api/setup-import" && (method === "GET" || method === "POST")) {
+      if (!local || asAgent) return json(res, 403, { error: "only Bloks on this computer can bring a setup over" });
+      if (method === "GET") return json(res, 200, reviewOf(detectSetup(), setupRecord, setupImportDeps()));
+      const body = await readBody(req).catch(() => ({}) as Record<string, unknown>);
+      // A new agent's settings mean asking the engines which one answers,
+      // which takes a moment; only an import that makes one waits for it.
+      const makesAgent = Array.isArray(body.picks) && body.picks.some((pick: unknown) => isRecord(pick) && pick.botId === "new");
+      const outcome = applyImport(detectSetup(), body.picks, setupImportDeps(makesAgent ? await newAgentSettings() : {}), setupRecord);
+      for (const id of outcome.created) {
+        const made = store.bot(id);
+        if (made) broadcast({ kind: "bot", bot: { ...clientBot(made)!, messages: store.messagesFor(made.threadId) } });
+      }
+      for (const id of outcome.touched.agents) {
+        if (!outcome.created.includes(id)) broadcast({ kind: "bot", bot: clientBot(store.bot(id)) });
+      }
+      for (const id of outcome.touched.memory) broadcast({ kind: "memory.changed", botId: id, changes: 1 });
+      if (outcome.touched.skills) broadcast({ kind: "skills" });
+      if (outcome.touched.rules) broadcast({ kind: "rules" });
+      if (outcome.touched.notes) broadcast({ kind: "profile" });
+      const brought = outcome.results.filter((r) => r.ok && r.did !== "unchanged").length;
+      if (brought) {
+        record({
+          at: Date.now(),
+          kind: "setup.imported",
+          actor: "you",
+          summary: `Brought over ${brought} ${brought === 1 ? "item" : "items"} from other agent tools`,
+          detail: { items: brought },
+        });
+      }
+      return json(res, 200, {
+        results: outcome.results,
+        created: outcome.created,
+        review: reviewOf(detectSetup(), setupRecord, setupImportDeps()),
+      });
     }
 
     // ── user MCP servers: bring your own tools ──
@@ -6530,6 +12752,8 @@ const server = createServer(async (req, res) => {
               ? (server.url ?? "").replace(/^(https?:\/\/[^\/]+).*$/, "$1")
               : (server.command ?? "").split("/").pop(),
           hasHeaders: Boolean(Object.keys(server.headers ?? {}).length),
+          // names still waiting for a value, never the values themselves
+          needs: unfilled(server),
         })),
       });
     }
@@ -6538,8 +12762,8 @@ const server = createServer(async (req, res) => {
       const name = clamp(body.name, 40);
       const transport = body.transport === "http" ? ("http" as const) : ("stdio" as const);
       if (!name) return json(res, 400, { error: "a server needs a name" });
-      if ((cfg.mcpServers ?? []).length >= 16) {
-        return json(res, 507, { error: "at most 16 MCP servers" });
+      if ((cfg.mcpServers ?? []).length >= MAX_MCP_SERVERS) {
+        return json(res, 507, { error: `at most ${MAX_MCP_SERVERS} MCP servers` });
       }
       const entry: NonNullable<AppConfig["mcpServers"]>[number] = {
         id: randomBytes(8).toString("hex"),
@@ -6578,19 +12802,42 @@ const server = createServer(async (req, res) => {
       if (transport === "http" ? !entry.url : !entry.command) {
         return json(res, 400, { error: transport === "http" ? "a valid http(s) url is required" : "a command is required" });
       }
-      saveConfig({ mcpServers: [...(cfg.mcpServers ?? []), entry] } as Partial<AppConfig>);
-      Object.assign(cfg, loadConfig());
+      Object.assign(cfg, saveConfig({ mcpServers: [...(cfg.mcpServers ?? []), entry] } as Partial<AppConfig>));
       return json(res, 201, { id: entry.id });
     }
     m = path.match(/^\/api\/mcp-servers\/([\w-]+)$/);
+    // Filling in what a server is waiting for: an environment value or a
+    // header a brought-over server came without. Only names it already
+    // has; a new name is a different server, added the usual way.
+    if (m && method === "PATCH") {
+      const server = (cfg.mcpServers ?? []).find((s) => s.id === m![1]);
+      if (!server) return json(res, 404, { error: "no such server" });
+      const body = await readBody(req).catch(() => ({}) as Record<string, unknown>);
+      const fill = (given: unknown, had: Record<string, string> | undefined) => {
+        if (!had) return undefined;
+        const out = { ...had };
+        if (!isRecord(given)) return out;
+        for (const [name, value] of Object.entries(given)) {
+          if (Object.hasOwn(had, name) && typeof value === "string") out[name] = value.trim().slice(0, MAX_KEY_CHARS * 5);
+        }
+        return out;
+      };
+      const next = {
+        ...server,
+        ...(server.env ? { env: fill(body.env, server.env) } : {}),
+        ...(server.headers ? { headers: fill(body.headers, server.headers) } : {}),
+      };
+      mcp.close(server.id);
+      Object.assign(cfg, saveConfig({ mcpServers: (cfg.mcpServers ?? []).map((s) => (s.id === server.id ? next : s)) } as Partial<AppConfig>));
+      return json(res, 200, { ok: true, needs: unfilled(next) });
+    }
     if (m && method === "DELETE") {
       mcp.close(m[1]);
       const remaining = (cfg.mcpServers ?? []).filter((server) => server.id !== m![1]);
       if (remaining.length === (cfg.mcpServers ?? []).length) {
         return json(res, 404, { error: "no such server" });
       }
-      saveConfig({ mcpServers: remaining } as Partial<AppConfig>);
-      Object.assign(cfg, loadConfig());
+      Object.assign(cfg, saveConfig({ mcpServers: remaining } as Partial<AppConfig>));
       // detach it from every agent so nothing dangles
       for (const b of store.bots) {
         if (b.mcpServers?.includes(m![1])) {
@@ -6632,10 +12879,11 @@ const server = createServer(async (req, res) => {
       choosingDecisions.add(key);
       try {
         if (room) {
-          enqueueRoomPost(room, text, { hops: 0, replyTo });
+          withYou({ room });
+          enqueueRoomPost(room, text, { hops: 0, replyTo, byYou: true });
           triggersFired({ kind: "message", targetId: room.id, text, fromUser: true });
         } else {
-          await sendUserMessage(bot.id, text, { taskId: threadId, replyTo });
+          await sendUserMessage(bot.id, text, { taskId: threadId, replyTo, yours: true, steer: true, personal: false });
         }
         const message = store.patchMessage(threadId, messageId, { decisionChoice: choice });
         broadcast({ kind: "message.patch", threadId, message: message! });
@@ -6643,6 +12891,29 @@ const server = createServer(async (req, res) => {
       } finally {
         choosingDecisions.delete(key);
       }
+    }
+
+    // ── picking up a turn cut off long ago ──
+    // Offered with a Continue rather than done on its own when Bloks was
+    // gone too long (recoverCutOff). Pressing it is the same pickup a
+    // restart makes, once: the record goes before the turn starts.
+    m = path.match(/^\/api\/threads\/([\w-]+)\/carry-on$/);
+    if (m && method === "POST") {
+      if (asAgent) return json(res, 403, { error: "picking up a cut-off turn is for the person, not an agent" });
+      const turn = cutOff.get(m[1]);
+      if (!turn?.waiting) return json(res, 409, { error: "There is nothing left to pick up here." });
+      const agent = store.bot(turn.botId);
+      if (agent?.tasks.find((t) => t.id === turn.laneId)?.busy) {
+        return json(res, 409, { error: `${agent.name} is working. Try again when it is done.` });
+      }
+      // left offered: after the restart it is still here to press
+      if (drain.on) return json(res, 503, { error: "Bloks is finishing what is running before it restarts. Continue this once it is back." });
+      cutOff.take(turn.laneId);
+      retireCarryOn(turn);
+      // the person pressed it, so what it says is a reply to them; it
+      // still runs for whoever asked for the turn it continues
+      carryOn({ ...turn, byYou: true }, "restart");
+      return json(res, 200, { ok: true });
     }
 
     // ── rewinding ──
@@ -6675,68 +12946,26 @@ const server = createServer(async (req, res) => {
       if (!target || target.role !== "user" || target.deleted) {
         return json(res, 400, { error: "Rewind to one of your own messages." });
       }
-
-      const now = Date.now();
-      const restored = new Set<string>();
-      const skipped = new Map<string, string>();
-      for (const record of checkpoints.undoableSince(laneId, target.at)) {
-        const result = await checkpoints.revert(record.id).catch(() => null);
-        if (!result) continue;
-        for (const path of result.restored) {
-          restored.add(path);
-          skipped.delete(path);
-        }
-        for (const s of result.skipped) if (!restored.has(s.path)) skipped.set(s.path, s.why);
-        patchChangesCard(record);
-      }
-
-      const later = messages.slice(index).filter((msg) => !msg.deleted);
-      for (const msg of later) {
-        const patched = store.patchMessage(laneId, msg.id, { deleted: true, rewound: now });
-        if (patched) broadcast({ kind: "message.patch", threadId: laneId, message: patched });
-      }
-      // A summary that covers part of what was taken back would hand it
-      // straight back to the agent, so it goes; the next turn replays what
-      // is left instead, and summarises again when that fills up.
-      const kept = messages.slice(0, index).filter((msg) => msg.kind === "text" && msg.text && !msg.deleted).length;
-      if (task.context && task.context.through > kept) store.setTaskContext(laneId, null);
-      store.forgetLaneSessions(laneId);
-      undoneSince.delete(laneId);
-
-      const files = [...restored];
-      const left = [...skipped.entries()];
-      const named = (paths: string[]) =>
-        paths.slice(0, 6).join(", ") + (paths.length > 6 ? `, and ${paths.length - 6} more` : "");
-      const parts = [
-        `Rewound to before your message. ${found.name} no longer remembers anything said after it.`,
-        files.length
-          ? `${files.length === 1 ? "1 file is" : `${files.length} files are`} back as they were: ${named(files)}.`
-          : "",
-        left.length
-          ? `Left alone, because they changed since: ${named(left.map(([path]) => path))}.`
-          : "",
-        "Its memory notes are unchanged.",
-      ].filter(Boolean);
-      const notice = store.appendMessage(laneId, { role: "bot", kind: "notice", text: parts.join(" ") });
-      broadcast({ kind: "message", threadId: laneId, message: notice });
-      record({
-        at: now,
-        kind: "conversation.rewound",
-        actor: "you",
-        summary: `Rewound a conversation with ${found.name}`,
-        detail: { agent: found.name, messages: String(later.length), files: String(files.length) },
-      });
-      broadcast({ kind: "bot", bot: clientBot(store.bot(found.id)) });
-      return json(res, 200, {
-        text: target.text ?? "",
-        rewound: later.length,
-        restored: files,
-        skipped: left.map(([path, why]) => ({ path, why })),
-      });
+      return json(res, 200, await rewindLane(found, task, index));
     }
 
     // ── editing and taking back ──
     m = path.match(/^\/api\/threads\/([\w-]+)\/messages\/([\w-]+)$/);
+    if (m && method === "GET") {
+      // One whole message, for a search hit's snippet that stopped
+      // mid-sentence. The person's, not an agent's: an agent reads its own
+      // conversations through its own tools.
+      if (asAgent) return json(res, 403, { error: "that is the person's to read" });
+      const message = store.messagesFor(m[1]).find((x) => x.id === m![2] && !x.deleted);
+      if (!message) return json(res, 404, { error: "no such message" });
+      const owner = store.bots.find((b) => b.tasks.some((t) => t.id === m![1]));
+      const room = bloks.bloks.find((r) => r.id === m![1]);
+      return json(res, 200, {
+        message,
+        botId: owner?.id ?? null,
+        conversation: owner?.tasks.find((t) => t.id === m![1])?.title ?? room?.name ?? null,
+      });
+    }
     if (m && (method === "PATCH" || method === "DELETE")) {
       const existing = store.messagesFor(m[1]).find((msg) => msg.id === m![2]);
       if (!existing) return json(res, 404, { error: "no such message" });
@@ -6754,6 +12983,8 @@ const server = createServer(async (req, res) => {
           component: undefined,
         });
         broadcast({ kind: "message.patch", threadId: m[1], message: patched! });
+        // taken back from under its own editor: nothing left to wait for
+        editClosed(m[1], m[2]);
         return json(res, 200, { message: patched });
       }
 
@@ -6769,7 +13000,51 @@ const server = createServer(async (req, res) => {
       if (text.length > MAX_MESSAGE_CHARS) return json(res, 413, { error: "that message is too long" });
       const patched = store.patchMessage(m[1], m[2], { text, editedAt: Date.now() });
       broadcast({ kind: "message.patch", threadId: m[1], message: patched! });
+      // A save closes the editor it came from. Here rather than in a
+      // second request from the app, so the burst it held can only go
+      // once the new words are in.
+      editClosed(m[1], m[2]);
       return json(res, 200, { message: patched });
+    }
+
+    // The editor opening and closing on a queued message, so the turn it
+    // waits for is held while the words are still changing (see
+    // editOpened). A message that is not waiting any more, because its
+    // turn took it a moment ago, is an ordinary edit and holds nothing.
+    m = path.match(/^\/api\/threads\/([\w-]+)\/messages\/([\w-]+)\/editing$/);
+    if (m && method === "POST") {
+      const body = await readBody(req);
+      if (body.editing === false) {
+        editClosed(m[1], m[2]);
+        return json(res, 200, { holding: false });
+      }
+      const message = store.messagesFor(m[1]).find((msg) => msg.id === m![2]);
+      const waiting = steerQueues.get(m[1])?.items.some((item) => item.messageId === m![2]);
+      if (!message || message.role !== "user" || message.deleted || !message.queued || !waiting) {
+        return json(res, 200, { holding: false });
+      }
+      editOpened(m[1], m[2]);
+      return json(res, 200, { holding: true });
+    }
+
+    // Redoing a message the agent already read (redoMessage). GET says
+    // what it would take back, for the line under the editor, or why it
+    // is not offered; POST does it, with the new words. The person's, as
+    // a rewind is: an agent that could redo could rewrite what it was
+    // asked.
+    m = path.match(/^\/api\/threads\/([\w-]+)\/messages\/([\w-]+)\/redo$/);
+    if (m && method === "GET") {
+      if (asAgent) return json(res, 403, { error: "redoing a message is for the person, not an agent" });
+      return json(res, 200, redoPreview(m[1], m[2]));
+    }
+    if (m && method === "POST") {
+      if (asAgent) return json(res, 403, { error: "redoing a message is for the person, not an agent" });
+      const body = await readBody(req);
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      if (!text) return json(res, 400, { error: "a redone message still needs words" });
+      if (text.length > MAX_MESSAGE_CHARS) return json(res, 413, { error: "that message is too long" });
+      const done = await redoMessage(m[1], m[2], text);
+      return json(res, done.status, done.body);
     }
 
     // ── reactions ──
@@ -6880,10 +13155,10 @@ const server = createServer(async (req, res) => {
           if (!(fx >= 0 && fx <= 1 && fy >= 0 && fy <= 1)) {
             return json(res, 400, { error: "x and y are fractions of the page" });
           }
-          await clickAt(BROWSER_PORT, fx, fy);
+          await clickAt(await browserPortOf(bot.id), fx, fy);
         } else {
           const text = typeof body.text === "string" ? body.text.slice(0, 2_000) : "";
-          await typeText(BROWSER_PORT, text, body.enter === true);
+          await typeText(await browserPortOf(bot.id), text, body.enter === true);
         }
       } catch (e) {
         return json(res, 409, { error: e instanceof Error ? e.message : String(e) });
@@ -6979,18 +13254,9 @@ const server = createServer(async (req, res) => {
       if (result.restored.length) {
         undoneSince.set(record.threadId, [...(undoneSince.get(record.threadId) ?? []), ...result.restored]);
       }
-      if (record.card) {
-        const current = store.messagesFor(record.card.threadId).find((msg) => msg.id === record.card!.messageId);
-        if (current?.changes) {
-          const patched = store.patchMessage(record.card.threadId, record.card.messageId, {
-            changes: {
-              ...current.changes,
-              reverted: { at: Date.now(), restored: result.restored.length, skipped: result.skipped.length },
-            },
-          });
-          if (patched) broadcast({ kind: "message.patch", threadId: record.card.threadId, message: patched });
-        }
-      }
+      patchChangesCard(record, {
+        reverted: { at: Date.now(), restored: result.restored.length, skipped: result.skipped.length },
+      });
       return json(res, 200, result);
     }
 
@@ -7024,9 +13290,12 @@ const server = createServer(async (req, res) => {
       if (!value || value.length > 4_000) {
         return json(res, 400, { error: "paste the value first" });
       }
+      // a card planted before names were checked is held to the same rule
+      if (reservedEnvName(card.secret.envName)) {
+        return json(res, 400, { error: `${card.secret.envName} is a name the system reads for itself, so it cannot hold a secret` });
+      }
       // straight to the config file; the transcript never sees it
-      saveConfig({ secrets: { [card.secret.envName]: value } });
-      Object.assign(cfg, loadConfig());
+      Object.assign(cfg, saveConfig({ secrets: { [card.secret.envName]: value } }));
       // No engine reload: the next turn reads secrets fresh (see startTurn).
       // Reloading tore down every engine, killing any turn in flight,
       // including the one the previous card had just resumed.
@@ -7041,7 +13310,7 @@ const server = createServer(async (req, res) => {
         entry.items.push({ text: note });
         steerQueues.set(threadId, entry);
       } else if (!already) {
-        void startTurn(bot.id, note, { taskId: threadId, presetMessage: true }).catch((e) => {
+        void startTurn(bot.id, note, { taskId: threadId, presetMessage: true, byYou: turnsForYou.has(threadId) }).catch((e) => {
           // Same reason as the connector resume: the mark is what stops
           // this firing twice, so leaving it set after a refusal parks
           // the task on a secret that has already been saved.
@@ -7107,11 +13376,19 @@ const server = createServer(async (req, res) => {
           error: "memory is capped at 256KB. Move long notes into memory/<topic>.md files",
         });
       }
-      const was = readRaw(memoryJournal.pathOf(m[1], "MEMORY.md"));
-      if (!workspace.writeMemoryFile(m[1], body.text)) {
-        return json(res, 409, { error: "MEMORY.md is a link to somewhere else now, so it was not saved. Look at the agent's workspace." });
+      // an unreadable file is not a missing one: recorded as made, Undo
+      // would delete it
+      let was: string | null;
+      try {
+        was = readMemoryText(memoryJournal.pathOf(m[1], "MEMORY.md")!, "MEMORY.md");
+      } catch (error) {
+        return json(res, 409, { error: (error as Error).message });
       }
-      if (memoryJournal.record(m[1], "MEMORY.md", "you", was, body.text)) {
+      if (memoryJournal.record(m[1], "MEMORY.md", "you", was, body.text, undefined, () => {
+        if (!workspace.writeMemoryFile(m![1], body.text)) {
+          throw Object.assign(new Error("MEMORY.md is a link to somewhere else now, so it was not saved. Look at the agent's workspace."), { status: 409 });
+        }
+      })) {
         broadcast({ kind: "memory.changed", botId: m[1], changes: 1 });
       }
       return json(res, 200, { ok: true, truncated: workspace.readMemoryFile(m[1]).truncated });
@@ -7160,19 +13437,26 @@ const server = createServer(async (req, res) => {
       const file = `memory/${name}`;
       const target = memoryJournal.pathOf(m[1], file);
       if (!target) return json(res, 400, { error: "a topic is a name ending in .md" });
-      const was = readRaw(target);
+      let was: string | null;
+      try {
+        was = readMemoryText(target, file);
+      } catch (error) {
+        return json(res, 409, { error: (error as Error).message });
+      }
       if (method === "DELETE") {
         if (was === null) return json(res, 404, { error: "no such topic" });
-        rmSync(target, { force: true });
-        memoryJournal.record(m[1], file, "you", was, null);
+        memoryJournal.record(m[1], file, "you", was, null, undefined, () => rmSync(target, { force: true }));
       } else {
         const body = await readBody(req);
         if (typeof body.text !== "string") return json(res, 400, { error: "text required" });
         if (Buffer.byteLength(body.text, "utf8") > workspace.MEMORY_FILE_MAX_BYTES) {
           return json(res, 400, { error: "a topic is capped at 256KB" });
         }
-        if (!workspace.writeMemoryTopic(m[1], name, body.text)) return json(res, 400, { error: "a topic is a name ending in .md" });
-        memoryJournal.record(m[1], file, "you", was, body.text);
+        memoryJournal.record(m[1], file, "you", was, body.text, undefined, () => {
+          if (!workspace.writeMemoryTopic(m![1], name, body.text)) {
+            throw Object.assign(new Error("a topic is a name ending in .md"), { status: 400 });
+          }
+        });
       }
       broadcast({ kind: "memory.changed", botId: m[1], changes: 1 });
       return json(res, 200, { ok: true, topics: workspace.listMemoryTopics(m[1]) });
@@ -7220,8 +13504,10 @@ const server = createServer(async (req, res) => {
       // 202 says the work started. It has to be true for every reason it
       // might not have, not only the two this route happened to know
       // about: a busy lane and a missing engine end the same way, with
-      // nothing running and the person told it was sent.
-      const refused = await startTurn(botId, text).then(
+      // nothing running and the person told it was sent. The words are
+      // written here around the file's name, which the agent chose, so
+      // they name no Codex skill, as a meeting's action item does not.
+      const refused = await startTurn(botId, text, { byYou: true, personal: false }).then(
         () => null,
         (e: unknown) => ({
           status: (e as { status?: number }).status ?? 500,
@@ -7229,6 +13515,7 @@ const server = createServer(async (req, res) => {
         }),
       );
       if (refused) return json(res, refused.status, { error: refused.error });
+      withYou({ bot });
       return json(res, 202, { sent: open.length });
     }
 
@@ -7277,14 +13564,16 @@ const server = createServer(async (req, res) => {
       if (!task) return json(res, 409, { error: `an agent runs at most ${MAX_TASKS} tasks` });
       const fresh = store.bot(bot.id)!;
       broadcast({ kind: "bot", bot: clientBot(fresh) });
-      return json(res, 201, { bot: { ...clientBot(fresh), messages: store.messagesFor(task.id) } });
+      return json(res, 201, { bot: { ...clientBot(fresh), ...laneFor(task.id) }, seq: frameSeq });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)\/activate$/);
     if (m && method === "POST") {
       if (!store.setActiveTask(m[1], m[2])) return json(res, 404, { error: "no such task" });
+      // opening a conversation is reading it
+      store.markLane(m[1], m[2], false);
       const fresh = store.bot(m[1])!;
       broadcast({ kind: "bot", bot: clientBot(fresh) });
-      return json(res, 200, { bot: { ...clientBot(fresh), messages: store.messagesFor(m[2]) } });
+      return json(res, 200, { bot: { ...clientBot(fresh), ...laneFor(m[2]) }, seq: frameSeq });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)$/);
     if (m && method === "PATCH") {
@@ -7293,25 +13582,172 @@ const server = createServer(async (req, res) => {
       // prompt ("your conversation ..."), so it is one short line.
       const body = await readBody(req);
       const title = clamp(typeof body.title === "string" ? body.title.replace(/\s+/g, " ") : undefined, 40);
-      if (!title) return json(res, 400, { error: "a task needs a title" });
+      const unread = typeof body.unread === "boolean" ? body.unread : undefined;
+      if (!title && unread === undefined) return json(res, 400, { error: "a task needs a title" });
       if (!store.bot(m[1])?.tasks.some((t) => t.id === m![2])) return json(res, 404, { error: "no such task" });
-      store.patchTaskTitle(m[1], m[2], title);
+      if (title) retitleLane(m[1], m[2], title);
+      // "mark as unread" on one conversation, from its row in the sidebar
+      if (unread !== undefined) store.markLane(m[1], m[2], unread);
       const fresh = store.bot(m[1])!;
       broadcast({ kind: "bot", bot: clientBot(fresh) });
-      return json(res, 200, { bot: { ...clientBot(fresh), messages: store.messagesFor(fresh.activeTaskId) } });
+      return json(res, 200, { bot: { ...clientBot(fresh), ...laneFor(fresh.activeTaskId) }, seq: frameSeq });
     }
     if (m && method === "DELETE") {
-      const outcome = store.deleteTask(m[1], m[2]);
+      // an agent closes the conversation it is in, never another one
+      if (asAgent && asAgent.taskId !== m[2]) {
+        return json(res, 403, { error: "an agent can close only the conversation it is in" });
+      }
+      const outcome = deleteLane(m[1], m[2]);
       if (outcome === "missing") return json(res, 404, { error: "no such task" });
+      // An agent closing its own conversation is doing it from inside its
+      // turn there, so that turn is what keeps it busy: close it when the
+      // turn ends rather than refuse.
+      if (outcome === "busy" && asAgent && store.bot(m[1])?.tasks[0]?.id === m[2]) {
+        return json(res, 409, { error: "General is cleared, not closed" });
+      }
+      if (outcome === "busy" && asAgent) {
+        closeAfterTurn.add(m[2]);
+        return json(res, 202, { ok: true, closing: "when this turn ends" });
+      }
       if (outcome === "busy") return json(res, 409, { error: "that task is running, interrupt it first" });
-      if (outcome === "last") return json(res, 409, { error: "an agent keeps at least one task" });
+      if (outcome === "general") return json(res, 409, { error: "General is cleared, not closed" });
+      claudeCatalogs.delete(m[2]);
       const fresh = store.bot(m[1])!;
       broadcast({ kind: "bot", bot: clientBot(fresh) });
       return json(
         res,
         200,
-        { bot: { ...clientBot(fresh), messages: store.messagesFor(fresh.activeTaskId) } },
+        // the sequence of the frame just sent, so a client can tell this
+        // answer from a newer record it already has
+        { bot: { ...clientBot(fresh), ...laneFor(fresh.activeTaskId) }, seq: frameSeq },
       );
+    }
+
+    // A fresh engine session in one conversation, its transcript kept. An
+    // agent asks for the conversation it is in, from inside its turn there,
+    // so the reset waits for that turn to end (GitHub 139).
+    m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)\/fresh$/);
+    if (m && method === "POST") {
+      if (asAgent && asAgent.taskId !== m[2]) {
+        return json(res, 403, { error: "an agent can start a fresh session only in the conversation it is in" });
+      }
+      const lane = store.bot(m[1])?.tasks.find((t) => t.id === m![2]);
+      if (!lane) return json(res, 404, { error: "no such task" });
+      if (lane.busy) {
+        freshAfterTurn.add(lane.id);
+        return json(res, 202, { ok: true, fresh: "when this turn ends" });
+      }
+      startFresh(lane.id);
+      return json(res, 200, { ok: true, fresh: "now" });
+    }
+
+    // A conversation's goal (server/goals.ts): set, paused, resumed, given
+    // more turns, or cleared. The person's alone: an agent reads its own
+    // with GET /api/agent/goal and never sets one, since a goal starts
+    // turns unattended and can run a command on this computer.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)\/goal$/);
+    if (m && (method === "GET" || method === "PUT" || method === "PATCH" || method === "DELETE")) {
+      if (asAgent) return json(res, 403, { error: "a goal is the person's to set. Read your own with `bloks goal`." });
+      const bot = store.bot(m[1]);
+      const lane = bot?.tasks.find((t) => t.id === m![2]);
+      if (!bot || !lane) return json(res, 404, { error: "no such task" });
+      if (method === "GET") return json(res, 200, { goal: lane.goal ? goalSummary(lane.goal, goalJudging.has(lane.id)) : null });
+      if (method === "DELETE") {
+        withdrawGoalNotes(bot.id, lane.id);
+        putGoal(bot.id, lane.id, undefined);
+        return json(res, 200, { ok: true, goal: null });
+      }
+      const body = await readBody(req);
+      if (method === "PUT") {
+        const input = goalInput(body);
+        if ("error" in input) return json(res, 400, { error: input.error });
+        withdrawGoalNotes(bot.id, lane.id);
+        const goal = startGoal(bot, lane, input);
+        return json(res, 200, { ok: true, goal: goalSummary(goal) });
+      }
+      // PATCH: pause, resume, or a new number of turns
+      if (!lane.goal) return json(res, 404, { error: "this conversation has no goal" });
+      let budget: number | undefined;
+      if (body.budget !== undefined) {
+        const read = goalInput({ text: lane.goal.text, budget: body.budget });
+        if ("error" in read) return json(res, 400, { error: read.error });
+        budget = read.budget;
+      }
+      if (body.status === "paused") {
+        if (lane.goal.status !== "active") return json(res, 409, { error: "only a goal that is going can be paused" });
+        if (budget) putGoal(bot.id, lane.id, { ...lane.goal, budget });
+        pauseGoal(bot.id, lane.id, goalPausedNotice("you"), "you paused it");
+      } else if (body.status === "active") {
+        resumeGoal(bot, lane, budget);
+      } else if (body.status !== undefined) {
+        return json(res, 400, { error: 'status is "paused" or "active"' });
+      } else if (budget) {
+        putGoal(bot.id, lane.id, { ...lane.goal, budget });
+      } else {
+        return json(res, 400, { error: "say what to change: status or budget" });
+      }
+      const goal = store.taskByThread(lane.id)?.task.goal;
+      return json(res, 200, { ok: true, goal: goal ? goalSummary(goal, goalJudging.has(lane.id)) : null });
+    }
+
+    m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)\/clear$/);
+    if (m && method === "POST") {
+      const outcome = store.clearTask(m[1], m[2]);
+      if (outcome === "missing") return json(res, 404, { error: "no such task" });
+      if (outcome === "busy") return json(res, 409, { error: "that task is running, interrupt it first" });
+
+      // the lane keeps its id, so nothing from before the clear may follow it
+      undoneSince.delete(m[2]);
+
+      const fresh = store.bot(m[1])!;
+
+      // every window showing it empties too, not just this one
+      broadcast({ kind: "bot", bot: { ...clientBot(fresh), ...(fresh.activeTaskId === m[2] ? { messages: [] } : {}) } });
+      return json(res, 200, { bot: { ...clientBot(fresh), ...laneFor(fresh.activeTaskId) }, seq: frameSeq });
+    }
+
+    // Everything two agents said to each other, from both sides, oldest
+    // first: what arrived in each one's chat and any send that never
+    // arrived, plus, as context marked "reply", what each said in its own
+    // chat in a turn the other's message started (never sent to them).
+    // Each entry names the conversation it sits in, so unrelated work
+    // stays told apart.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/exchange\/([\w-]+)$/);
+    if (m && method === "GET") {
+      const a = store.bot(m[1]);
+      const b = store.bot(m[2]);
+      if (!a || !b) return json(res, 404, { error: "no such agent" });
+      const entries: Array<Record<string, unknown>> = [];
+      for (const [self, other] of [[a, b], [b, a]] as const) {
+        for (const lane of self.tasks) {
+          for (const msg of store.messagesFor(lane.id)) {
+            // what an agent said in its own chat after the other's message
+            // is context, listed as such: it was never sent to them
+            const note =
+              (msg.takeBack ? { dir: "take-back" as const, ...msg.takeBack } : undefined) ??
+              msg.agent ?? (msg.afterAgent ? { dir: "reply" as const, ...msg.afterAgent } : undefined);
+            if (!note || note.peerId !== other.id || msg.deleted) continue;
+            // a send that arrived is listed once, from the side it arrived on
+            if (note.dir === "out" && note.status !== "failed") continue;
+            const fromSelf = note.dir !== "in";
+            entries.push({
+              id: msg.id,
+              at: msg.at,
+              dir: note.dir,
+              ...("status" in note && note.status ? { status: note.status } : {}),
+              from: fromSelf ? self.id : other.id,
+              fromName: fromSelf ? self.name : other.name,
+              to: fromSelf ? other.id : self.id,
+              toName: fromSelf ? other.name : self.name,
+              laneId: lane.id,
+              laneTitle: lane.title,
+              text: msg.text ?? "",
+            });
+          }
+        }
+      }
+      entries.sort((x, y) => (x.at as number) - (y.at as number));
+      return json(res, 200, { messages: entries.slice(-500) });
     }
 
     // What a `/` in this agent's composer can name (server/agent-commands.ts).
@@ -7319,12 +13755,31 @@ const server = createServer(async (req, res) => {
     if (m && method === "GET") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such agent" });
-      const instance = registry.get(bot.modelSelection.instanceId);
+      const taskId = url.searchParams.get("taskId") ?? bot.activeTaskId;
+      const lane = bot.tasks.find((t) => t.id === taskId);
+      if (!lane) return json(res, 404, { error: "no such task" });
+      const selection = laneEngine.get(lane.id) ?? selectEngine(bot);
+      const instance = registry.get(selection.instanceId);
+      const project = projects.forAgent(bot.id);
+      const cwd = lane.cwd ?? bot.cwd ?? (project ? workingFolder(standingOf(project)) : null) ?? workspace.workspaceDir(bot.id);
+      const cached = claudeCatalogs.get(lane.id);
+      const reported = cached?.instanceId === selection.instanceId && cached.cwd === cwd ? cached.catalog : undefined;
+      const codexSkills = instance?.driverKind === "codex" ? await instance.skills?.(cwd) : undefined;
+      // Discovery is asynchronous: a menu must not borrow rows from an
+      // engine or folder the person left while the probe was running.
+      const current = store.bot(bot.id);
+      const currentLane = current?.tasks.find((t) => t.id === taskId);
+      const currentProject = current ? projects.forAgent(current.id) : null;
+      const currentCwd = currentLane?.cwd ?? current?.cwd ?? (currentProject ? workingFolder(standingOf(currentProject)) : null) ?? workspace.workspaceDir(bot.id);
+      if (!current || !currentLane || registry.get(selection.instanceId) !== instance || (laneEngine.get(lane.id) ?? selectEngine(current)).instanceId !== selection.instanceId || currentCwd !== cwd) return json(res, 409, { error: "This menu's engine or folder changed. Open it again." });
       return json(res, 200, {
         commands: agentCommands({
           library: getSkills(bot.skillIds ?? []),
           onClaudeCode: instance?.driverKind === "claudeAgent",
-          cwd: bot.cwd ?? null,
+          onCodex: instance?.driverKind === "codex",
+          codexSkills: codexSkills ?? undefined,
+          cwd,
+          reported,
         }),
       });
     }
@@ -7334,37 +13789,58 @@ const server = createServer(async (req, res) => {
       if (!bot) return json(res, 404, { error: "no such agent" });
       const body = await readBody(req);
       const requestId = String(body.requestId);
+      // An ask this run of Bloks never raised is not one anything is
+      // waiting on: a card from before a restart, say. A new engine
+      // process may number its own requests the same way, so an answer
+      // meant for the old card must not reach it as permission.
+      const live = askThreadByRequest.has(requestId);
       const askThread = askThreadByRequest.get(requestId) ?? bot.threadId;
-      const instance = laneInstance(bot, askThread);
+      const instance = askInstance(bot, askThread, requestId);
       if (!instance) return json(res, 409, { error: "provider unavailable" });
       try {
+        if (!live) throw new Error("not a live ask");
+        // so a copy of the card on a phone can say what was chosen here
+        if (body.behavior === "answer" && typeof body.message === "string") telegramCards.expect(requestId, body.message);
         await instance.adapter.respondToRequest(askThread, requestId, {
           behavior: body.behavior,
           message: body.message,
         });
+        // An answer is the person in the conversation as much as a
+        // message is; in a room, the card was the room's.
+        const askedIn = activeRoom.get(askThread);
+        const room = askedIn && askedIn !== askThread ? bloks.get(askedIn) : null;
+        withYou(room ? { room } : { bot });
         return json(res, 200, { ok: true, outcome: "delivered" });
       } catch {
-        // The ask is gone: the turn ended, or the engine died. Failing
-        // closed beats a 500 that leaves a dead card open forever, the
-        // card settles as unanswerable, and the action was never run.
-        const messageId = askMessageByRequest.get(requestId);
-        if (messageId) {
-          const existing = store.messagesFor(askThread).find((msg) => msg.id === messageId);
-          if (existing?.card && !existing.card.answered) {
-            const patched = store.patchMessage(askThread, messageId, {
-              card: { ...existing.card, answered: "unavailable", dismissed: true },
-            });
-            if (patched) broadcast({ kind: "message.patch", threadId: askThread, message: patched });
-          }
-          askMessageByRequest.delete(requestId);
-          askThreadByRequest.delete(requestId);
+        // Nothing is waiting on this ask: it closed before the answer got
+        // here, or its engine went without saying so. Failing closed
+        // beats a 500 that leaves a dead card open forever, and the
+        // action was never run. A card still open settles and says so.
+        // One that had settled already is sent again as it stands, so a
+        // window that showed this press as the answer shows what the
+        // card really says.
+        const settled = settledAsks.get(requestId);
+        const messageId = askMessageByRequest.get(requestId) ?? settled?.messageId;
+        // where the card is, which in a room is not the lane that asked
+        const cardThread = askCardThread.get(requestId) ?? settled?.thread ?? askThread;
+        settleTelegramCard(requestId, () => "Closed without an answer.");
+        const existing = messageId ? store.messagesFor(cardThread).find((msg) => msg.id === messageId) : undefined;
+        if (existing?.card) {
+          const shown = existing.card.answered
+            ? existing
+            : store.patchMessage(cardThread, existing.id, {
+                card: { ...existing.card, answered: CLOSED_UNANSWERED, closed: closedWhy(undefined, existing.card, bot.name) },
+              });
+          if (shown) broadcast({ kind: "message.patch", threadId: cardThread, message: shown });
         }
-        const notice = store.appendMessage(askThread, {
+        forgetAsk(requestId);
+        const notice = store.appendMessage(cardThread, {
           role: "bot",
+          ...(bloks.get(cardThread) ? { from: bot.id } : {}),
           kind: "activity",
           tool: { name: "that request had already closed, nothing was run", ok: false },
         });
-        broadcast({ kind: "message", threadId: askThread, message: notice });
+        broadcast({ kind: "message", threadId: cardThread, message: notice });
         return json(res, 200, { ok: false, outcome: "unavailable" });
       }
     }
@@ -7373,25 +13849,153 @@ const server = createServer(async (req, res) => {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such agent" });
       const body = await readBody(req).catch(() => ({}) as Record<string, unknown>);
+      if (asAgent) {
+        // Another agent stopping this one: only the one that hired it, or
+        // one that outranks it in a room they share. It stops the
+        // conversation that agent's messages go to, and its reason is the
+        // next thing said there (GitHub 141).
+        const caller = store.bot(asAgent.botId)!;
+        if (!mayStop(caller.id, bot.id)) {
+          return json(res, 403, { error: `${caller.name} can stop only an agent it hired, or one it outranks in a room they are both in` });
+        }
+        const lane = mainLaneOf(bot);
+        if (!lane.busy) return json(res, 200, { ok: true, stopped: false, note: `${bot.name} was not working; nothing to stop.` });
+        cutOff.stop(lane.id);
+        await interruptLane(bot, lane.id);
+        const notice = store.appendMessage(lane.id, { role: "bot", kind: "notice", text: `${caller.name} stopped this turn.` });
+        broadcast({ kind: "message", threadId: lane.id, message: notice });
+        const why = clamp(body.text, MAX_MESSAGE_CHARS);
+        // the reason starts a turn like any message, so it is one more in a
+        // chain of agents' messages, and past the cap only the stop lands
+        const said = why
+          ? await sendUserMessage(bot.id, why, {
+              taskId: lane.id,
+              from: { botId: caller.id, name: caller.name },
+              chain: chainFrom(caller, asAgent.taskId),
+            }).then(() => true, () => false)
+          : false;
+        return json(res, 200, { ok: true, stopped: true, ...(said ? { said: why } : {}) });
+      }
       // a named lane is interruptible even when another lane is on screen
       const laneId =
         typeof body.taskId === "string" && bot.tasks.some((t) => t.id === body.taskId)
           ? body.taskId
           : bot.threadId;
-      await laneInstance(bot, laneId)?.adapter.interruptTurn(laneId);
+      await stopForYou(bot, laneId);
       return json(res, 200, { ok: true });
     }
 
     // How the desktop shell recognises the server it just started. A
     // developer's own harness answers this route identically, so the pid
-    // is the part that distinguishes ours from theirs.
+    // is the part that distinguishes ours from theirs. A phone reads the
+    // version and features: it is updated by the App Store on a schedule
+    // of its own, and this is how it knows what this Mac can do for it
+    // (server/features.ts).
     if (method === "GET" && path === "/api/health") {
-      return json(res, 200, { app: "bloks", pid: process.pid, static: Boolean(STATIC_DIR) });
+      return json(res, 200, {
+        app: "bloks",
+        pid: process.pid,
+        static: Boolean(STATIC_DIR),
+        version: APP_VERSION,
+        features: FEATURES,
+      });
     }
 
     // ── provider instances (model picker) ──
     if (method === "GET" && path === "/api/instances") {
       return json(res, 200, { instances: await registry.describe() });
+    }
+    // What each engine's plan has left, as it last said, for the card on
+    // the composer's ring (server/plan-usage.ts). The person's to read,
+    // here or on a device they paired: a server on another machine has
+    // no window of its own, and a paired phone already answers approvals,
+    // which is far more than this (GitHub 259). Never an agent's, never
+    // said in a prompt, and somebody in a shared room is not the person:
+    // their requests were answered above and never reach this line.
+    if (method === "GET" && path === "/api/plan-usage") {
+      if (asAgent) return json(res, 403, { error: "not from here" });
+      const usage: Record<string, PlanUsage> = {};
+      for (const instance of registry.instances()) {
+        const latest = instance.planUsage?.();
+        if (latest) usage[instance.instanceId] = latest;
+      }
+      return json(res, 200, { usage });
+    }
+
+    // The security checkup (server/security.ts). This machine only, and
+    // never an agent: it names what can reach the person's keys, accounts
+    // and screen, which is a map for whoever holds a phone or a turn, and
+    // its fixes change file modes and forget secrets.
+    if (path === "/api/security" || path.startsWith("/api/security/")) {
+      if (!local || asAgent) return json(res, 403, { error: "not from here" });
+      if (method === "GET" && path === "/api/security") return json(res, 200, await securityReport());
+      if (method === "POST" && path === "/api/security/permissions") {
+        const { fixed, failed } = tightenPermissions(DATA_DIR);
+        return json(res, 200, { fixed, failed, ...(await securityReport()) });
+      }
+      // a secret's name is an environment variable's, so nothing to decode
+      m = path.match(/^\/api\/security\/secrets\/([A-Za-z_][A-Za-z0-9_]{0,127})$/);
+      if (m && method === "DELETE") {
+        const saved = forgetSecret(m[1]);
+        if (!saved) return json(res, 404, { error: "no secret by that name" });
+        // the next turn reads secrets fresh (see startTurn), so nothing reloads
+        Object.assign(cfg, saved);
+        return json(res, 200, await securityReport());
+      }
+      return json(res, 404, { error: "not found" });
+    }
+
+    // Setting an engine up from the app (server/engine-setup.ts). This
+    // machine only: it installs software and opens Terminal, which no
+    // phone, remote window or agent may ask for.
+    if (method === "GET" && path === "/api/engines/setup") {
+      if (!local || asAgent) return json(res, 403, { error: "not from here" });
+      return json(res, 200, { setup: ENGINE_SETUP, platform: process.platform });
+    }
+    // Engines with a newer release than the one installed: the reason a
+    // model everyone is talking about is missing from the list. Checked
+    // against npm at most every six hours (server/engine-updates.ts).
+    if (method === "GET" && path === "/api/engines/updates") {
+      if (asAgent) return json(res, 403, { error: "not from here" });
+      const described = await registry.describe();
+      const updates = await engineUpdates(
+        described.map((d) => ({
+          driverKind: d.driverKind,
+          version: d.snapshot.version ?? null,
+          available: d.snapshot.state === "available",
+        })),
+      );
+      return json(res, 200, { updates, canUpdate: local });
+    }
+    m = path.match(/^\/api\/engines\/([\w-]+)\/update$/);
+    if (m && method === "POST") {
+      if (!local || asAgent) return json(res, 403, { error: "not from here" });
+      const known = ENGINE_PACKAGES[m[1]];
+      if (!known) return json(res, 404, { error: "no such engine" });
+      const result = await runSetupScript(known.update);
+      record({ at: Date.now(), kind: "engine.installed", actor: "you", summary: `${m[1]}: ${result.ok ? "updated" : "update failed"}` });
+      // A new CLI brings new models, but the engines read their model
+      // lists when they are built. Rebuilding cuts off the turns running
+      // on that engine, so it is rebuilt now when none are, and otherwise
+      // once the last of them ends (rebuildUpdatedWhenQuiet). Other
+      // engines, and their turns, are left alone.
+      let reloaded = false;
+      if (result.ok) {
+        enginesUpdated.add(m[1]);
+        await reloadProviders();
+        reloaded = !enginesUpdated.has(m[1]);
+        if (reloaded) broadcast({ kind: "providers", ...(await providerCatalog()) });
+      }
+      return json(res, 200, { ...result, reloaded });
+    }
+    m = path.match(/^\/api\/engines\/([\w-]+)\/(install|signin)$/);
+    if (m && method === "POST") {
+      if (!local || asAgent) return json(res, 403, { error: "not from here" });
+      if (!ENGINE_SETUP[m[1]]) return json(res, 404, { error: "no such engine" });
+      if (m[2] === "signin") return json(res, 200, openSignIn(m[1]));
+      const result = await installEngine(m[1]);
+      record({ at: Date.now(), kind: "engine.installed", actor: "you", summary: `${m[1]}: ${result.ok ? "installed" : "failed"}` });
+      return json(res, 200, result);
     }
 
     // ── engines: what you can connect, and how ──
@@ -7421,6 +14025,7 @@ const server = createServer(async (req, res) => {
           speechElevenlabs: Boolean(speechStatus.elevenlabs),
           speechOpenai: Boolean(speechStatus.openai),
           compactionMicro: Boolean(cfg.compaction?.micro),
+          compactionIdle: Boolean(cfg.compaction?.idle),
           skillsPropose: Boolean(cfg.skills?.propose),
         },
         engines: rows.map(
@@ -7465,9 +14070,8 @@ const server = createServer(async (req, res) => {
     if (m && method === "DELETE") {
       const spec = specFor(m[1]);
       if (!spec) return json(res, 404, { error: "no such provider" });
-      disconnectProvider(spec.kind);
-      Object.assign(cfg, loadConfig());
-      // loadConfig re-reads the file; drop the key it no longer holds
+      Object.assign(cfg, disconnectProvider(spec.kind));
+      // Drop the key the saved config no longer holds
       delete cfg.providers?.[spec.kind];
       if (spec.kind === "grok") delete cfg.xai;
       await reloadProviders();
@@ -7628,6 +14232,7 @@ const server = createServer(async (req, res) => {
         store.patchBot(hire.id, {
           ...settings,
           modelSelection: { instanceId: lead.modelSelection.instanceId, model: cheap },
+          activeWithYouAt: Date.now(),
         });
         broadcast({
           kind: "bot",
@@ -7635,7 +14240,8 @@ const server = createServer(async (req, res) => {
         });
       }
 
-      const blok = bloks.create(pending.plan.room, [lead.id, ...hires.map((h) => h.id)]);
+      // the person said yes to this, which is time spent with them
+      const blok = bloks.create(pending.plan.room, [lead.id, ...hires.map((h) => h.id)], Date.now());
       broadcast({ kind: "blok", blok });
 
       // settle the proposal so it reads as decided everywhere
@@ -7659,18 +14265,53 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    // ── the sidebar's arrangement (server/sidebar.ts) ──
+    // Read by the app for the order of the headings, and by agents to see
+    // where things stand before they file or pin anything. Pins and
+    // activity travel on the agents and rooms themselves.
+    if (method === "GET" && path === "/api/sidebar") {
+      return json(res, 200, {
+        sectionOrder: sidebar.sectionOrder,
+        // whether anyone has placed a heading yet: a device that kept an
+        // order of its own before this hands it over only while not
+        sectionOrderSaved: sidebar.saved,
+        sections: sidebarView(sidebarRows(), sidebar.sectionOrder),
+      });
+    }
+    // The person's own: the order of the headings is how they read the
+    // list, and an agent tidying its part of it has pins for that.
+    if (method === "PUT" && path === "/api/sidebar/sections") {
+      const body = await readBody(req);
+      const order = cleanSectionOrder(body.order);
+      if (!order) return json(res, 400, { error: "order is a list of section names" });
+      sidebar.setSectionOrder(order);
+      broadcast({ kind: "sidebar", sectionOrder: order });
+      return json(res, 200, { sectionOrder: order });
+    }
+
     // ── rooms (bloks with more than one agent) ──
     if (method === "GET" && path === "/api/bloks") {
+      // The same transcript tail as the agent list; discovery needs none.
+      const tail = Number(url.searchParams.get("messages") || NaN);
+      const zero = tail >= 0 && tail < 1;
+      const trim = (list: Message[]) =>
+        Number.isFinite(tail) && tail >= 0 ? list.slice(-tail) : list;
       // The person sees every room and everything said in it. An agent
       // sees the transcripts of the rooms it is in, and no more than the
       // name and roster of the rest: enough to ask to be added to one,
       // which is the only reason it needs to know they exist.
       return json(res, 200, {
-        bloks: bloks.bloks.map((b) =>
-          !asAgent || b.memberIds.includes(asAgent.botId)
-            ? { ...b, messages: store.messagesFor(b.id) }
-            : { id: b.id, name: b.name, memberIds: b.memberIds, archived: b.archived, messages: [] },
-        ),
+        bloks: (() => {
+          // Fit the whole history so olderMessages counts everything omitted.
+          const fitted = viaRelay
+            ? fitTranscripts(bloks.bloks.map((b) => store.messagesFor(b.id)), Number.isFinite(tail) && tail >= 0 ? Math.floor(tail) : RELAY_TAIL)
+            : null;
+          return bloks.bloks.map((b, i) =>
+            !asAgent || b.memberIds.includes(asAgent.botId)
+              ? { ...b, ...(fitted ? fitted[i] : { messages: zero ? [] : trim(store.messagesFor(b.id)) }) }
+              : { id: b.id, name: b.name, memberIds: b.memberIds, archived: b.archived, messages: [] },
+          );
+        })(),
       });
     }
     if (method === "POST" && path === "/api/bloks") {
@@ -7689,7 +14330,7 @@ const server = createServer(async (req, res) => {
       // Whoever opened it is in it. An agent that left itself off the
       // roster would have made a room it cannot speak in.
       if (asAgent && !memberIds.includes(asAgent.botId)) memberIds.unshift(asAgent.botId);
-      const blok = bloks.create(clamp(body.name, MAX_NAME_CHARS) ?? "", memberIds);
+      const blok = bloks.create(clamp(body.name, MAX_NAME_CHARS) ?? "", memberIds, asAgent ? 0 : Date.now());
       // open with the roster so the transcript explains itself later
       const names = memberIds.map((id) => store.bot(id)!.name).join(", ");
       store.appendMessage(blok.id, {
@@ -7703,15 +14344,13 @@ const server = createServer(async (req, res) => {
     m = path.match(/^\/api\/bloks\/([\w-]+)$/);
     if (m && method === "PATCH") {
       const body = await readBody(req);
-      const patch: { name?: string; memberIds?: string[]; leadOnly?: boolean; cwd?: string; archived?: boolean; section?: string | null } = {};
+      const patch: { name?: string; memberIds?: string[]; leadOnly?: boolean; cwd?: string; archived?: boolean } = {};
       if (typeof body.name === "string") patch.name = body.name;
       if (typeof body.leadOnly === "boolean") patch.leadOnly = body.leadOnly;
       if (typeof body.archived === "boolean") patch.archived = body.archived;
-      if (body.section !== undefined) {
-        const named = normalizeSection(body.section);
-        if (!named.ok) return json(res, 400, { error: named.error });
-        patch.section = named.section;
-      }
+      // its section, its pin and its place, by the same reading as an agent's
+      const placing = readArrangement(body);
+      if (!placing.ok) return json(res, 400, { error: placing.error });
       if ("cwd" in body) {
         const existing = bloks.get(m[1]);
         if (existing?.pinnedCwd !== undefined) {
@@ -7730,6 +14369,7 @@ const server = createServer(async (req, res) => {
       }
       const blok = bloks.patch(m[1], patch);
       if (!blok) return json(res, 404, { error: "no such room" });
+      if (Object.keys(placing.ask).length) arrange("room", blok.id, placing.ask, blok.id);
       broadcast({ kind: "blok", blok });
       return json(res, 200, { blok });
     }
@@ -7743,6 +14383,13 @@ const server = createServer(async (req, res) => {
       return json(res, ok ? 200 : 404, ok ? { ok: true } : { error: "no such room" });
     }
     m = path.match(/^\/api\/bloks\/([\w-]+)\/messages$/);
+    if (m && method === "GET") {
+      const room = bloks.bloks.find((b) => b.id === m![1]);
+      if (!room || (asAgent && !room.memberIds.includes(asAgent.botId))) {
+        return json(res, 404, { error: "no such room" });
+      }
+      return json(res, 200, earlierPage(store.messagesFor(room.id), url));
+    }
     if (m && method === "POST") {
       const blok = bloks.get(m[1]);
       if (!blok) return json(res, 404, { error: "no such room" });
@@ -7755,12 +14402,34 @@ const server = createServer(async (req, res) => {
       if (!text) {
         return json(res, 400, { error: "text required" });
       }
-      // a human message starts a fresh chain, so hop counters reset
-      for (const id of blok.memberIds) agentHops.delete(id);
+      // An agent's `bloks say` into a room comes through here too. It is
+      // that agent speaking, not the person, so it goes in as its line
+      // and is passed on the way its replies in the room are: only to
+      // someone it named, never back to itself, and counted against the
+      // chain it is part of rather than starting a fresh one.
+      if (asAgent) {
+        const replyTo = replyRef(roomBody.replyTo);
+        const message = store.appendMessage(blok.id, {
+          role: "bot",
+          from: asAgent.botId,
+          kind: "text",
+          text,
+          ...(replyTo ? { replyTo } : {}),
+        });
+        broadcast({ kind: "message", threadId: blok.id, message });
+        // whoever started the turn it said this from is still the one who
+        // asked, so a member's chain does not become the owner's
+        void relayMentions(blok.id, asAgent.botId, text, laneRequester.get(asAgent.taskId), nextAgentChain(asAgent.taskId), (turnHops.get(asAgent.taskId) ?? 0) + 1).catch(() => {});
+        triggersFired({ kind: "message", targetId: blok.id, text, fromUser: false });
+        return json(res, 201, { message });
+      }
+      // a human message starts a fresh chain: whoever it wakes is at no hops
       const { message } = enqueueRoomPost(blok, text, {
         hops: 0,
         replyTo: replyRef(roomBody.replyTo),
+        byYou: true,
       });
+      withYou({ room: blok }, message.at);
       triggersFired({ kind: "message", targetId: blok.id, text, fromUser: true });
       return json(res, message.queued ? 202 : 201, { message });
     }
@@ -7810,8 +14479,7 @@ const server = createServer(async (req, res) => {
       if (typeof body.hostName === "string") {
         const name = people.cleanName(body.hostName);
         if (name) {
-          saveConfig({ profile: { ...(cfg.profile ?? {}), name } });
-          Object.assign(cfg, loadConfig());
+          Object.assign(cfg, saveConfig({ profile: { ...(cfg.profile ?? {}), name } }));
         }
       }
       if (!blok.sharing) {
@@ -7945,9 +14613,11 @@ const server = createServer(async (req, res) => {
       }
       const blok = bloks.get(inv.roomId);
       if (!blok?.sharing) return json(res, 409, { error: "that room is no longer shared" });
-      const approved = people.approveInvite(inv.id);
+      let device!: ReturnType<typeof addMemberDevice>;
+      const approved = people.approveInvite(inv.id, (person) => {
+        device = addMemberDevice(person.id, person.name, inv.claim!.tokenHash);
+      });
       if (!approved) return json(res, 409, { error: "nobody is waiting on that invite" });
-      const device = addMemberDevice(approved.person.id, approved.person.name, inv.claim!.tokenHash);
       people.noteInviteDevice(inv.id, device.id);
       const notice = store.appendMessage(blok.id, {
         role: "bot",
@@ -7980,7 +14650,7 @@ const server = createServer(async (req, res) => {
     if (m && method === "DELETE") {
       const who = people.person(m[2]);
       if (!who) return json(res, 404, { error: "no such person" });
-      const { removed, roomless } = people.removeFromRoom(who.id, m[1]);
+      const { removed, roomless } = removeMemberFromRoom(who.id, m[1]);
       if (!removed) return json(res, 404, { error: "no such person in that room" });
       if (roomless) await revokeMember(who.id, who.relayTokenHash);
       const notice = store.appendMessage(m[1], { role: "bot", kind: "notice", event: true, text: `${who.name} was removed from the room.` });
@@ -8118,7 +14788,7 @@ const server = createServer(async (req, res) => {
       );
       const settings = await newAgentSettings();
       for (const hire of hired) {
-        store.patchBot(hire.id, settings);
+        store.patchBot(hire.id, { ...settings, activeWithYouAt: Date.now() });
         broadcast({
           kind: "bot",
           bot: { ...clientBot(store.bot(hire.id))!, messages: store.messagesFor(hire.threadId) },
@@ -8127,6 +14797,7 @@ const server = createServer(async (req, res) => {
       const blok = bloks.create(
         clamp(body.name, MAX_NAME_CHARS) ?? "Imported team",
         [...existing, ...hired.map((h) => h.id)],
+        Date.now(),
       );
       // one desk for the whole room, when they were pointed at a folder
       if (resolvedDesk?.ok && resolvedDesk.path) bloks.patch(blok.id, { cwd: resolvedDesk.path });
@@ -8215,8 +14886,11 @@ const server = createServer(async (req, res) => {
         });
         broadcast({ kind: "message", threadId: laneId, message: shown });
         meetingLanes.set(laneId, meeting.id);
-        void startTurn(bot.id, notesPrompt(meeting, transcript, team, person), { taskId: laneId, presetMessage: true }).catch((e) => {
+        // the person pressed stop and asked for the notes
+        withYou({ bot }, shown.at);
+        void startTurn(bot.id, notesPrompt(meeting, transcript, team, person), { taskId: laneId, presetMessage: true, byYou: true }).catch((e) => {
           meetingLanes.delete(laneId);
+          releaseMeeting(meeting.id, laneId);
           const notice = store.appendMessage(laneId, { role: "bot", kind: "notice", text: `The notes could not be written: ${(e as Error).message}` });
           broadcast({ kind: "message", threadId: laneId, message: notice });
         });
@@ -8232,7 +14906,7 @@ const server = createServer(async (req, res) => {
       if (!meeting || !item) return json(res, 404, { error: "no such action item" });
       if (!item.botId || !store.bot(item.botId)) return json(res, 400, { error: `${item.owner} is not one of your agents` });
       if (item.sentAt) return json(res, 409, { error: "already handed over" });
-      await sendUserMessage(item.botId, `From the meeting${meeting.title ? ` "${meeting.title}"` : ""}: ${item.text}`);
+      await sendUserMessage(item.botId, `From the meeting${meeting.title ? ` "${meeting.title}"` : ""}: ${item.text}`, { yours: true, personal: false });
       item.sentAt = Date.now();
       saveMeetings();
       broadcast({ kind: "meetings" });
@@ -8290,15 +14964,37 @@ const server = createServer(async (req, res) => {
       if (asAgent) body.botId = asAgent.botId;
       const checked = cleanWatcher(body, (id) => Boolean(store.bot(id) && !store.bot(id)!.archivedAt));
       if (!checked.ok) return json(res, 400, { error: checked.error });
+      const unnamed = threadRefusal(checked.value.botId, checked.value.thread);
+      if (unnamed) return json(res, 400, { error: unnamed });
       if (watchers.length >= 50) return json(res, 409, { error: "fifty watchers is the limit" });
-      const w: Watcher = { id: newId(), ...checked.value, createdAt: Date.now(), fires: [] };
+      const w: Watcher = {
+        id: newId(),
+        ...checked.value,
+        createdAt: Date.now(),
+        fires: [],
+        // filed from an agent's turn, its turns go on from that one's place
+        ...(asAgent ? { chain: nextAgentChain(asAgent.taskId) } : {}),
+      };
+      // A check runs a command with nobody watching. The person filing one
+      // has approved it by writing it; an agent's waits for the person,
+      // unless that agent already runs commands without asking.
+      if (w.kind === "check") {
+        const approvedBy = !asAgent ? "person" : runsCommandsUnasked(store.bot(w.botId)) ? "mode" : undefined;
+        if (approvedBy) w.approvedBy = approvedBy;
+      }
       watchers.push(w);
       saveWatchers();
       armWatcher(w);
       // the first look is the baseline, taken now so the next change counts
       void checkWatcher(w.id);
       broadcast({ kind: "watchers" });
-      return json(res, 201, { watcher: watcherView(w) });
+      const waiting = w.kind === "check" && !w.approvedBy;
+      return json(res, 201, {
+        watcher: watcherView(w),
+        ...(waiting
+          ? { note: `Filed, but its command does not run until ${hostName()} approves it in Watchers. Tell them it is waiting and what it runs.` }
+          : {}),
+      });
     }
     m = path.match(/^\/api\/watchers\/([\w-]+)$/);
     if (m && (method === "PATCH" || method === "DELETE")) {
@@ -8308,21 +15004,63 @@ const server = createServer(async (req, res) => {
         disarmWatcher(w.id);
         watchers = watchers.filter((x) => x.id !== w.id);
         saveWatchers();
+        // Its own lane goes with it, or old ones fill the agent's limit
+        // (GitHub 166). Through the close an agent asks for, so a lane
+        // still working, or with a message waiting, closes once that is
+        // done: the usual way a watcher is dropped is by its agent, from
+        // a turn in that very lane. Its laneId is only ever a lane it made
+        // under its own name, "Watching: <name>": General, or any other
+        // conversation named with --thread, is never one, and one the
+        // person talked in is theirs, so those stay.
+        if (w.laneId && !watchers.some((x) => x.laneId === w.laneId) && !personSpokeIn(w.laneId)) {
+          closeAfterTurn.add(w.laneId);
+          closeIfAsked(w.laneId);
+        }
         broadcast({ kind: "watchers" });
         return json(res, 200, { ok: true });
       }
       const body = await readBody(req);
       const checked = cleanWatcher({ ...w, ...body, botId: asAgent ? w.botId : (body.botId ?? w.botId) }, (id) => Boolean(store.bot(id)));
       if (!checked.ok) return json(res, 400, { error: checked.error });
+      const renamed = checked.value.thread !== w.thread || checked.value.botId !== w.botId;
+      const unnamed = renamed ? threadRefusal(checked.value.botId, checked.value.thread) : null;
+      if (unnamed) return json(res, 400, { error: unnamed });
       const moved = checked.value.target !== w.target || checked.value.kind !== w.kind;
+      const owner = store.bot(checked.value.botId);
+      const couldRun = checkAllowed(w, owner?.approvals);
       Object.assign(w, checked.value);
+      // an empty filter, or a watcher that is no longer a page, has none
+      if (!checked.value.mentions) delete w.mentions;
       if (moved) {
         delete w.seen;
         delete w.seenItems;
       }
+      if (w.kind !== "check") delete w.approvedBy;
+      else if (asAgent) {
+        // a command an agent rewrites is a new command: approved again,
+        // unless the agent runs commands unasked anyway
+        if (moved) {
+          if (runsCommandsUnasked(owner)) w.approvedBy = "mode";
+          else delete w.approvedBy;
+        }
+      } else if (typeof body.approved === "boolean") {
+        if (body.approved) w.approvedBy = "person";
+        else delete w.approvedBy;
+      } else if (moved) {
+        w.approvedBy = "person";
+      }
+      const canRun = checkAllowed(w, owner?.approvals);
+      if (canRun && !couldRun) w.lastError = undefined;
+      // the person changing it has had their say; an agent changing it
+      // carries its own turn's place (MAX_AGENT_CHAIN)
+      const wasHeld = chainPastLimit(w.chain ?? 0);
+      if (asAgent) w.chain = nextAgentChain(asAgent.taskId);
+      else delete w.chain;
+      if (wasHeld && !(chainPastLimit(w.chain ?? 0))) w.lastError = undefined;
       saveWatchers();
       armWatcher(w);
-      if (moved && w.enabled) void checkWatcher(w.id);
+      // approving a check takes its baseline straight away
+      if ((moved || (canRun && !couldRun)) && w.enabled) void checkWatcher(w.id);
       broadcast({ kind: "watchers" });
       return json(res, 200, { watcher: watcherView(w) });
     }
@@ -8330,6 +15068,11 @@ const server = createServer(async (req, res) => {
     if (m && method === "POST") {
       const w = watchers.find((x) => x.id === m![1]);
       if (!w || (asAgent && w.botId !== asAgent.botId)) return json(res, 404, { error: "no such watcher" });
+      // the person looking by hand starts it over (MAX_AGENT_CHAIN)
+      if (!asAgent && w.chain) {
+        delete w.chain;
+        saveWatchers();
+      }
       return json(res, 200, await checkWatcher(w.id, true));
     }
 
@@ -8464,10 +15207,29 @@ const server = createServer(async (req, res) => {
       const body = await readBody(req);
       return json(res, 200, { result: suggestNote(bot, body.text, asAgent?.taskId) });
     }
+    // `bloks secret`: the request_secret tool for an engine that does not
+    // have it. The same card in the same place, and the same answer the
+    // tool gives, so the agent ends its turn and is resumed on save.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/secrets$/);
+    if (m && method === "POST") {
+      if (!asAgent) return json(res, 403, { error: "this route is for an agent asking from inside its turn" });
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such agent" });
+      const body = await readBody(req);
+      const roomId = activeRoom.get(asAgent.taskId) ?? asAgent.taskId;
+      return json(res, 200, { result: plantSecretCard(bot, roomId, randomUUID(), { name: body.name, hint: body.hint }) });
+    }
 
     // An agent's own past, for the command line (server/recall.ts). The
     // agent guard only lets an agent ask about itself; the lane decides
     // how far back it may look.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/recall\/([\w-]+)$/);
+    if (m && method === "GET") {
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such agent" });
+      const found = recalledMessage(bot, m[2], asAgent?.taskId);
+      return found ? json(res, 200, { message: found }) : json(res, 404, { error: "no such message in your conversations" });
+    }
     m = path.match(/^\/api\/bots\/([\w-]+)\/recall$/);
     if (m && method === "GET") {
       const bot = store.bot(m[1]);
@@ -8479,9 +15241,40 @@ const server = createServer(async (req, res) => {
     }
 
     if (method === "GET" && path === "/api/search") {
-      const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+      const q = (url.searchParams.get("q") ?? "").trim().toLowerCase().slice(0, 300);
       const limit = Math.max(1, Math.min(50, Number(url.searchParams.get("limit")) || 20));
       if (!q) return json(res, 200, { hits: [] });
+      // The person's own search: every conversation of every agent still
+      // in the list, and every room, ranked the way an agent's recall is
+      // (server/recall-index.ts) and from the same indexes, so the message
+      // that answers comes before the one that happens to be newest and
+      // "vendors" finds "vendor". Nothing taken back, rewound or still
+      // waiting to be said is in them.
+      if (termsOf(q).length) {
+        const places = [
+          ...store.bots
+            .filter((bot) => !bot.hidden)
+            .flatMap((bot) => bot.tasks.map((task) => ({ threadId: task.id, about: { botId: bot.id, name: bot.name, task: task.title } }))),
+          ...bloks.bloks.map((blok) => ({ threadId: blok.id, about: { blokId: blok.id, name: blok.name } })),
+        ];
+        const ranked = rank(q, places.map((place) => laneIndex(place.threadId)), { limit, need: mostOf });
+        const hits = ranked.map((hit) => {
+          const place = places[hit.source];
+          const message = store.messagesFor(place.threadId).find((m) => m.id === hit.doc.id);
+          return {
+            threadId: place.threadId,
+            messageId: hit.doc.id,
+            at: hit.doc.at,
+            role: message?.role ?? "user",
+            snippet: excerpt(hit.doc.text, hit.focus, 170),
+            ...place.about,
+          };
+        });
+        recallDone();
+        return json(res, 200, { hits });
+      }
+      // Only small words ("to be or not"): nothing for the index to go
+      // on, so the words as typed, anywhere, newest first, as before.
       const hits: object[] = [];
       const snip = (text: string) => {
         const flat = text.replace(/\s+/g, " ").trim();
@@ -8568,7 +15361,11 @@ const server = createServer(async (req, res) => {
       if (blokId && !bloks.get(blokId)) return json(res, 404, { error: "no such room" });
       const workflowId = typeof body.workflowId === "string" && workflows.get(body.workflowId) ? body.workflowId : undefined;
       if (!botId && !blokId && !workflowId) return json(res, 400, { error: "a webhook needs a target" });
-      const hook = webhooks.create(String(body.name ?? ""), { botId, blokId, workflowId });
+      // the conversation an agent's events go to; none is its first
+      const thread = cleanThread(body.thread);
+      const unnamed = botId ? threadRefusal(botId, thread) : null;
+      if (unnamed) return json(res, 400, { error: unnamed });
+      const hook = webhooks.create(String(body.name ?? ""), { botId, blokId, workflowId }, thread);
       if (!hook) return json(res, 409, { error: "webhook limit reached" });
       return json(res, 201, { webhook: hook });
     }
@@ -8576,6 +15373,13 @@ const server = createServer(async (req, res) => {
     if (m && method === "PATCH") {
       const body = await readBody(req);
       let hook = null;
+      if (typeof body.thread === "string" || body.thread === null) {
+        const found = webhooks.hooks.find((h) => h.id === m![1]);
+        const thread = cleanThread(body.thread);
+        const unnamed = found?.botId && thread !== found.thread ? threadRefusal(found.botId, thread) : null;
+        if (unnamed) return json(res, 400, { error: unnamed });
+        hook = webhooks.setThread(m[1], thread);
+      }
       if (typeof body.enabled === "boolean") hook = webhooks.setEnabled(m[1], body.enabled);
       if (typeof body.name === "string") hook = webhooks.rename(m[1], body.name);
       return json(res, hook ? 200 : 404, hook ? { webhook: hook } : { error: "no such webhook" });
@@ -8777,8 +15581,28 @@ const server = createServer(async (req, res) => {
         name: bot?.name ?? "",
         title: bot?.title ?? "",
         taskId: asAgent.taskId,
-        fingerprint: identityFor(asAgent.botId).fingerprint,
+        fingerprint: fingerprintFor(asAgent.botId),
         can: capabilities(),
+      });
+    }
+    // The goal of the conversation this turn runs in, for `bloks goal`.
+    // Read only: the credential names its lane, so there is nothing to
+    // ask for but this, and setting one is the person's (see the goal
+    // routes above). The check is said as what counts as done, the way
+    // every goal note says it.
+    if (method === "GET" && path === "/api/agent/goal") {
+      if (!asAgent) return json(res, 401, { error: "no agent credential on this request" });
+      const goal = store.taskByThread(asAgent.taskId)?.task.goal;
+      if (!goal) return json(res, 200, { goal: null, note: "This conversation has no goal. Only the person sets one." });
+      return json(res, 200, {
+        goal: {
+          text: goal.text,
+          status: goal.status,
+          turn: goal.turns,
+          budget: goal.budget,
+          ...(goal.check ? { doneWhen: `\`${goal.check}\` exits 0 in this folder` } : {}),
+          ...(goal.lastReason ? { lastReason: goal.lastReason } : {}),
+        },
       });
     }
 
@@ -8794,6 +15618,11 @@ const server = createServer(async (req, res) => {
     if (method === "POST" && path === "/api/projects") {
       const body = await readBody(req).catch(() => ({}) as Record<string, unknown>);
       const project = projects.create(body, Date.now());
+      if (!project) {
+        return json(res, 409, {
+          error: `There are already ${MAX_PROJECTS} projects, the most Bloks keeps, and all of them are in use. Archive one you have finished with to make room.`,
+        });
+      }
       broadcast({ kind: "projects" });
       return json(res, 201, { project: standingOf(project) });
     }
@@ -8834,7 +15663,9 @@ const server = createServer(async (req, res) => {
       const title = clamp(body.title, MAX_TITLE_CHARS) ?? "";
       const brief = clamp(body.brief, MAX_DESCRIPTION_CHARS) ?? "";
       if (!title && !brief) return json(res, 400, { error: "a job needs something to do" });
-      const job = jobs.post({ title: title || brief.slice(0, 80), brief: brief || title, now: Date.now() });
+      // posted from an agent's turn, its taker's turn is one more in that chain
+      const chain = asAgent ? nextAgentChain(asAgent.taskId) : undefined;
+      const job = jobs.post({ title: title || brief.slice(0, 80), brief: brief || title, now: Date.now(), chain });
       record({
         at: Date.now(),
         kind: "job.posted",
@@ -8868,8 +15699,11 @@ const server = createServer(async (req, res) => {
       if (job.state === "claimed") return json(res, 409, { error: "somebody is on it" });
       // asking again after everyone has passed starts the round over
       const body = await readBody(req).catch(() => ({}) as Record<string, unknown>);
-      if (body.again) jobs.patch(job.id, { offers: [], state: "open", result: undefined });
-      else jobs.patch(job.id, { state: "open" });
+      // the person offering it has had their say; an agent offering it
+      // takes it one further along its own chain
+      const chain = asAgent ? nextAgentChain(asAgent.taskId) : undefined;
+      if (body.again) jobs.patch(job.id, { offers: [], state: "open", result: undefined, chain });
+      else jobs.patch(job.id, { state: "open", chain });
       const offered = await offerJob(job.id);
       return json(res, 200, { job: offered ?? jobs.get(job.id) });
     }
@@ -9170,8 +16004,7 @@ const server = createServer(async (req, res) => {
       // The search route and the job board already draw the same line.
       for (const bot of store.bots.filter((b) => !b.archivedAt)) {
         for (const task of bot.tasks) {
-          const limit = contextLimitFor(bot.modelSelection?.model);
-          const fill = pressure(task.lastInput ?? 0, limit);
+          const fill = laneContext(bot, task);
           lanes.push({
             threadId: task.id,
             botId: bot.id,
@@ -9179,7 +16012,7 @@ const server = createServer(async (req, res) => {
             laneTitle: task.title,
             busy: Boolean(task.busy),
             since: turnStarted.get(task.id),
-            context: { used: fill.used, limit: fill.limit, fraction: fill.fraction },
+            context: fill,
             blocked: blockedOn(store.messagesFor(task.id), live, { includingPutAside: true }),
           });
         }
@@ -9216,7 +16049,10 @@ const server = createServer(async (req, res) => {
 
       usage.flush();
       const today = usage.since(1);
-      const spend = new Map<string, { botId: string; turns: number; input: number; output: number; cost: number }>();
+      const spend = new Map<
+        string,
+        { botId: string; turns: number; input: number; output: number; cost: number; unmeasured: number }
+      >();
       let costKnown = false;
       for (const bucket of today) {
         const row = spend.get(bucket.botId) ?? {
@@ -9225,11 +16061,13 @@ const server = createServer(async (req, res) => {
           input: 0,
           output: 0,
           cost: 0,
+          unmeasured: 0,
         };
         row.turns += bucket.turns;
         row.input += bucket.input;
         row.output += bucket.output;
         row.cost += bucket.cost;
+        row.unmeasured += bucket.unmeasured ?? 0;
         spend.set(bucket.botId, row);
         if (bucket.costKnown) costKnown = true;
       }
@@ -9279,7 +16117,7 @@ const server = createServer(async (req, res) => {
           ? body.taskId
           : (asAgent?.taskId && bot.tasks.some((t) => t.id === asAgent.taskId)
               ? asAgent.taskId
-              : bot.activeTaskId);
+              : activeLaneOf(bot));
       const destination = activeRoom.get(laneId) ?? laneId;
       const message = store.appendMessage(destination, {
         role: "bot",
@@ -9303,6 +16141,32 @@ const server = createServer(async (req, res) => {
       }
       const working = store.bots.reduce((n, b) => n + b.tasks.filter((t) => t.busy).length, 0);
       return json(res, 200, { working });
+    }
+
+    // ── finishing up before a planned restart (server/drain.ts) ──
+    // From this computer only, like the power route above: the updater
+    // and `bloks-server drain` call it before they restart Bloks. POST
+    // starts it (or moves its deadline), GET says where it stands, DELETE
+    // calls it off. Nothing here answers, cancels or changes an approval.
+    if (path === "/api/maintenance/drain" && (method === "GET" || method === "POST" || method === "DELETE")) {
+      if (!local || asAgent) return json(res, 403, { error: "not from here" });
+      if (method === "POST") {
+        const body = await readBody(req).catch(() => ({}) as Record<string, unknown>);
+        drain.start(drainWindow(body.seconds));
+        armDrainLapse();
+      }
+      if (method === "DELETE") endDrain();
+      return json(res, 200, drainStatus());
+    }
+
+    // ── backups of the whole workspace (server/backup.ts) ──
+    // This computer only, and never an agent's credential: a backup is
+    // the whole workspace, sealed ones with every key in it, and a
+    // restore replaces the workspace. A paired phone or a page from
+    // another origin gets nothing here either.
+    if (path === "/api/backups" || path.startsWith("/api/backups/")) {
+      if (!local || asAgent) return json(res, 403, { error: "not from here" });
+      return serveBackups(req, res, method, path);
     }
 
     // ── Slack and Discord, for shared rooms ──
@@ -9402,52 +16266,85 @@ const server = createServer(async (req, res) => {
     }
 
     if (method === "GET" && path === "/api/telegram") {
-      const state = cfg.telegram ?? {};
-      // The token is a credential and never comes back out; what the
-      // screen needs is whether one is set and who is paired.
+      // A pointer for old Settings clients, not a second workspace bot.
+      // A token is a credential and never comes back out; what a screen
+      // needs is whether one is set, whose bot it is and who is paired.
+      const botId = cfg.telegram?.migratedBotId ?? null;
       return json(res, 200, {
-        configured: Boolean(state.token),
-        enabled: state.enabled === true,
-        paired: (state.chatIds ?? []).length,
-        pairing: state.pairing ?? null,
-        botId: state.botId ?? null,
+        ...telegramStatus(botId ? telegramBinding(botId) : undefined), botId,
+        migrationError: cfg.telegram?.migrationError ?? null,
+        pendingMigration: Boolean(cfg.telegram?.pending),
+        bots: Object.keys(cfg.telegram?.bots ?? {}).filter((id) => store.bot(id)).map((id) => ({ botId: id, ...telegramStatus(telegramBinding(id)) })),
+        voiceVendor: speech.transcriptionVendor(cfg),
       });
     }
-    if (method === "POST" && path === "/api/telegram") {
-      if (asAgent) return json(res, 403, { error: "an agent cannot change this" });
-      const body = await readBody(req).catch(() => ({}) as Record<string, unknown>);
-      const next = { ...(cfg.telegram ?? {}) };
-      if (body.token !== undefined) {
-        const token = telegram.cleanToken(body.token);
+    const telegramPath = path.match(/^\/api\/bots\/([\w-]+)\/telegram$/);
+    if (telegramPath || (method === "POST" && path === "/api/telegram")) {
+      if (asAgent) return json(res, 403, { error: "an agent cannot read or change Telegram settings" });
+      const body = method === "POST" ? await readBody(req) : {};
+      const botId = telegramPath?.[1] ?? (typeof body.botId === "string" ? body.botId : cfg.telegram?.migratedBotId);
+      if (!botId || !store.bot(botId)) return json(res, 400, { error: "Choose an agent for this Telegram bot." });
+      const status = () => ({ ...telegramStatus(telegramBinding(botId)), botId, voiceVendor: speech.transcriptionVendor(cfg) });
+      if (method === "GET") return json(res, 200, status());
+      if (method !== "POST") return json(res, 405, { error: "method not allowed" });
+      const pending = cfg.telegram?.pending;
+      const movePending = body.migrate === true;
+      if (movePending) {
+        if (!pending?.token) return json(res, 400, { error: "There is no previous Telegram bot to move." });
+        if (telegramBinding(botId)?.token) return json(res, 409, { error: "This agent already has a Telegram bot." });
+      }
+      if (body.forget === true) {
+        saveTelegramBinding(botId);
+        startTelegramBot(botId);
+        return json(res, 200, status());
+      }
+      let validated: { token: string; me: { id: number; username: string } } | undefined;
+      let adoptsPending = movePending;
+      if (body.token !== undefined || movePending) {
+        const token = telegram.cleanToken(movePending ? pending!.token : body.token);
         if (!token) return json(res, 400, { error: "a bot token is required" });
+        let me: { id: number; username: string };
+        try { me = await telegram.whoAmI(token); }
+        catch (error) { return json(res, 400, { error: (error as Error).message }); }
         try {
-          await telegram.whoAmI(token);
-        } catch (error) {
-          return json(res, 400, { error: (error as Error).message });
-        }
-        next.token = token;
-        // A new token is a new bot: whoever was paired with the old one
-        // has no business talking to this one.
-        next.chatIds = [];
-        next.offset = 0;
+          await identifyTelegramBindings(token, me);
+          if (pending?.token && !movePending) {
+            if (pending.token === token) adoptsPending = true;
+            else {
+              try { adoptsPending = (await telegram.whoAmI(pending.token)).id === me.id; }
+              catch (error) {
+                if (!refusedTelegramToken(error)) throw new Error("Could not verify the previous Telegram bot. Try again when Telegram is reachable.");
+              }
+            }
+          }
+        } catch (error) { return json(res, 502, { error: (error as Error).message }); }
+        if (!store.bot(botId)) return json(res, 400, { error: "Choose an agent for this Telegram bot." });
+        if (duplicateTelegramBot(botId, me.id)) return json(res, 409, { error: "This Telegram bot already belongs to another agent. Each agent needs its own bot." });
+        if (adoptsPending && cfg.telegram?.pending !== pending) return json(res, 409, { error: "The previous Telegram bot changed while checking it. Choose it again in App Settings." });
+        if (movePending && telegramBinding(botId)?.token) return json(res, 409, { error: "This agent already has a Telegram bot." });
+        validated = { token, me };
       }
-      if (typeof body.botId === "string") next.botId = body.botId;
-      if (body.enabled !== undefined) next.enabled = body.enabled === true;
-      if (body.pair === true) next.pairing = telegram.pairingWord();
-      if (body.unpair === true) {
-        next.chatIds = [];
-        next.pairing = null;
+      // Read after getMe: another owner request or a poll may have saved
+      // its state while validation was in flight.
+      const before = adoptsPending && pending ? { ...legacyBinding(pending), telegramId: validated!.me.id } : telegramBinding(botId);
+      let next = validated ? replaceTelegramToken(before, validated.token, validated.me) : { ...(before ?? { generation: randomUUID(), chatIds: [], offset: 0 }) };
+      if (movePending) next.enabled = before!.enabled === true;
+      if (body.enabled !== undefined) {
+        if (body.enabled === true && !next.token) return json(res, 400, { error: "Save a bot token first." });
+        if (next.enabled !== (body.enabled === true)) next.generation = randomUUID();
+        next.enabled = body.enabled === true;
       }
-      cfg.telegram = next;
-      saveConfig({ telegram: next } as Partial<AppConfig>);
-      if (next.enabled && next.token) void telegramLoop();
-      return json(res, 200, {
-        configured: Boolean(next.token),
-        enabled: next.enabled === true,
-        paired: (next.chatIds ?? []).length,
-        pairing: next.pairing ?? null,
-        botId: next.botId ?? null,
-      });
+      if (body.pair === true) {
+        if (!next.token) return json(res, 400, { error: "Save a bot token first." });
+        next = ownerPairing(next);
+      }
+      // Unpairing forgets the owner too, and is a new connection: a turn
+      // or a card from before it has nobody left to answer to.
+      if (body.unpair === true) next = { ...next, chatIds: [], ownerUserId: undefined, ownerChatId: undefined, pairing: null, generation: randomUUID() };
+      if (adoptsPending) saveTelegram({ ...cfg.telegram, version: 1, bots: { ...cfg.telegram?.bots, [botId]: next }, migratedBotId: botId, pending: undefined, migrationError: undefined });
+      else saveTelegramBinding(botId, next);
+      startTelegramBot(botId);
+      return json(res, 200, status());
     }
 
     // ── borrowing a sign-in for the agent's browser ──
@@ -9482,8 +16379,8 @@ const server = createServer(async (req, res) => {
         if (!cookies.length) {
           return json(res, 200, { imported: 0, note: `no cookies for those sites in ${source.browser}` });
         }
-        await launch(join(DATA_DIR, "browser", bot.id), BROWSER_PORT);
-        const targets = await listTargets(BROWSER_PORT);
+        // its own profile's browser, never a room's
+        const targets = await listTargets(await launch(join(DATA_DIR, "browser", bot.id)));
         if (!targets.length) return json(res, 503, { error: "the agent's browser is not open" });
         const page = new CdpSession(targets[targets.length - 1].webSocketDebuggerUrl);
         await page.open();
@@ -9537,6 +16434,8 @@ const server = createServer(async (req, res) => {
         // transcript keeps what it did, and asking again after the hand
         // back is the person's decision.
         for (const lane of bot.tasks.filter((t) => t.busy)) {
+          cutOff.stop(lane.id);
+          if (cancelRecovery(bot, lane.id, "Stopped. It will not be asked again.")) continue;
           await registry
             .get(bot.modelSelection.instanceId)
             ?.adapter.interruptTurn(lane.id)
@@ -9667,39 +16566,68 @@ const server = createServer(async (req, res) => {
 
     // ── routines (see server/routines.ts) ──
     // Scheduled work an agent does without being asked. The schedule is a
-    // time of day plus days of the week, not cron: it has to be readable
-    // at arm's length on a phone.
+    // time of day plus days of the week, or every so many minutes within
+    // hours, not cron: it has to be readable at arm's length on a phone.
     if (method === "GET" && path === "/api/routines") {
       const now = new Date();
       return json(res, 200, {
-        routines: routines.routines.map((r) => ({
-          ...r,
-          summary: describeRoutine(r),
-          nextRunAt: r.enabled ? (nextScheduledAfter(r, now)?.getTime() ?? null) : null,
-        })),
+        routines: routines.routines.map((r) => {
+          // on, but its agent is archived: it runs again once restored
+          const suspended = r.targetKind === "agent" && suspendedFor(r.targetId);
+          return {
+            ...r,
+            summary: describeRoutine(r),
+            nextRunAt: r.enabled && !suspended ? (nextScheduledAfter(r, now)?.getTime() ?? null) : null,
+            ...(suspended ? { suspended: "archived" as const } : {}),
+          };
+        }),
       });
     }
     if (method === "POST" && path === "/api/routines") {
       const body = await readBody(req);
+      const tooLong = promptTooLong(body?.prompt);
+      if (tooLong) return json(res, 400, { error: tooLong });
+      const unscheduled = scheduleProblem(body);
+      if (unscheduled) return json(res, 400, { error: unscheduled });
       const clean = normalizeRoutine(body);
       if (!clean) return json(res, 400, { error: "a routine needs a target, something to say, and a time" });
+      // An agent files routines for itself, the same line its changes and
+      // removals keep to below. Aimed at another agent, a routine would be
+      // a standing instruction to it that outlives this agent's turn and
+      // runs under that agent's approvals, not this one's.
+      if (asAgent && (clean.targetKind !== "agent" || clean.targetId !== asAgent.botId)) {
+        return json(res, 403, { error: "an agent files routines for itself" });
+      }
       // A routine aimed at nothing would fire forever into the void.
       const exists =
         clean.targetKind === "room" ? Boolean(bloks.get(clean.targetId)) : Boolean(store.bot(clean.targetId));
       if (!exists) return json(res, 404, { error: "no such agent or room" });
-      const routine = routines.create(clean);
+      const unnamed = clean.targetKind === "agent" ? threadRefusal(clean.targetId, clean.thread) : null;
+      if (unnamed) return json(res, 400, { error: unnamed });
+      // filed from an agent's turn, its turns go on from that one's place
+      const routine = routines.create({ ...clean, ...(asAgent ? { chain: nextAgentChain(asAgent.taskId) } : {}) });
       if (!routine) return json(res, 507, { error: `you can have at most ${MAX_ROUTINES} routines` });
       broadcast({ kind: "routines" });
       return json(res, 201, { routine: { ...routine, summary: describeRoutine(routine) } });
     }
     m = path.match(/^\/api\/routines\/([\w-]+)$/);
+    // An agent changes and drops its own routines, as with watchers, and
+    // nobody else's: one agent tidying up must not take away a routine the
+    // person set for another.
+    const notMine = (r: { targetKind: string; targetId: string } | null) =>
+      Boolean(asAgent && r && (r.targetKind !== "agent" || r.targetId !== asAgent.botId));
     if (m && method === "PATCH") {
       const existing = routines.get(m[1]);
-      if (!existing) return json(res, 404, { error: "no such routine" });
+      if (!existing || notMine(existing)) return json(res, 404, { error: "no such routine" });
       const body = await readBody(req);
+      const tooLong = promptTooLong(body.prompt);
+      if (tooLong) return json(res, 400, { error: tooLong });
       // Only the fields a person edits. Never lastRunAt: rewriting when it
       // last ran is how you make a routine fire twice.
-      const merged = normalizeRoutine({
+      // A check-in turned back into a time of day stops being quiet unless
+      // asked to stay so: it was quiet for being a check-in.
+      const leavesCheckIn = existing.every !== undefined && body.every === null;
+      const input = {
         targetId: existing.targetId,
         targetKind: existing.targetKind,
         prompt: body.prompt ?? existing.prompt,
@@ -9711,13 +16639,27 @@ const server = createServer(async (req, res) => {
         date: body.date ?? existing.date,
         durationMin: body.durationMin ?? existing.durationMin,
         runsOn: body.runsOn === null ? undefined : (body.runsOn ?? existing.runsOn),
-      });
+        thread: body.thread === null ? undefined : (body.thread ?? existing.thread),
+        every: body.every === null ? undefined : (body.every ?? existing.every),
+        activeHours: body.activeHours === null ? undefined : (body.activeHours ?? existing.activeHours),
+        quiet: body.quiet ?? (leavesCheckIn ? undefined : existing.quiet),
+      };
+      const unscheduled = scheduleProblem(input);
+      if (unscheduled) return json(res, 400, { error: unscheduled });
+      const merged = normalizeRoutine(input);
       if (!merged) return json(res, 400, { error: "that is not a valid routine" });
-      const routine = routines.patch(m[1], merged);
+      // only a conversation newly named: one named before and since closed
+      // must not stop the rest of an edit
+      const unnamed = merged.thread !== existing.thread ? threadRefusal(merged.targetId, merged.thread) : null;
+      if (unnamed) return json(res, 400, { error: unnamed });
+      // the person changing it has had their say; an agent changing it
+      // carries its own turn's place
+      const routine = routines.patch(m[1], { ...merged, chain: asAgent ? nextAgentChain(asAgent.taskId) : undefined });
       broadcast({ kind: "routines" });
       return json(res, 200, { routine: { ...routine!, summary: describeRoutine(routine!) } });
     }
     if (m && method === "DELETE") {
+      if (notMine(routines.get(m[1]))) return json(res, 404, { error: "no such routine" });
       const ok = routines.remove(m[1]);
       if (ok) broadcast({ kind: "routines" });
       return json(res, ok ? 200 : 404, ok ? { ok: true } : { error: "no such routine" });
@@ -9728,6 +16670,9 @@ const server = createServer(async (req, res) => {
     if (m && method === "POST") {
       const routine = routines.get(m[1]);
       if (!routine) return json(res, 404, { error: "no such routine" });
+      if (drain.on) return json(res, 503, { error: "Bloks is finishing what is running before it restarts. Run this again once it is back." });
+      // the person running it by hand starts it over (MAX_AGENT_CHAIN)
+      if (routine.chain) routines.patch(routine.id, { chain: undefined });
       // A hand-run is still a run. It is how anybody checks that a
       // routine does what they meant, so it belongs in the history at
       // least as much as the scheduled ones do.
@@ -9746,8 +16691,12 @@ const server = createServer(async (req, res) => {
             }),
           );
       } else {
-        const laneId = backgroundTaskId(routine.targetId, "Routines");
-        if (!laneId) return json(res, 409, { error: "that agent's Routines lane is busy. Try again when it settles" });
+        const laneId = workLaneId(routine.targetId, routine.thread);
+        if (!laneId) {
+          const target = store.bot(routine.targetId);
+          const lane = (target && namedLane(target, routine.thread)?.title) ?? routine.thread ?? "General";
+          return json(res, 409, { error: `that agent's ${lane} lane is busy. Try again when it settles` });
+        }
         const run = routines.beginRun(routine.id, laneId);
         if (run) openRuns.set(laneId, { routineId: routine.id, runId: run.id });
         broadcast({ kind: "routines" });
@@ -9755,6 +16704,7 @@ const server = createServer(async (req, res) => {
           await startTurn(routine.targetId, routine.prompt, {
             taskId: laneId,
             computerOverride: routine.runsOn,
+            routine: routineMark(routine, true),
           });
         } catch (e) {
           closeRun(laneId, {
@@ -9780,11 +16730,12 @@ const server = createServer(async (req, res) => {
       if (typeof body.enabled !== "boolean") {
         return json(res, 400, { error: "enabled must be true or false" });
       }
-      setRemoteEnabled(body.enabled);
+      const saved = setRemoteEnabled(body.enabled);
+      Object.assign(cfg, saved);
       // pairing is the master switch for all remote access, the relay
       // included: turning it off drops the outbound line immediately
-      syncRelay();
-      const status = pairingStatus();
+      syncRelay(saved);
+      const status = pairingStatus(saved);
       broadcast({ kind: "pairing", ...status });
       return json(res, 200, status);
     }
@@ -9824,31 +16775,78 @@ const server = createServer(async (req, res) => {
     if (method === "POST" && path === "/api/pair/claim") {
       const body = await readBody(req);
       // `credential` is the QR token or the code; `code` is the old name
-      const claimed = claimPairing(body.credential ?? body.code, body.device);
+      const claimed = claimPairing(body.credential ?? body.code, body.device, (saved) => {
+        broadcast({ kind: "pairing", ...pairingStatus(saved) });
+      });
       if (!claimed) return json(res, 401, { error: "that code is not valid" });
-      broadcast({ kind: "pairing", ...pairingStatus() });
       return json(res, 200, claimed);
     }
     if (method === "DELETE" && path === "/api/pair/devices") {
       if (!local) return json(res, 403, { error: "not from here" });
-      revokeAll();
-      broadcast({ kind: "pairing", ...pairingStatus() });
+      const saved = revokeAll();
+      broadcast({ kind: "pairing", ...pairingStatus(saved) });
       return json(res, 200, { ok: true });
     }
     m = path.match(/^\/api\/pair\/devices\/([\w-]+)$/);
     if (m && method === "DELETE") {
       if (!local) return json(res, 403, { error: "not from here" });
-      const ok = revokeDevice(m[1]);
-      if (ok) broadcast({ kind: "pairing", ...pairingStatus() });
+      const ok = revokeDevice(m[1], (saved) => {
+        broadcast({ kind: "pairing", ...pairingStatus(saved) });
+      });
       return json(res, ok ? 200 : 404, ok ? { ok: true } : { error: "no such device" });
     }
 
     // ── stored settings: written here, never read back out ──
+    // ── how much agents ask, for the whole workspace ──
+    // One choice, made once: it is the start for every new agent, and on
+    // request it becomes every existing agent's mode too. Each agent can
+    // still be set differently afterwards in its own settings.
+    if (method === "GET" && path === "/api/approvals") {
+      const counts: Record<string, number> = { ask: 0, edits: 0, auto: 0, full: 0 };
+      for (const b of store.bots) if (!b.hidden && !b.archivedAt) counts[b.approvals ?? "ask"]++;
+      return json(res, 200, { mode: cfg.agentDefaults?.approvals ?? "ask", agents: counts });
+    }
+    if ((method === "PUT" || method === "POST") && path === "/api/approvals") {
+      const body = await readBody(req);
+      const mode = body.mode as Approvals;
+      if (!APPROVALS.includes(mode)) return json(res, 400, { error: "mode is ask, edits, auto or full" });
+      const { approvals: _old, ...rest } = cfg.agentDefaults ?? {};
+      Object.assign(cfg, saveConfig({ agentDefaults: mode === "ask" ? rest : { ...rest, approvals: mode } }));
+      let changed = 0;
+      if (body.applyToAll === true) {
+        for (const b of store.bots) {
+          if (b.hidden || b.archivedAt || (b.approvals ?? "ask") === mode) continue;
+          store.patchBot(b.id, { approvals: mode });
+          broadcast({ kind: "bot", bot: clientBot(store.bot(b.id)) });
+          changed++;
+        }
+      }
+      record({
+        at: Date.now(),
+        kind: "approvals.changed",
+        actor: "you",
+        summary:
+          `New agents now start on ${mode}` + (changed ? `, and ${changed} agent${changed === 1 ? "" : "s"} moved to it` : ""),
+        detail: { mode, changed },
+      });
+      const status = configStatus();
+      broadcast({ kind: "config", ...status });
+      return json(res, 200, { mode, changed });
+    }
     if (method === "GET" && path === "/api/config") {
       return json(res, 200, configStatus());
     }
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
+      if (body.agents !== undefined && (!isRecord(body.agents) || !validTurnLimit(body.agents.turnLimit))) {
+        return json(res, 400, { error: `agents.turnLimit must be a whole number from ${MIN_AGENT_CHAIN_LIMIT} to ${MAX_AGENT_CHAIN_LIMIT}` });
+      }
+      if (body.changes !== undefined && (
+        !body.changes || typeof body.changes !== "object" || Array.isArray(body.changes) ||
+        typeof (body.changes as Record<string, unknown>).showShared !== "boolean"
+      )) {
+        return json(res, 400, { error: "changes.showShared must be true or false" });
+      }
       // Only known string fields, each length-capped. Without this the
       // whole config file is an arbitrary write target.
       const FIELDS: Record<string, { keys: string[]; max: number }> = {
@@ -9864,6 +16862,7 @@ const server = createServer(async (req, res) => {
       /** Sections that save themselves, so the empty-patch guard below
        * does not mistake a real write for an empty request. */
       let wroteSomething = false;
+      let compactionLineChanged = false;
       if (body.speech && typeof body.speech === "object" && !Array.isArray(body.speech)) {
         const consent = (body.speech as Record<string, unknown>).useDiscoveredOpenAI;
         if (typeof consent === "boolean") consentPatch = { useDiscoveredOpenAI: consent };
@@ -9871,20 +16870,60 @@ const server = createServer(async (req, res) => {
       // A boolean, not a credential, so it rides outside the string table
       // like the consent flags do.
       if (body.compaction && typeof body.compaction === "object" && !Array.isArray(body.compaction)) {
-        const micro = (body.compaction as Record<string, unknown>).micro;
-        if (typeof micro === "boolean") {
-          saveConfig({ compaction: { micro } });
-          Object.assign(cfg, loadConfig());
+        const { micro, idle, beforeTurn, beforeTurnAt } = body.compaction as Record<string, unknown>;
+        // A ceiling is 0 (never) or a real number of tokens, and the share
+        // of the window is a share; anything else is left as it was.
+        const ceiling =
+          typeof beforeTurn === "number" && Number.isInteger(beforeTurn) && (beforeTurn === 0 || (beforeTurn >= 10_000 && beforeTurn <= 2_000_000))
+            ? beforeTurn
+            : undefined;
+        const share = typeof beforeTurnAt === "number" && beforeTurnAt >= 0.2 && beforeTurnAt < 1 ? beforeTurnAt : undefined;
+        if (typeof micro === "boolean" || typeof idle === "boolean" || ceiling !== undefined || share !== undefined) {
+          const previous = beforeTurnSettings();
+          Object.assign(cfg, saveConfig({
+            compaction: {
+              ...(typeof micro === "boolean" ? { micro } : {}),
+              ...(typeof idle === "boolean" ? { idle } : {}),
+              ...(ceiling !== undefined ? { beforeTurn: ceiling } : {}),
+              ...(share !== undefined ? { beforeTurnAt: share } : {}),
+            },
+          }));
+          const next = beforeTurnSettings();
+          compactionLineChanged = previous.ceiling !== next.ceiling || previous.at !== next.at;
+          wroteSomething = true;
+        }
+      }
+      if (body.turns && typeof body.turns === "object" && !Array.isArray(body.turns)) {
+        const minutes = (body.turns as Record<string, unknown>).stallMinutes;
+        if (minutes !== undefined) {
+          if (!STALL_CHOICES.includes(minutes as (typeof STALL_CHOICES)[number])) {
+            return json(res, 400, { error: `stallMinutes is one of ${STALL_CHOICES.join(", ")} (0 is never)` });
+          }
+          Object.assign(cfg, saveConfig({ turns: { stallMinutes: minutes as number } }));
+          wroteSomething = true;
+        }
+      }
+      if (isRecord(body.agents)) {
+        Object.assign(cfg, saveConfig({ agents: { turnLimit: body.agents.turnLimit as number } }));
+        wroteSomething = true;
+      }
+      if (body.recall && typeof body.recall === "object" && !Array.isArray(body.recall)) {
+        const beforeTurn = (body.recall as Record<string, unknown>).beforeTurn;
+        if (typeof beforeTurn === "boolean") {
+          Object.assign(cfg, saveConfig({ recall: { beforeTurn } }));
           wroteSomething = true;
         }
       }
       if (body.skills && typeof body.skills === "object" && !Array.isArray(body.skills)) {
         const propose = (body.skills as Record<string, unknown>).propose;
         if (typeof propose === "boolean") {
-          saveConfig({ skills: { propose } });
-          Object.assign(cfg, loadConfig());
+          Object.assign(cfg, saveConfig({ skills: { propose } }));
           wroteSomething = true;
         }
+      }
+      if (body.changes) {
+        Object.assign(cfg, saveConfig({ changes: { showShared: (body.changes as { showShared: boolean }).showShared } }));
+        wroteSomething = true;
       }
       // A hotkey is not a credential, so it gets its own shape check
       // rather than a slot in the string table: it must look like an
@@ -9892,8 +16931,7 @@ const server = createServer(async (req, res) => {
       if (body.shortcuts && typeof body.shortcuts === "object" && !Array.isArray(body.shortcuts)) {
         const asked = (body.shortcuts as Record<string, unknown>).quickAsk;
         if (asked === null) {
-          saveConfig({ shortcuts: { quickAsk: null } });
-          Object.assign(cfg, loadConfig());
+          Object.assign(cfg, saveConfig({ shortcuts: { quickAsk: null } }));
           wroteSomething = true;
         } else if (typeof asked === "string") {
           const accelerator = asked.trim();
@@ -9902,8 +16940,7 @@ const server = createServer(async (req, res) => {
             /^([A-Za-z]+\+)+[A-Za-z0-9]+$/.test(accelerator) &&
             /(Command|Control|Alt|Shift|Super|CommandOrControl)\+/.test(accelerator);
           if (!valid) return json(res, 400, { error: "that is not a keyboard shortcut" });
-          saveConfig({ shortcuts: { quickAsk: accelerator } });
-          Object.assign(cfg, loadConfig());
+          Object.assign(cfg, saveConfig({ shortcuts: { quickAsk: accelerator } }));
           wroteSomething = true;
         }
       }
@@ -9919,7 +16956,7 @@ const server = createServer(async (req, res) => {
         }
         if (asked.approvals !== undefined) {
           if (!APPROVALS.includes(asked.approvals as Approvals)) {
-            return json(res, 400, { error: "approvals is ask, edits or auto" });
+            return json(res, 400, { error: "approvals is ask, edits, auto or full" });
           }
           next.approvals = asked.approvals as Approvals;
         }
@@ -9939,13 +16976,16 @@ const server = createServer(async (req, res) => {
           }
           next.modelSelection = { instanceId: pick.instanceId, model: pick.model };
         }
-        saveConfig({ agentDefaults: next });
-        Object.assign(cfg, loadConfig());
+        Object.assign(cfg, saveConfig({ agentDefaults: next }));
         wroteSomething = true;
       }
-      if (body.setupDone === true && !cfg.setupDoneAt) {
-        saveConfig({ setupDoneAt: Date.now() });
-        Object.assign(cfg, loadConfig());
+      if (body.setupDone === true) {
+        // saying setup is done when it already is, is still a success: the
+        // first answer used to be "nothing to save", a 400 for doing it right
+        if (!cfg.setupDoneAt) {
+          Object.assign(cfg, saveConfig({ setupDoneAt: Date.now() }));
+        }
+        wroteSomething = true;
       }
       for (const [section, spec] of Object.entries(FIELDS)) {
         const value = body[section];
@@ -9985,15 +17025,19 @@ const server = createServer(async (req, res) => {
           return json(res, 400, { error: "Composio didn't accept that API key" });
         }
       }
-      saveConfig(patch);
-      Object.assign(cfg, loadConfig());
+      Object.assign(cfg, saveConfig(patch));
       // Only a section instanceConfigs builds engines from is worth the
-      // reload, because a reload ends every turn in flight on every agent.
+      // reload, because a reload cuts off the turns of every engine it
+      // rebuilds, and these two reach the environment of all of them.
       // The rest (profile, speech, Composio, and the sections saved above)
       // are read fresh when they are used.
       if (patch.xai || patch.box) await reloadProviders();
       const status = configStatus();
       broadcast({ kind: "config", ...status });
+      // A saved reading has a new denominator even with no new request.
+      if (compactionLineChanged) {
+        for (const bot of store.bots) broadcast({ kind: "bot", bot: clientBot(bot) });
+      }
       return json(res, 200, status);
     }
 
@@ -10009,6 +17053,51 @@ const server = createServer(async (req, res) => {
     }
 
     // ── connectors (Composio) ──
+    // App icons, fetched here and handed to the page as our own images.
+    // The page may only load images from itself (see SECURITY_HEADERS),
+    // which blocked every logo and favicon the plugin grid asked for. A
+    // proxy for arbitrary URLs would be a way out of that rule, so this
+    // one takes a bare domain for a favicon, or a logo on a short list of
+    // hosts, and passes back images only.
+    if (method === "GET" && path === "/api/connectors/icon") {
+      const domain = url.searchParams.get("domain") ?? "";
+      const src = url.searchParams.get("src") ?? "";
+      let target: string | null = null;
+      if (/^(?=.{1,253}$)([a-z0-9-]+\.)+[a-z]{2,}$/i.test(domain)) {
+        target = `https://www.google.com/s2/favicons?domain=${domain.toLowerCase()}&sz=64`;
+      } else if (src) {
+        try {
+          const parsed = new URL(src);
+          const host = parsed.hostname.toLowerCase();
+          const allowed =
+            parsed.protocol === "https:" &&
+            (host === "ssl.gstatic.com" || host === "www.google.com" || host === "composio.dev" || host.endsWith(".composio.dev"));
+          if (allowed) target = parsed.toString();
+        } catch {
+          /* not a URL */
+        }
+      }
+      if (!target) return json(res, 400, { error: "not an icon this can fetch" });
+      const cached = iconCache.get(target);
+      if (cached) {
+        res.writeHead(200, { "content-type": cached.type, "cache-control": "max-age=86400", ...SECURITY_HEADERS });
+        return res.end(cached.bytes);
+      }
+      try {
+        const got = await fetch(target, { signal: AbortSignal.timeout(8_000), redirect: "follow" });
+        const type = got.headers.get("content-type") ?? "";
+        const bytes = Buffer.from(await got.arrayBuffer());
+        if (!got.ok || !/^image\/(png|jpeg|gif|webp|x-icon|vnd\.microsoft\.icon|svg\+xml)/.test(type) || bytes.length > 256_000) {
+          return json(res, 404, { error: "no icon" });
+        }
+        if (iconCache.size >= 300) iconCache.delete(iconCache.keys().next().value!);
+        iconCache.set(target, { type, bytes });
+        res.writeHead(200, { "content-type": type, "cache-control": "max-age=86400", ...SECURITY_HEADERS });
+        return res.end(bytes);
+      } catch {
+        return json(res, 404, { error: "no icon" });
+      }
+    }
     if (method === "GET" && path === "/api/connectors/catalog") {
       const { cards, source } = await composio.connectorCatalog(cfg);
       return json(res, 200, { configured: Boolean(cfg.composio?.key), source, cards });
@@ -10016,11 +17105,25 @@ const server = createServer(async (req, res) => {
     if (method === "GET" && path === "/api/connectors") {
       const services = (url.searchParams.get("services") ?? "").split(",").filter(Boolean);
       if (!cfg.composio?.key) return json(res, 200, { configured: false, services: {} });
-      const status = await composio.connectorStates(
-        cfg,
-        services.length ? services : composio.SHIPPED_CONNECTOR_SLUGS,
-      );
-      return json(res, 200, { configured: true, services: status });
+      // A status check that fails is not a broken screen: the list still
+      // renders, and the reason rides along for it to show.
+      try {
+        const status = await composio.connectorStates(
+          cfg,
+          services.length ? services : composio.SHIPPED_CONNECTOR_SLUGS,
+        );
+        return json(res, 200, { configured: true, services: status });
+      } catch (e) {
+        return json(res, 200, {
+          configured: true,
+          services: {},
+          error: redactSecrets(e instanceof Error ? e.message : String(e)),
+        });
+      }
+    }
+    m = path.match(/^\/api\/connectors\/([\w-]+)(\/authorize)?$/);
+    if (m && (method === "DELETE" || (method === "POST" && m[2])) && !cfg.composio?.key) {
+      return json(res, 400, { error: "Connecting apps needs a Composio key. Add one in Settings, Apps and keys." });
     }
     m = path.match(/^\/api\/connectors\/([\w-]+)\/authorize$/);
     if (m && method === "POST") return json(res, 200, await composio.beginConnectorAuth(cfg, m[1]));
@@ -10124,12 +17227,20 @@ const server = createServer(async (req, res) => {
       }
     }
 
-    return json(res, 404, { error: `no route: ${method} ${path}` });
+    // The code is what a client reads: a phone newer than this Mac asking
+    // for something it does not have yet tells its person to update here,
+    // rather than showing them a method and a path.
+    return json(res, 404, { error: `no route: ${method} ${path}`, code: "unknown_route" });
   } catch (e) {
     const status = (e as any)?.status ?? 500;
     return json(res, status, { error: redactSecrets(e instanceof Error ? e.message : String(e)) });
   }
-});
+}
+
+/** The environment and header names an MCP server has no value for yet. */
+function unfilled(server: { env?: Record<string, string>; headers?: Record<string, string> }): string[] {
+  return [...Object.entries(server.env ?? {}), ...Object.entries(server.headers ?? {})].filter(([, value]) => !value).map(([name]) => name);
+}
 
 /** Provider and connector errors sometimes quote the credential that
  * failed. Never hand one back to the UI (or into a log) verbatim. */
@@ -10159,8 +17270,51 @@ function redactSecrets(message: string): string {
 // header of server/pairing.ts for why this is not a live toggle.
 const BIND = bindHost();
 noteBound(BIND);
+// A port someone else holds is the one startup failure a person can fix
+// on their own, so it is said plainly instead of as a stack trace. The
+// code stays in the line: the desktop app and the tests read it to know
+// to try another port.
+server.on("error", (error: NodeJS.ErrnoException) => {
+  if (error.code === "EADDRINUSE") {
+    console.error(
+      `[bloks] port ${PORT} is already in use by another program (EADDRINUSE). ` +
+        `Quit that program, or start Bloks on another port with BLOKS_PORT, for example BLOKS_PORT=${PORT + 1}.`,
+    );
+    process.exit(1);
+  }
+  throw error;
+});
+// before the first request, so nobody sees the sidebar half arranged
+settleSidebar();
 server.listen(PORT, BIND, () => {
   console.log(`bloks server on http://127.0.0.1:${PORT}`);
+  // turns cut off when Bloks last stopped, and messages that were
+  // waiting on a turn (the second inside the first)
+  recoverCutOff();
+  // Copies written before the native log stopped repeating Codex's thread
+  // history (server/drivers/native.ts), slimmed once, after startup has
+  // had its moment. Then any still too big are moved aside and gzipped,
+  // after the slimming so the two never work on the same file at once.
+  setTimeout(() => {
+    void slimNativeLogs()
+      .then(({ files, saved }) => {
+        if (files) console.log(`[bloks] native logs: ${files} slimmed, ${Math.round(saved / 1e6)} MB freed`);
+      })
+      .catch(() => {})
+      .then(() => tidyNativeLogs())
+      .then(({ rotated }) => {
+        if (rotated) console.log(`[bloks] native logs: ${rotated} too big, moved aside and gzipped`);
+      })
+      .catch(() => {});
+  }, 30_000).unref?.();
+  // Where this server is, for the tools on this machine that look for it
+  // (bin/bloks-mcp.mjs, bin/bloks.mjs). The desktop app can end up on a
+  // port nobody would guess when the usual ones are taken.
+  try {
+    writeFileSync(join(DATA_DIR, "port"), String(PORT));
+  } catch {
+    /* they fall back to the usual ports */
+  }
   if (BIND !== "127.0.0.1") {
     console.log(`[bloks] paired devices may reach this machine on port ${PORT}`);
   }
@@ -10175,13 +17329,62 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (error) => {
   console.error("[bloks] uncaught exception:", redactSecrets(error?.stack ?? String(error)));
 });
+// Whoever reads this process's output can go away before it does: the
+// app quitting hard, a test runner killing its file. A write after that
+// fails with EPIPE, and the stream reports it as an error event. console
+// only quiets the first one, so the second became an uncaught exception,
+// whose log line failed the same way, and so on. Each round was queued
+// for the very next tick, so the event loop never came back around: a
+// full core, no requests answered, and SIGTERM never delivered. A log
+// with no reader is simply lost.
+for (const stream of [process.stdout, process.stderr]) stream.on("error", () => {});
 
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => {
-    // shells first: they are children of this process and would otherwise
-    // outlive it, still holding the folder open
-    terminals.closeAll();
-    mcp.closeAll();
-    void registry.disposeAll().finally(() => process.exit(0));
-  });
+/** How long a stop may take before the process ends anyway: an engine or
+ * a browser that never answers must not keep the server alive. The
+ * desktop app waits less than this before it kills (electron/server-life.mjs),
+ * so this is for everyone else who asks with a signal. */
+const SHUTDOWN_DEADLINE_MS = 5_000;
+
+let shuttingDown = false;
+/** Stops the way a quit does. Also how a restore ends this process, so
+ * the next start can put the restored folder in place. */
+const shutDown = () => {
+  // once, however many ways it is asked
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // first, so nothing below (a throw included) can leave it running
+  setTimeout(() => process.exit(0), SHUTDOWN_DEADLINE_MS).unref();
+  // What is running stays on the list as it is: the engines shut down
+  // below end their turns, and that is this stop, not them finishing.
+  cutOff.close();
+  // shells first: they are children of this process and would otherwise
+  // outlive it, still holding the folder open
+  terminals.closeAll();
+  mcp.closeAll();
+  void Promise.allSettled([registry.disposeAll(), closeBrowsers()]).finally(() => process.exit(0));
+};
+for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, shutDown);
+// A test that starts a server and is then killed (the test runner's file
+// timeout does it with no after hooks) never stops it, and it lives on
+// with nobody to talk to. Those servers are told which process started
+// them and stop once it is no longer their parent. Told, not read from
+// process.ppid here: a test killed while this file was still loading
+// would leave launchd as the parent from the start. The app has its own
+// way to ask (below), so this is only for them.
+const testParent = Number(process.env.BLOKS_TEST_PARENT_PID);
+// not handed on to what this server starts in turn
+delete process.env.BLOKS_TEST_PARENT_PID;
+if (testParent > 0) {
+  setInterval(() => {
+    if (process.ppid !== testParent) shutDown();
+  }, 500).unref();
 }
+// The desktop app asks this way before it kills the server
+// (electron/server-life.mjs). On Windows killing it ends it outright, with
+// none of the above: its engines kept running, and its lock on the data
+// folder stayed behind for the next start to trip on. A message reaches
+// it the same way everywhere. Only Electron gives a process this port.
+type ParentPort = { on(event: "message", listener: (message: { data?: { kind?: unknown } }) => void): void };
+(process as NodeJS.Process & { parentPort?: ParentPort }).parentPort?.on("message", (message) => {
+  if (message?.data?.kind === "stop") shutDown();
+});

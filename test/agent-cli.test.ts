@@ -13,6 +13,7 @@ import {
   cliBriefing,
   matches,
   runsAProcess,
+  secretHint,
 } from "../server/agent-cli.ts";
 
 const ME = "bot-me";
@@ -60,18 +61,51 @@ describe("what an agent can do", () => {
     assert.match(refused.reason ?? "", /only read and write its own/);
   });
 
-  test("its own settings, and nobody else's", () => {
-    assert.equal(allows(ME, "PATCH", `/api/bots/${ME}`).ok, true);
-    assert.equal(allows(ME, "PATCH", `/api/bots/${SOMEONE_ELSE}`).ok, false);
+  test("it can ask for a secret for itself, and for nobody else", () => {
+    assert.equal(allows(ME, "POST", `/api/bots/${ME}/secrets`).ok, true);
+    assert.equal(allows(ME, "POST", `/api/bots/${SOMEONE_ELSE}/secrets`).ok, false);
+    // asking is all: the saved values stay out of reach
+    assert.equal(allows(ME, "GET", `/api/bots/${ME}/secrets`).ok, false);
   });
 
-  test("renaming its own conversations, and nobody else's", () => {
+  test("its own settings, and nobody else's", () => {
+    assert.equal(allows(ME, "PATCH", `/api/bots/${ME}`).ok, true);
+    // another agent's record is reachable only to file it into a section;
+    // the route refuses every other field (test/agent-sections.test.ts)
+    assert.equal(allows(ME, "PATCH", `/api/bots/${SOMEONE_ELSE}`).ok, true);
+    assert.equal(allows(ME, "DELETE", `/api/bots/${SOMEONE_ELSE}`).ok, false);
+    assert.equal(allows(ME, "PUT", `/api/bots/${SOMEONE_ELSE}/memory`).ok, false);
+  });
+
+  test("the sidebar's arrangement is read freely, and its headings stay the person's", () => {
+    // pins and places ride on PATCH /api/bots/:id and the room's own route,
+    // which narrow them themselves (test/agent-sections.test.ts)
+    assert.equal(allows(ME, "GET", "/api/sidebar").ok, true);
+    assert.equal(allows(ME, "PUT", "/api/sidebar/sections").ok, false);
+  });
+
+  test("how much every agent may do without asking is never an agent's to set", () => {
+    assert.equal(allows(ME, "PUT", "/api/approvals").ok, false);
+    assert.equal(allows(ME, "GET", "/api/approvals").ok, false);
+  });
+
+  test("renaming and closing its own conversations, and nobody else's", () => {
     assert.equal(allows(ME, "PATCH", `/api/bots/${ME}/tasks/lane-1`).ok, true);
     assert.equal(allows(ME, "PATCH", `/api/bots/${SOMEONE_ELSE}/tasks/lane-1`).ok, false);
-    // renaming is all: opening, switching and closing lanes stay the person's
+    // closing its own (the route narrows it to the one it is in)
+    assert.equal(allows(ME, "DELETE", `/api/bots/${ME}/tasks/lane-1`).ok, true);
+    assert.equal(allows(ME, "DELETE", `/api/bots/${SOMEONE_ELSE}/tasks/lane-1`).ok, false);
+    // opening and switching lanes stay the person's
     assert.equal(allows(ME, "POST", `/api/bots/${ME}/tasks`).ok, false);
     assert.equal(allows(ME, "POST", `/api/bots/${ME}/tasks/lane-1/activate`).ok, false);
-    assert.equal(allows(ME, "DELETE", `/api/bots/${ME}/tasks/lane-1`).ok, false);
+  });
+
+  test("rewinding a conversation and redoing a message are the person's alone", () => {
+    // an agent that could take back what it was asked, or rewrite it and
+    // run again, would be editing its own instructions
+    assert.equal(allows(ME, "POST", "/api/threads/lane-1/rewind").ok, false);
+    assert.equal(allows(ME, "GET", "/api/threads/lane-1/messages/m-1/redo").ok, false);
+    assert.equal(allows(ME, "POST", "/api/threads/lane-1/messages/m-1/redo").ok, false);
   });
 
   test("a query string does not smuggle anything past the rules", () => {
@@ -215,6 +249,33 @@ describe("the credential itself", () => {
     assert.equal(tokens.identify(minted.token, 1_000 + TOKEN_TTL_MS), null);
   });
 
+  test("a turn still running keeps its credential past the hour, and loses it when it ends", () => {
+    // An hour of comparing quotes in a browser is ordinary work; a
+    // credential that died at sixty minutes meant the result was never
+    // delivered. The turn ending is the real limit.
+    const tokens = new AgentTokens();
+    const running = new Set(["task-1"]);
+    const alive = (taskId: string) => running.has(taskId);
+    const minted = tokens.mint(ME, "task-1", 1_000);
+    const later = 1_000 + TOKEN_TTL_MS * 3;
+    assert.ok(tokens.identify(minted.token, later, alive), "a running turn was locked out after an hour");
+    // the sweep leaves it alone too
+    tokens.sweep(later + TOKEN_TTL_MS * 2, alive);
+    assert.ok(tokens.identify(minted.token, later + TOKEN_TTL_MS * 2, alive));
+    // the turn ends: gone at once, however recently it was renewed
+    running.delete("task-1");
+    tokens.revokeTask("task-1");
+    assert.equal(tokens.identify(minted.token, later + TOKEN_TTL_MS * 2, alive), null);
+  });
+
+  test("a turn that is not running gets no renewal, so a stray credential still expires", () => {
+    const tokens = new AgentTokens();
+    const alive = () => false;
+    const minted = tokens.mint(ME, "task-1", 1_000);
+    tokens.sweep(1_000 + TOKEN_TTL_MS, alive);
+    assert.equal(tokens.identify(minted.token, 1_000 + TOKEN_TTL_MS, alive), null);
+  });
+
   test("a deleted agent's credentials go with it", () => {
     const tokens = new AgentTokens();
     const mine = tokens.mint(ME, "task-1", 1);
@@ -276,6 +337,16 @@ describe("what the agent is told", () => {
     assert.match(briefing, /\/opt\/bloks\/bin\/bloks\.mjs/);
     assert.match(briefing, /help/);
     assert.ok(briefing.length < 500, "a paragraph in every prompt competes with the request");
+  });
+
+  test("how to ask for a key is the way this engine actually has (#172)", () => {
+    const command = 'node "$BLOKS_CLI"';
+    assert.match(secretHint("tool", command) ?? "", /request_secret tool/);
+    // an engine without the tool is not sent looking for it
+    const cli = secretHint("cli", command) ?? "";
+    assert.doesNotMatch(cli, /request_secret/);
+    assert.ok(cli.includes(`${command} secret "`), cli);
+    assert.equal(secretHint(null, command), null);
   });
 
   test("what it can do is the rules, not a second list to keep in step", () => {

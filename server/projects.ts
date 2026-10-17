@@ -21,9 +21,10 @@
 //
 // The pure half is here. Reading the disk and running turns is the
 // caller's problem.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { readSaved, writeFileAtomic } from "./atomic-write.ts";
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
 import type { BlokColor, BlokShape } from "./store.ts";
@@ -162,20 +163,13 @@ export class ProjectStore {
   projects: Project[] = [];
 
   constructor() {
-    try {
-      const parsed = JSON.parse(readFileSync(PROJECTS_FILE, "utf8"));
-      if (Array.isArray(parsed)) {
-        this.projects = parsed.filter((p) => p?.id && typeof p.name === "string");
-      }
-    } catch {
-      /* no projects yet */
-    }
+    this.projects = readSaved<Project[]>(PROJECTS_FILE, [], Array.isArray).filter((p) => p?.id && typeof p.name === "string");
   }
 
   private save() {
     try {
       mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-      writeFileSync(PROJECTS_FILE, JSON.stringify(this.projects, null, 2), { mode: 0o600 });
+      writeFileAtomic(PROJECTS_FILE, JSON.stringify(this.projects, null, 2), 0o600);
     } catch {
       /* still a project for this session */
     }
@@ -191,7 +185,19 @@ export class ProjectStore {
     return this.projects.find((p) => p.id === id) ?? null;
   }
 
-  create(input: NewProject, now: number): Project {
+  /**
+   * A new project, or null when there are MAX_PROJECTS already and none
+   * of them is archived. Room is made by forgetting the one archived
+   * longest ago, never a project still in use: dropping the oldest one
+   * whatever it was could take the project you were working in.
+   */
+  create(input: NewProject, now: number): Project | null {
+    while (this.projects.length >= MAX_PROJECTS) {
+      const finished = this.projects.filter((p) => p.archivedAt);
+      if (!finished.length) return null;
+      const oldest = finished.reduce((a, b) => (b.archivedAt! < a.archivedAt! ? b : a));
+      this.projects = this.projects.filter((p) => p !== oldest);
+    }
     const clean = cleanInput(input);
     const project: Project = {
       id: newId(),
@@ -205,7 +211,6 @@ export class ProjectStore {
       createdAt: now,
     };
     this.projects.unshift(project);
-    if (this.projects.length > MAX_PROJECTS) this.projects.length = MAX_PROJECTS;
     this.save();
     return project;
   }

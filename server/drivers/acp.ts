@@ -21,7 +21,7 @@
 // A turn spawns a process and kills it on settle, the same as the codex
 // driver. Continuity comes from session/load with the stored id.
 import { spawn, execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,10 +37,15 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { outReason } from "../failover.ts";
 import { attachRpc } from "../harness/jsonrpc-stdio.ts";
-import { onPath, widenPath } from "../path.ts";
+import { killTree, launchSpec, onPath, widenPath } from "../path.ts";
+import { callSignature } from "../repeats.ts";
 import { appendNative } from "./native.ts";
 import { describeEarlyExit, describeSpawnError } from "./spawn-error.ts";
+import { within } from "./deadline.ts";
+import { OWN_GROUP } from "../no-console.ts";
+import { EngineProcesses } from "./engine-processes.ts";
 
 export interface AcpSpec {
   kind: string;
@@ -66,6 +71,9 @@ export interface AcpSpec {
    * its own. Checked so an installed-but-signed-out agent says so instead
    * of failing on the first message. */
   authFiles?: string[];
+  /** Answers without any sign-in (OpenCode serves free models out of the
+   * box), so a missing credential is not "signed out", only unknown. */
+  signInOptional?: boolean;
   /** Used until session/new reports what the agent actually serves. */
   models: ModelCatalog;
   /** When --version would start a session instead of printing a
@@ -76,6 +84,14 @@ export interface AcpSpec {
    * turn otherwise. Set to probe a throwaway session for the real
    * catalog, so the picker lists actual models from the start. */
   probeModels?: boolean;
+  /** A message chunk that is the agent's own status line rather than its
+   * reply (pi-acp's "Retrying (attempt 1/3, waiting 2s)..."), matched
+   * against the whole chunk. Kept out of the answer. */
+  statusText?: RegExp;
+  /** Why the turn failed, for an agent that ends a failed turn as an
+   * ordinary end_turn and keeps the reason to itself. Read after the
+   * turn; `since` is when it started, so an old failure is not blamed. */
+  turnError?: (sessionId: string, since: number) => string | null;
 }
 
 export interface AcpConfig {
@@ -86,6 +102,31 @@ export interface AcpConfig {
 }
 
 const PROTOCOL_VERSION = 1;
+
+/** How long to wait for an agent to list its commands before deciding
+ * it has no /compact, and how long its compaction may take. */
+const COMMANDS_WAIT_MS = 2_000;
+// the same allowance as Codex's (codex.ts COMPACT_LIMIT_MS)
+const COMPACT_LIMIT_MS = 10 * 60_000;
+
+/** How long a turn that ended empty waits for the agent's stderr to say
+ * why, when it has not said yet. Short, since an empty turn with no
+ * reason anywhere waits this long for nothing. */
+const STDERR_GRACE_MS = 200;
+
+/**
+ * How full a session is, from a `usage_update`: `used` is the tokens in
+ * context now and `size` the window, by the spec's own definitions.
+ * Either is null when it is missing or not a count.
+ */
+export function acpReading(update: any): { used: number | null; window: number | null } {
+  const used = Number(update?.used);
+  const size = Number(update?.size);
+  return {
+    used: Number.isFinite(used) && used > 0 ? Math.round(used) : null,
+    window: Number.isFinite(size) && size > 0 ? Math.round(size) : null,
+  };
+}
 
 /** How long a probe session may take to report its catalog. A hung CLI
  * (pi-acp --version starts a session) will sit forever without this. */
@@ -107,13 +148,96 @@ function connectorsHelper(): string {
 }
 
 /** ACP tool kinds, mapped to something worth reading in a transcript. */
+/** The files a call writes, by ACP's own account: an edit, delete or
+ * move names them in its locations, and a diff names its file. */
+function writesOf(update: any): string[] {
+  if (!["edit", "delete", "move"].includes(update?.kind)) return [];
+  const named = [
+    ...(Array.isArray(update.locations) ? update.locations.map((l: any) => l?.path) : []),
+    ...(Array.isArray(update.content) ? update.content.filter((c: any) => c?.type === "diff").map((c: any) => c?.path) : []),
+  ];
+  return [...new Set(named.filter((p): p is string => typeof p === "string" && p.length > 0))];
+}
+
+const RULE_FIELDS = ["command", "cmd", "script", "file_path", "path", "filePath", "notebook_path", "target_file", "url", "uri"];
+
+/**
+ * What a permission request is about, in the fields the rules read: the
+ * call's own input (where a command usually is), and every file it names
+ * in its locations or diffs. Left out, rules about commands and paths
+ * could never match an ACP agent's request.
+ */
+export function permissionInput(call: any): Record<string, unknown> {
+  // Only the fields a rule reads (policy.ts targetOf): a write's input can
+  // carry the whole file, and this event goes to every screen. Those
+  // fields go whole, never cut short: a rule that saw only the start of a
+  // command could be walked past by padding the front of it.
+  const raw: Record<string, unknown> = {};
+  const given = call?.rawInput && typeof call.rawInput === "object" && !Array.isArray(call.rawInput) ? call.rawInput : {};
+  for (const key of RULE_FIELDS) {
+    const value = given[key];
+    if (typeof value === "string") raw[key] = value;
+    // a command can come as its argv, the way Codex's legacy one does
+    else if (Array.isArray(value) && value.every((part) => typeof part === "string")) raw[key] = value.join(" ");
+  }
+  const paths = [
+    ...(Array.isArray(call?.locations) ? call.locations.map((l: any) => l?.path) : []),
+    ...(Array.isArray(call?.content) ? call.content.filter((c: any) => c?.type === "diff").map((c: any) => c?.path) : []),
+  ].filter((p, i, all): p is string => typeof p === "string" && p.length > 0 && all.indexOf(p) === i);
+  return { ...raw, ...(paths.length ? { paths } : {}) };
+}
+
 function toolTitle(update: any): string {
   const title = typeof update?.title === "string" ? update.title : null;
   if (title) return title.slice(0, 100);
   return typeof update?.kind === "string" ? update.kind : "tool";
 }
 
+/**
+ * What a call asked for, as a signature (server/repeats.ts), when the
+ * agent sends its arguments with the call. Some agents send an empty
+ * rawInput first and the arguments in a later update; read as given,
+ * every call of one tool would look like the same call, so an empty one
+ * gives no signature at all.
+ */
+export function acpSignature(update: any): string | undefined {
+  const raw = update?.rawInput;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Object.keys(raw).length) return undefined;
+  return callSignature(`${typeof update.kind === "string" ? update.kind : ""}:${toolTitle(update)}`, raw);
+}
+
+/** The session's model choice as an ACP config option, if the agent
+ * describes it that way. Agents that do (pi-acp among them) may not
+ * implement the older session/set_model at all. */
+function modelOption(session: any): any | null {
+  const options: any[] = Array.isArray(session?.configOptions) ? session.configOptions : [];
+  return (
+    options.find((o) => o?.type === "select" && (o.category === "model" || o.id === "model")) ?? null
+  );
+}
+
+/** A select option's values, flattening the grouped form the spec allows. */
+function selectValues(option: any): { value: string; name: string }[] {
+  const out: { value: string; name: string }[] = [];
+  for (const entry of Array.isArray(option?.options) ? option.options : []) {
+    const inner = Array.isArray(entry?.options) ? entry.options : [entry];
+    for (const o of inner) {
+      if (o?.value === undefined || o?.value === null) continue;
+      out.push({ value: String(o.value), name: String(o.name || o.value) });
+    }
+  }
+  return out;
+}
+
 function catalogFromSession(session: any): ModelCatalog | null {
+  const option = modelOption(session);
+  const values = selectValues(option);
+  if (values.length) {
+    return {
+      default: String(option.currentValue ?? values[0].value),
+      options: values.map((v) => ({ id: v.value, label: v.name })),
+    };
+  }
   const available: any[] = session?.models?.availableModels ?? [];
   if (!available.length) return null;
   return {
@@ -122,12 +246,102 @@ function catalogFromSession(session: any): ModelCatalog | null {
   };
 }
 
+/**
+ * A provider's error, readable. Providers send "429 {json}" with the
+ * sentence that matters buried in error.message; the status stays in
+ * front, since it is part of what says the engine is out.
+ */
+export function providerWords(raw: string): string {
+  const said = raw.trim();
+  const brace = said.indexOf("{");
+  if (brace === -1) return said.slice(0, 600);
+  try {
+    const body = JSON.parse(said.slice(brace));
+    const inner = body?.error?.message ?? body?.message;
+    if (typeof inner === "string" && inner.trim()) {
+      const status = said.slice(0, brace).trim().replace(/[:\s]+$/, "");
+      return (status ? `${status}: ${inner.trim()}` : inner.trim()).slice(0, 600);
+    }
+  } catch {
+    /* not JSON after all; the raw text is the best there is */
+  }
+  return said.slice(0, 600);
+}
+
+/**
+ * A reply that is nothing but a provider error passed through as text:
+ * one short line that opens like an error ("Error: 429 ...", "429 {...",
+ * "API error ...") and names an engine running out. An agent talking
+ * about a limit it met in its work writes a sentence, not that.
+ */
+export function isErrorReply(text: string): boolean {
+  const said = text.trim();
+  if (!said || said.length > 600 || said.includes("\n")) return false;
+  if (!/^(?:(?:api |provider |pi )?error\s*:|\d{3}\b|\{\s*"(?:type|error)")/i.test(said)) return false;
+  return outReason(said) !== null;
+}
+
+/**
+ * Why pi's last turn failed, from pi's own session file. pi-acp keeps a
+ * provider error to itself: pi records the assistant message with
+ * stopReason "error" and the provider's words, and pi-acp answers the
+ * prompt with end_turn and no content. The file is the one place the
+ * reason survives. pi-acp maps its session ids to pi's files in
+ * ~/.pi/pi-acp/session-map.json.
+ */
+export function piTurnError(sessionId: string, since: number, home = homedir()): string | null {
+  try {
+    const map = JSON.parse(readFileSync(join(home, ".pi", "pi-acp", "session-map.json"), "utf8"));
+    const file = map?.sessions?.[sessionId]?.sessionFile;
+    if (typeof file !== "string" || !file) return null;
+    // only the end matters, and a long session file is large
+    const fd = openSync(file, "r");
+    let tail = "";
+    try {
+      const size = fstatSync(fd).size;
+      const length = Math.min(size, 256 * 1024);
+      const buffer = Buffer.alloc(length);
+      readSync(fd, buffer, 0, length, size - length);
+      tail = buffer.toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+    const lines = tail.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let entry: any;
+      try {
+        entry = JSON.parse(lines[i]);
+      } catch {
+        continue;
+      }
+      if (entry?.type !== "message") continue;
+      // the last thing said decides it: a reply or a tool result after
+      // an error means the turn went on and the error is history
+      const message = entry.message;
+      if (message?.role !== "assistant" || message.stopReason !== "error") return null;
+      const at = Date.parse(entry.timestamp);
+      if (!(at >= since - 5_000)) return null;
+      return typeof message.errorMessage === "string" && message.errorMessage.trim() ? message.errorMessage.trim() : null;
+    }
+  } catch {
+    /* no map, no file: nothing more to say than an empty turn */
+  }
+  return null;
+}
+
 /** The catalog an ACP agent serves, from one throwaway session, or null
  * when the agent cannot be asked. ACP has no catalog without a session,
  * so there is no cheaper question. No prompt is sent: nothing is spent,
  * and the child is killed as soon as the answer lands. */
 async function probeCatalog(spec: AcpSpec, cli: string, env: Record<string, string | undefined>): Promise<ModelCatalog | null> {
-  const child = spawn(cli, spec.args, { cwd: tmpdir(), env, stdio: ["pipe", "pipe", "pipe"] });
+  const launch = launchSpec(cli, spec.args);
+  const child = spawn(launch.command, launch.args, {
+    cwd: tmpdir(),
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    windowsVerbatimArguments: launch.windowsVerbatimArguments,
+  });
   // a chatty CLI can fill stderr and stall if nobody reads it
   child.stderr?.resume();
 
@@ -152,7 +366,7 @@ async function probeCatalog(spec: AcpSpec, cli: string, env: Record<string, stri
   } finally {
     clearTimeout(timer);
     try {
-      child.kill("SIGTERM");
+      killTree(child.pid, () => child.kill("SIGTERM"));
     } catch {
       /* already gone */
     }
@@ -180,13 +394,16 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
       const { instanceId, config } = input;
       const listeners = new Set<RuntimeEventListener>();
       interface Turn {
-        /** Ask the agent to stop, then kill it if it will not. */
-        interrupt: () => void;
+        /** Ask the agent to stop, then kill it if it will not. Settles
+         * once its process is gone, or a little after the kill. */
+        interrupt: () => Promise<void>;
         stop: () => void;
         turnId: string;
-        asks: Map<string, (behavior: string, message?: string) => void>;
+        asks: Map<string, (behavior: string, message?: string, source?: string) => void>;
       }
       const active = new Map<string, Turn>();
+      /** Every engine process this instance started, ended on dispose (engine-processes.ts). */
+      const engines = new EngineProcesses();
 
       // replaced the first time an agent tells us what it serves
       const models: ModelCatalog = { default: spec.models.default, options: [...spec.models.options] };
@@ -243,23 +460,62 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
         const argv = [
           ...spec.args,
           ...(spec.turnArgs?.({
-            fullAuto: config.fullAuto,
+            // a turn the owner did not vouch for asks, however the engine is set
+            fullAuto: config.fullAuto && !turn.untrusted,
             model: turn.model,
             effort: turn.effort,
           }) ?? []),
         ];
         widenPath();
-        const child = spawn(config.cli, argv, {
+        // an npm-installed agent is a .cmd on Windows; see launchSpec
+        let launch: ReturnType<typeof launchSpec>;
+        try {
+          launch = launchSpec(config.cli, argv);
+        } catch (e) {
+          throw new Error(`${spec.name} could not start: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        const child = spawn(launch.command, launch.args, {
           cwd: turn.cwd ?? homedir(),
           env: childEnv(turn.env),
           stdio: ["pipe", "pipe", "pipe"],
-          detached: true,
+          // process groups are POSIX; on Windows the kill takes the tree
+          detached: OWN_GROUP,
+          windowsHide: true,
+          windowsVerbatimArguments: launch.windowsVerbatimArguments,
         });
+        engines.add(child);
 
-        const state = { settled: false, text: "", live: false };
-        const asks = new Map<string, (behavior: string, message?: string) => void>();
+        // `banner` is pi-acp's startup listing, which it also sends as an
+        // ordinary agent message (see handleUpdate).
+        // `tools` counts the calls the turn made: a turn that only worked
+        // and said nothing still did something.
+        // `stopping` is set by an interrupt: from then on nothing the agent
+        // asks for is allowed, and a prompt not yet sent is not sent.
+        // `commands` is what the agent said it takes with a slash, once it
+        // has said, and `commandsHeard` wakes a wait for that.
+        // `deciding` is set while an empty turn waits for stderr: the
+        // reply has come, so the agent exiting meanwhile is not the turn
+        // stopping early.
+        const state = {
+          settled: false,
+          text: "",
+          live: false,
+          banner: null as string | null,
+          tools: 0,
+          commands: null as Set<string> | null,
+          commandsHeard: null as (() => void) | null,
+          compacting: false,
+          stopping: false,
+          deciding: false,
+        };
+        const startedAt = Date.now();
+        const asks = new Map<string, (behavior: string, message?: string, source?: string) => void>();
 
         const stop = () => {
+          if (process.platform === "win32") {
+            killTree(child.pid, () => child.kill("SIGTERM"));
+            return;
+          }
           try {
             process.kill(-child.pid!, "SIGTERM");
           } catch {
@@ -286,16 +542,31 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
 
         // An interrupt goes through the protocol first, so the agent can
         // put its tools down properly. The kill is the backstop.
+        //
+        // Whoever stopped it is told so once the process has gone, not
+        // when the cancel was sent. An agent that acts without asking
+        // could otherwise start another tool in the two seconds before
+        // the kill, after the person had been told it was stopped (GitHub
+        // 220). Anything it was waiting to be allowed is refused now.
         let sessionId: string | null = null;
-        const interrupt = () => {
+        // sessions this turn gave up on, which can still talk (see handleUpdate)
+        const leftBehind = new Set<string>();
+        let exited = false;
+        const gone = new Promise<void>((resolve) => child.once("close", () => resolve()));
+        void gone.then(() => (exited = true));
+        const interrupt = async () => {
+          state.stopping = true;
+          for (const finish of [...asks.values()]) finish("deny", "Bloks: the turn was stopped", "turn-ended");
+          if (exited) return;
           if (sessionId) rpc.notify("session/cancel", { sessionId });
           setTimeout(stop, 2_000).unref?.();
+          await Promise.race([gone, new Promise<void>((resolve) => setTimeout(resolve, 3_000).unref?.())]);
         };
 
         const settle = (ok: boolean, stopReason: string | null) => {
           if (state.settled) return;
           state.settled = true;
-          for (const finish of [...asks.values()]) finish("deny", "Bloks: the turn ended");
+          for (const finish of [...asks.values()]) finish("deny", "Bloks: the turn ended", "turn-ended");
           rpc.failPending(new Error("turn settled"));
           active.delete(threadId);
           if (state.text.trim()) {
@@ -313,13 +584,21 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
           const allowId = pick(["allow_once", "allow_always"]) ?? options[0]?.optionId;
           const denyId = pick(["reject_once", "reject_always"]) ?? options[options.length - 1]?.optionId;
 
-          if (config.fullAuto && allowId) {
+          // After a stop, the answer the protocol gives for a cancelled turn,
+          // whatever the agent's mode would have said.
+          if (state.stopping) {
+            return rpc.reply(msg.id, { outcome: { outcome: "cancelled" } });
+          }
+          if (config.fullAuto && !turn.untrusted && allowId) {
             return rpc.reply(msg.id, { outcome: { outcome: "selected", optionId: allowId } });
           }
 
           const requestId = newId();
           const call = params.toolCall ?? {};
-          const finish = (behavior: string, message?: string) => {
+          // `source` is who settled it: the person, unless the clock or the
+          // turn's end did, which the card and the record must not put down
+          // as their decision.
+          const finish = (behavior: string, message?: string, source = "user") => {
             if (!asks.delete(requestId)) return;
             clearTimeout(timer);
             // The card shows the agent's own labels ("Allow once", "Always
@@ -342,10 +621,10 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
               type: "request.resolved",
               requestId,
               behavior: denied ? "deny" : "allow",
-              source: "user",
+              source,
             });
           };
-          const timer = setTimeout(() => finish("deny"), 15 * 60_000);
+          const timer = setTimeout(() => finish("deny", undefined, "timeout"), 15 * 60_000);
           timer.unref?.();
           asks.set(requestId, finish);
           emit({
@@ -354,6 +633,7 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
             requestId,
             requestType: "permission",
             tool: typeof call.kind === "string" ? call.kind : "tool",
+            input: permissionInput(call),
             summary: toolTitle(call),
             // the agent names its own choices, so use its words
             choices: options.map((o) => String(o?.name ?? "")).filter(Boolean).slice(0, 5),
@@ -362,15 +642,60 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
 
         // ── streaming updates ──
         function handleUpdate(params: any) {
+          const update = params?.update ?? {};
+          // A session the turn has left can still be talking, late, on
+          // this same process: a compaction that ran out of time goes on
+          // in the old session after the words went to a new one. Its
+          // words are not the reply and its usage is not the new
+          // session's reading. Once the turn has its session, only that
+          // one counts; before, only the ones it gave up on are dropped.
+          const from = typeof params?.sessionId === "string" ? params.sessionId : null;
+          if (from && (sessionId ? from !== sessionId : leftBehind.has(from))) return;
+          // pi-acp returns its startup listing (pi version, skills,
+          // extensions) in session/new's _meta.piAcp.startupInfo and then
+          // sends the same text as an agent_message_chunk from a timer
+          // after the reply. It arrives after session/prompt has gone out,
+          // so the gate below does not catch it and it would be taken for
+          // the answer. It comes as one chunk; drop it once, by exact text.
+          if (
+            state.banner &&
+            update.sessionUpdate === "agent_message_chunk" &&
+            update.content?.type === "text" &&
+            update.content.text === state.banner
+          ) {
+            state.banner = null;
+            return;
+          }
+          // What the agent can be asked with a slash, which says whether it
+          // can compact its own session (pi's /compact), and how full the
+          // session is, which the spec has the agent send whenever it
+          // changes. Neither is output, so both are read before the gate.
+          if (update.sessionUpdate === "available_commands_update") {
+            const names = (Array.isArray(update.availableCommands) ? update.availableCommands : [])
+              .map((c: any) => (typeof c?.name === "string" ? c.name.replace(/^\//, "") : ""))
+              .filter(Boolean);
+            state.commands = new Set(names);
+            state.commandsHeard?.();
+            return;
+          }
+          if (update.sessionUpdate === "usage_update") {
+            const reading = acpReading(update);
+            // the compaction reads the old session; what it leaves is what
+            // the next request reports
+            if (!state.compacting && (reading.used !== null || reading.window !== null)) {
+              emit({ ...base(threadId, turnId), type: "context.reading", ...reading });
+            }
+            return;
+          }
           // session/load replays history as the same notifications a live
           // turn uses. Until we have sent session/prompt, none of it is
           // this turn's output.
           if (!state.live) return;
-          const update = params?.update ?? {};
           switch (update.sessionUpdate) {
             case "agent_message_chunk": {
               const text = update.content?.type === "text" ? String(update.content.text ?? "") : "";
               if (!text) break;
+              if (spec.statusText?.test(text.trim())) break;
               state.text += text;
               emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: text });
               break;
@@ -378,15 +703,23 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
             case "agent_thought_chunk":
               emit({ ...base(threadId, turnId), type: "item.updated", itemType: "reasoning", tokens: null });
               break;
-            case "tool_call":
+            case "tool_call": {
+              state.tools++;
+              const paths = writesOf(update);
+              const signature = acpSignature(update);
               emit({
                 ...base(threadId, turnId),
                 type: "item.started",
                 itemType: "tool",
                 itemId: String(update.toolCallId ?? newId()),
                 title: toolTitle(update),
+                ...(paths.length ? { paths } : {}),
+                // a command writes what it writes, and says nothing of it
+                ...(update.kind === "execute" ? { mayWrite: true } : {}),
+                ...(signature ? { signature } : {}),
               });
               break;
+            }
             case "tool_call_update": {
               const status = update.status;
               if (status !== "completed" && status !== "failed") break;
@@ -407,6 +740,39 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
           stderr += c;
           if (stderr.length > 8192) stderr = stderr.slice(-8192);
         });
+        /** The last line on stderr saying the engine is out, if any. */
+        const stderrReason = () =>
+          stderr
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line && outReason(line))
+            .at(-1);
+        /**
+         * Gives stderr a moment to catch up with a reply on stdout. They
+         * are separate pipes, so a reason the agent wrote before replying
+         * can still be read after the reply, and on a busy machine it was:
+         * the turn read as empty and the backup was never asked (GitHub
+         * 233). The wait ends early on a reason or the agent exiting, and
+         * whatever reached the pipe by then is read before deciding.
+         */
+        const stderrCaughtUp = async () => {
+          if (!stderrReason() && !exited) {
+            await new Promise<void>((resolve) => {
+              const done = () => {
+                clearTimeout(timer);
+                child.stderr.off("data", heard);
+                resolve();
+              };
+              const heard = () => {
+                if (stderrReason()) done();
+              };
+              const timer = setTimeout(done, STDERR_GRACE_MS);
+              child.stderr.on("data", heard);
+              void gone.then(done);
+            });
+          }
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        };
         child.on("error", (e) => {
           emit({
             ...base(threadId, turnId),
@@ -421,7 +787,7 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
           settle(false, "spawn_error");
         });
         child.on("close", (code) => {
-          if (state.settled) return;
+          if (state.settled || state.deciding) return;
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",
@@ -430,12 +796,56 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
           settle(false, "exit_before_result");
         });
 
+        /**
+         * Ask a resumed session to compact itself, by the agent's own
+         * /compact, and say whether it did. The agent lists its commands
+         * just after the session opens, so a moment is given for that;
+         * one that never lists /compact cannot be asked. What the
+         * compaction says is not the reply, so it runs before the turn
+         * goes live and its words are dropped like a replay's.
+         */
+        async function compactSession(id: string): Promise<boolean> {
+          if (!state.commands) {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, COMMANDS_WAIT_MS);
+              timer.unref?.();
+              state.commandsHeard = () => {
+                clearTimeout(timer);
+                resolve();
+              };
+            });
+            state.commandsHeard = null;
+          }
+          if (!state.commands?.has("compact") || state.settled) return false;
+          state.compacting = true;
+          let running = true;
+          try {
+            const asked = rpc.request("session/prompt", { sessionId: id, prompt: [{ type: "text", text: "/compact" }] });
+            asked.then(
+              () => (running = false),
+              () => (running = false),
+            );
+            const done: any = await within(asked, "compacting the conversation", spec.name, COMPACT_LIMIT_MS);
+            const reason = String(done?.stopReason ?? "end_turn");
+            if (reason !== "end_turn") return false;
+          } catch {
+            // one past the limit is still running, on a session about to
+            // be left; asked to stop, it spends nothing more there
+            if (running) rpc.notify("session/cancel", { sessionId: id });
+            return false;
+          } finally {
+            state.compacting = false;
+          }
+          emit({ ...base(threadId, turnId), type: "context.compacted", trigger: "manual", before: null, after: null });
+          return true;
+        }
+
         active.set(threadId, { interrupt, stop, turnId, asks });
         emit({ ...base(threadId, turnId), type: "turn.started" });
 
         (async () => {
           try {
-            await rpc.request("initialize", CLIENT_HELLO);
+            await within(rpc.request("initialize", CLIENT_HELLO), "starting up", spec.name);
 
             const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
             const cwd = turn.cwd ?? homedir();
@@ -461,15 +871,37 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
             let session: any = null;
             if (cursor) {
               try {
-                session = (await rpc.request("session/load", { cwd, mcpServers, sessionId: cursor })) ?? {};
+                session =
+                  (await within(
+                    rpc.request("session/load", { cwd, mcpServers, sessionId: cursor }),
+                    "reopening the conversation",
+                    spec.name,
+                  )) ?? {};
                 session.sessionId ??= cursor;
               } catch {
-                /* the agent forgot this session; start a new one below */
+                // the agent forgot this session; start a new one below.
+                // Anything still to come about the old one is not this turn's.
+                leftBehind.add(cursor);
               }
             }
-            if (!session) session = await rpc.request("session/new", { cwd, mcpServers });
+            // The session has grown past the lane's line. An agent with a
+            // /compact of its own (pi) compacts it before the words go; one
+            // without, or one whose compaction fails, gets a new session
+            // told the bounded story instead of the old one at full size.
+            if (session && turn.compactFirst && !(await compactSession(String(session.sessionId)))) {
+              leftBehind.add(String(session.sessionId));
+              session = null;
+            }
+            // a cursor that did not lead back to its session is a new one,
+            // and is told the story rather than only the words
+            const words = cursor && !session && turn.handoff ? turn.handoff : turn.text;
+            if (!session) {
+              session = await within(rpc.request("session/new", { cwd, mcpServers }), "opening a session", spec.name);
+            }
             sessionId = session?.sessionId ?? null;
             if (!sessionId) throw new Error(`${spec.name} did not open a session`);
+            const startupInfo = session?._meta?.piAcp?.startupInfo;
+            if (typeof startupInfo === "string" && startupInfo.trim()) state.banner = startupInfo;
 
             // the agent knows its own model list better than we do
             const catalog = catalogFromSession(session);
@@ -477,11 +909,42 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
               models.options = catalog.options;
               models.default = catalog.default;
             }
-            if (turn.model && catalog?.options.some((m) => m.id === turn.model)) {
-              await rpc.request("session/set_model", { sessionId, modelId: turn.model }).catch(() => {});
+            // A model the agent will not switch to must not quietly become
+            // a turn on whatever model it already had: say so and stop
+            // before anything is sent or spent.
+            if (turn.model && turn.model !== catalog?.default && catalog?.options.some((m) => m.id === turn.model)) {
+              const option = modelOption(session);
+              try {
+                if (option) {
+                  await rpc.request("session/set_config_option", {
+                    sessionId,
+                    configId: String(option.id),
+                    value: turn.model,
+                  });
+                } else {
+                  await rpc.request("session/set_model", { sessionId, modelId: turn.model });
+                }
+              } catch (e) {
+                throw new Error(
+                  `${spec.name} could not switch to ${turn.model} (${(e as Error).message}), so the message was not sent. Pick another model, or try again.`,
+                );
+              }
             }
-            if (config.fullAuto) {
-              await rpc.request("session/set_mode", { sessionId, modeId: "yolo" }).catch(() => {});
+            // "yolo" is gemini-cli's mode for acting without asking. Other
+            // agents use modes for something else entirely (pi-acp's are
+            // thinking levels), so only ask for it where it exists.
+            const modes: any[] = Array.isArray(session?.modes?.availableModes) ? session.modes.availableModes : [];
+            if (((config.fullAuto && !turn.untrusted) || (turn.fullAccess && !turn.shared)) && modes.some((m) => m?.id === "yolo")) {
+              try {
+                await rpc.request("session/set_mode", { sessionId, modeId: "yolo" });
+              } catch (e) {
+                // failing safe: the turn still runs, with approvals as they were
+                emit({
+                  ...base(threadId, turnId),
+                  type: "runtime.error",
+                  message: `${spec.name} did not accept full access (${(e as Error).message}), so it may ask before acting.`,
+                });
+              }
             }
 
             emit({
@@ -491,10 +954,17 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
               model: turn.model ?? models.default,
             });
 
+            // Stopped while the session was opening, before the agent had
+            // been told anything: there is nothing to cancel yet, so not
+            // sending is the only way it does not start.
+            if (state.stopping) {
+              settle(false, "interrupted");
+              return;
+            }
             state.live = true;
             const result = await rpc.request("session/prompt", {
               sessionId,
-              prompt: [{ type: "text", text: turn.system ? `${turn.system}\n\n${turn.text}` : turn.text }],
+              prompt: [{ type: "text", text: turn.system ? `${turn.system}\n\n${words}` : words }],
             });
             const usage = result?.usage;
             if (usage) {
@@ -506,10 +976,56 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
               });
             }
             const reason = String(result?.stopReason ?? "end_turn");
-            settle(reason === "end_turn" || reason === "max_tokens", reason === "end_turn" ? null : reason);
+            const ended = reason === "end_turn" || reason === "max_tokens";
+            // A turn can end "well" having failed: pi-acp answers end_turn
+            // after the provider refused (a daily limit, an empty balance)
+            // and keeps the reason. Taken at its word, that was a turn
+            // with no reply, no error, and no backup asked.
+            const failed = ended && sessionId ? spec.turnError?.(sessionId, startedAt) : null;
+            if (failed) {
+              emit({ ...base(threadId, turnId), type: "runtime.error", message: `${spec.name} could not answer: ${providerWords(failed)}` });
+              settle(false, failed.slice(0, 400));
+              return;
+            }
+            // Or the provider's error came through as the whole reply.
+            if (ended && !state.tools && isErrorReply(state.text)) {
+              const said = state.text.trim();
+              state.text = "";
+              emit({ ...base(threadId, turnId), type: "runtime.error", message: `${spec.name} could not answer: ${providerWords(said)}` });
+              settle(false, said.slice(0, 400));
+              return;
+            }
+            // A turn that said nothing and did nothing is never an answer.
+            // Silence reads as the message being ignored, so say so, with
+            // whatever the agent's stderr gave as the reason.
+            if (ended && !state.tools && !state.text.trim()) {
+              state.deciding = true;
+              await stderrCaughtUp();
+              state.deciding = false;
+              if (state.settled) return;
+              const why = stderrReason();
+              emit({
+                ...base(threadId, turnId),
+                type: "runtime.error",
+                message: why
+                  ? `${spec.name} could not answer: ${providerWords(why)}`
+                  : `${spec.name} ended the turn without a reply. Its model may have failed without saying why: check the provider ${spec.name} is set up with, then send this again.`,
+              });
+              settle(false, why ? why.slice(0, 400) : "empty_turn");
+              return;
+            }
+            settle(ended, reason === "end_turn" ? null : reason);
           } catch (e) {
             if (state.settled) return;
-            emit({ ...base(threadId, turnId), type: "runtime.error", message: (e as Error).message });
+            // what went wrong is often in the error's data, not its message
+            const data = (e as any)?.data;
+            const detail = [data?.details, data?.message].find((d): d is string => typeof d === "string" && d.trim().length > 0);
+            const message = (e as Error).message;
+            emit({
+              ...base(threadId, turnId),
+              type: "runtime.error",
+              message: detail && !message.includes(detail.trim()) ? `${message}: ${providerWords(detail)}` : message,
+            });
             settle(false, "rpc_error");
           }
         })();
@@ -522,14 +1038,22 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
         const version = spec.probePath
           ? (onPath(config.cli) ? basename(config.cli) : null)
           : await new Promise<string | null>((resolve) => {
-              execFile(config.cli, ["--version"], { timeout: 8_000 }, (err, stdout) =>
-                resolve(err ? null : stdout.trim().split("\n").pop()!.trim()),
+              const launch = launchSpec(config.cli, ["--version"]);
+              execFile(
+                launch.command,
+                launch.args,
+                { timeout: 8_000, windowsHide: true, windowsVerbatimArguments: launch.windowsVerbatimArguments },
+                (err, stdout) => resolve(err ? null : stdout.trim().split("\n").pop()!.trim()),
               );
             });
         if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
         const hasKey = (spec.keyEnv ?? []).some((k) => input.environment[k] || process.env[k]);
         const signedIn = (spec.authFiles ?? []).some((f) => existsSync(join(homedir(), f)));
-        return { state: "available", version: `${spec.name} ${version}`, authenticated: hasKey || signedIn };
+        // An agent that answers without a sign-in is not "signed out" for
+        // want of one: saying so put up a warning nobody could clear while
+        // the agent was answering fine on a free model.
+        const authenticated = hasKey || signedIn ? true : spec.signInOptional ? undefined : false;
+        return { state: "available", version: `${spec.name} ${version}`, authenticated };
       };
 
       return {
@@ -542,7 +1066,7 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
         catalogReady,
         adapter: {
           provider: spec.kind,
-          capabilities: { sessionModelSwitch: "in-session" },
+          capabilities: { sessionModelSwitch: "in-session", compactsFirst: true },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),
           respondToRequest: async (threadId, requestId, decision) => {
@@ -562,6 +1086,7 @@ export function acpDriver(spec: AcpSpec): ProviderDriver<AcpConfig> {
         dispose: async () => {
           for (const { stop } of active.values()) stop();
           listeners.clear();
+          await engines.end();
         },
       };
     },
@@ -575,10 +1100,12 @@ export const ACP_SPECS: readonly AcpSpec[] = [
     name: "OpenCode",
     command: "opencode",
     args: ["acp"],
-    install: "npm i -g opencode-ai",
+    install: "npm i -g --prefix ~/.local opencode-ai",
     signIn: "run `opencode auth login` to connect a provider",
     // it manages its own provider credentials; nothing of ours to pass
     authFiles: [".local/share/opencode/auth.json"],
+    // OpenCode Zen's free models need no provider at all
+    signInOptional: true,
     // placeholder until session/new reports the real catalog, which for
     // opencode depends entirely on which providers are connected
     probeModels: true,
@@ -627,7 +1154,7 @@ export const ACP_SPECS: readonly AcpSpec[] = [
     name: "Gemini CLI",
     command: "gemini",
     args: ["--acp"],
-    install: "npm i -g @google/gemini-cli",
+    install: "npm i -g --prefix ~/.local @google/gemini-cli",
     signIn: "connect a Gemini key in Settings or run `gemini` to sign in with Google",
     // if a Gemini key is connected in Bloks the CLI picks it up, so one
     // credential covers both the chat engine and the agent
@@ -655,10 +1182,14 @@ export const ACP_SPECS: readonly AcpSpec[] = [
     // pi serves whatever providers its own settings connect, so the
     // catalog is pi's, not ours to guess
     probeModels: true,
-    install: "npm i -g --ignore-scripts @earendil-works/pi-coding-agent && npm i -g pi-acp",
+    install: "npm i -g --prefix ~/.local --ignore-scripts @earendil-works/pi-coding-agent pi-acp",
     signIn: "run `pi` (or `pi-acp --terminal-login`) and configure providers/login",
     // credentials live in Pi; nothing of ours to pass
     authFiles: [".pi/agent/auth.json"],
+    // pi-acp's word that pi is retrying a failed request, and that it
+    // stopped; neither is the reply
+    statusText: /^(?:Retrying(?: \(attempt \d+\/\d+, waiting \d+s\))?\.\.\.|Retry finished, resuming\.)$/,
+    turnError: (sessionId, since) => piTurnError(sessionId, since),
     models: {
       default: "auto",
       options: [{ id: "auto", label: "Auto" }],

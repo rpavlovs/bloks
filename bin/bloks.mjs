@@ -9,7 +9,19 @@
 // It reads its credential from the environment, which is where the turn
 // put it. Nothing is stored, nothing is cached, and there is no login: a
 // credential that outlives its turn would be a credential worth stealing.
-const BASE = process.env.BLOKS_URL || "http://127.0.0.1:8799";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+// the running server writes its port down, and it is not always 8799
+const writtenPort = (() => {
+  try {
+    return readFileSync(join(homedir(), ".bloks", "port"), "utf8").trim();
+  } catch {
+    return "";
+  }
+})();
+const BASE = process.env.BLOKS_URL || `http://127.0.0.1:${/^\d+$/.test(writtenPort) ? writtenPort : "8799"}`;
 const TOKEN = process.env.BLOKS_TOKEN || "";
 
 /** Everything this understands, and what each one is for. */
@@ -19,17 +31,34 @@ const COMMANDS = {
     about: "who this credential says you are",
     run: () => request("GET", "/api/agent/whoami"),
   },
+  goal: {
+    use: "goal",
+    about:
+      "the goal the person set for this conversation, if any: what done looks like, which turn this is of how many, " +
+      "and the check that has to pass. Only the person sets or changes a goal",
+    // nothing to pass: the credential already names the conversation, and
+    // a goal is read here, never set
+    run: () => request("GET", "/api/agent/goal"),
+  },
   agents: {
     use: "agents",
-    about: "everyone in the workspace, with their roles and skills",
+    about:
+      "everyone in the workspace, with their roles and skills, and whether each one's engine can answer now: " +
+      "ready, not signed in, out until a time, or unavailable. Only the person can fix the last three",
     run: async () => {
       const { bots } = await request("GET", "/api/bots?messages=0");
-      return bots.map((bot) => ({
+      // an archived agent cannot answer, so listing it by name only
+      // invites a message nobody reads; the MCP server leaves it out too
+      return bots.filter((bot) => !bot.hidden && !bot.archivedAt).map((bot) => ({
         id: bot.id,
         name: bot.name,
         title: bot.title,
         skills: bot.skills ?? [],
         busy: Boolean(bot.busy),
+        engine: engineWord(bot.engine),
+        // where it sits in the sidebar; `sidebar` has the places
+        section: bot.section ?? null,
+        pinned: Boolean(bot.pinned),
       }));
     },
   },
@@ -37,55 +66,93 @@ const COMMANDS = {
     use: "rooms",
     about: "the rooms that exist, and who is in them",
     run: async () => {
-      const { bloks } = await request("GET", "/api/bloks");
-      return (bloks ?? []).map((room) => ({ id: room.id, name: room.name, members: room.memberIds }));
+      const { bloks } = await request("GET", "/api/bloks?messages=0");
+      // an archived room is out of the sidebar, so it stays out of this list too
+      return (bloks ?? []).filter((room) => !room.archived).map((room) => ({ id: room.id, name: room.name, members: room.memberIds }));
     },
   },
   say: {
-    use: "say <agent-id|room-id> <text…>",
-    about: "say something to another agent, or in a room",
+    use: "say <agent-id|room-id> [--now] <text…>",
+    about:
+      "say something to another agent, or in a room. A busy agent hears it when its turn ends; " +
+      "--now is for a correction to work already under way: it goes into the running turn, read after the step it is on, " +
+      "when your message started that turn or you may stop that agent, and otherwise waits as usual. Rooms keep their order. " +
+      "When the agent cannot answer right now (its engine is not signed in, out until a time, or unavailable), the answer says so in `engine`",
     run: async (args) => {
-      const [target, ...rest] = args;
+      // --now before the text, or as the last word of it, which is where
+      // somebody who thought of it late puts it
+      const at = [0, 1, args.length - 1].find((i) => i >= 0 && args[i] === "--now");
+      const now = at !== undefined;
+      const [target, ...rest] = now ? args.filter((_, i) => i !== at) : args;
       const text = rest.join(" ");
       if (!target || !text) throw new Error("say needs someone to say it to, and something to say");
       // an id is either an agent or a room; try the agent first because
       // that is what most of them are
       try {
-        return await request("POST", `/api/bots/${target}/messages`, { text });
+        return await request("POST", `/api/bots/${target}/messages`, { text, ...(now ? { now: true } : {}) });
       } catch (error) {
         if (!/no such agent/i.test(String(error.message))) throw error;
-        return await request("POST", `/api/bloks/${target}/messages`, { text });
+        const said = await request("POST", `/api/bloks/${target}/messages`, { text });
+        // a room's agents speak one at a time, so nothing joins a turn there
+        return now ? { ...said, note: "Rooms keep their order, so --now does nothing there; this was said in the room as usual." } : said;
       }
     },
   },
+  "take-back": {
+    use: "take-back <agent-id>",
+    about: "take back all your messages still waiting for another agent, and list their words. Already received messages cannot be taken back; send a correction instead. Rooms are not included",
+    run: (args) => {
+      if (args.length !== 1 || !args[0]) throw new Error("take-back needs one agent id");
+      return request("POST", `/api/bots/${encodeURIComponent(args[0])}/take-back`);
+    },
+  },
   recall: {
-    use: "recall <words…>",
+    use: "recall <words…> | recall --id <message-id>",
     about: "look something up in your own past conversations: a decision, a name, a preference",
     run: async (args) => {
+      const flags = parseFlags(args);
+      const me = await request("GET", "/api/agent/whoami");
+      // one message in full, for a hit that was cut short
+      if (flags.id && flags.id !== "true") {
+        return (await request("GET", `/api/bots/${me.botId ?? me.id}/recall/${encodeURIComponent(flags.id)}`)).message;
+      }
       const words = args.join(" ").trim();
       if (!words) throw new Error("recall needs something to look for");
-      const me = await request("GET", "/api/agent/whoami");
       const { hits } = await request("GET", `/api/bots/${me.botId ?? me.id}/recall?q=${encodeURIComponent(words)}`);
-      return hits;
+      return hits.map((hit) => (hit.clipped ? { ...hit, full: `bloks recall --id ${hit.messageId}` } : hit));
     },
   },
   watch: {
-    use: 'watch --folder <path> | --page <url> | --feed <url> --do "<what to do when it changes>" [--name <name>] [--every <minutes>] [--mentions <text>] [--rehearse]',
-    about: "act when a folder, a web page or a feed changes",
-    run: (args) => {
+    use: 'watch --folder <path> | --page <url> | --feed <url> | --check "<command>" --do "<what to do when it changes>" [--name <name>] [--every <minutes>] [--mentions <text>] [--thread <conversation>] [--rehearse]',
+    about:
+      "act when a folder, a web page or a feed changes, or when a cheap check you wrote finds something: " +
+      "--check runs a command every --every minutes without waking you; exit 0 means act (what it prints is passed on), exit 1 means nothing to do. " +
+      "Unless you may run commands without asking, the person approves the command before it runs. " +
+      "The instruction (--do) and folder, page or feed target can each be up to 1,000 characters; a check command can be up to 500. Longer text is refused, not cut. " +
+      "Its turns come to your first conversation, where the person talks to you; --thread sends them to another, by its title (made if missing) or its id",
+    run: async (args) => {
       const flags = parseFlags(args);
-      const kind = flags.folder ? "folder" : flags.page ? "page" : flags.feed ? "feed" : null;
-      if (!kind) throw new Error("watch needs --folder, --page or --feed");
+      const kind = flags.folder ? "folder" : flags.page ? "page" : flags.feed ? "feed" : flags.check ? "check" : null;
+      if (!kind) throw new Error("watch needs --folder, --page, --feed or --check");
       if (!flags.do) throw new Error('watch needs --do "what to do when it changes"');
-      return request("POST", "/api/watchers", {
+      const asked = flags.every ? Number(flags.every) : undefined;
+      const filed = await request("POST", "/api/watchers", {
         kind,
         target: flags[kind],
         instruction: flags.do,
         name: flags.name,
-        every: flags.every ? Number(flags.every) : undefined,
+        every: asked,
         mentions: flags.mentions,
+        ...(flags.thread ? { thread: flags.thread } : {}),
         mode: flags.rehearse ? "rehearse" : "act",
       });
+      // The workspace keeps --every within its bounds without saying so,
+      // and an agent that asked for 2 would otherwise plan on 2 (GitHub
+      // 166). A folder is watched as it changes, so its --every is moot.
+      const every = filed.watcher?.every;
+      if (kind === "folder" || !Number.isFinite(asked) || typeof every !== "number" || Math.round(asked) === every) return filed;
+      const clamped = `Checks every ${every} minutes (the ${every > asked ? "minimum" : "maximum"}; you asked for ${asked}).`;
+      return { ...filed, note: filed.note ? `${filed.note} ${clamped}` : clamped };
     },
   },
   watchers: {
@@ -93,12 +160,94 @@ const COMMANDS = {
     about: "your watchers, and when each last fired",
     run: async () => (await request("GET", "/api/watchers")).watchers,
   },
+  "edit-watch": {
+    use: 'edit-watch <watcher-id> [--do "<what to do>"] [--folder <path> | --page <url> | --feed <url> | --check "<command>"] [--name <name>] [--every <minutes>] [--mentions <text>] [--thread <conversation>]',
+    about:
+      "change supplied fields of one of your watchers, keeping its id and fire history; leave out a flag to keep that field. " +
+      "Use --mentions= or --thread= to clear those fields. The same text limits as watch apply. " +
+      "A changed check command needs approval again unless you already run commands without asking",
+    run: async (args) => {
+      const [id, ...rest] = args;
+      if (!id || id.startsWith("--")) throw new Error("edit-watch needs a watcher id");
+      const fields = { do: "instruction", name: "name", every: "every", mentions: "mentions", thread: "thread" };
+      const kinds = ["folder", "page", "feed", "check"];
+      for (let i = 0; i < rest.length; i++) {
+        const arg = rest[i];
+        const key = arg.split("=")[0].slice(2);
+        if (!arg.startsWith("--") || (!Object.hasOwn(fields, key) && !kinds.includes(key))) throw new Error(`edit-watch does not understand ${arg}`);
+        if (!arg.includes("=")) {
+          if (rest[i + 1] === undefined || rest[i + 1].startsWith("--")) throw new Error(`--${key} needs a value`);
+          i++;
+        }
+      }
+      const flags = parseFlags(rest);
+      const targets = kinds.filter((kind) => Object.hasOwn(flags, kind));
+      if (targets.length > 1) throw new Error("edit-watch takes only one of --folder, --page, --feed or --check");
+      const body = {};
+      for (const [flag, field] of Object.entries(fields)) {
+        if (Object.hasOwn(flags, flag)) body[field] = flag === "every" ? Number(flags[flag]) : flags[flag];
+      }
+      if (targets.length) Object.assign(body, { kind: targets[0], target: flags[targets[0]] });
+      if (!Object.keys(body).length) throw new Error("edit-watch needs at least one field to change");
+      if (Object.hasOwn(body, "every") && !Number.isFinite(body.every)) throw new Error("--every needs a number of minutes");
+      const edited = await request("PATCH", `/api/watchers/${encodeURIComponent(id)}`, body);
+      const every = edited.watcher?.every;
+      if (edited.watcher?.kind === "folder" || !Number.isFinite(body.every) || typeof every !== "number" || Math.round(body.every) === every) return edited;
+      return { ...edited, note: `Checks every ${every} minutes (the ${every > body.every ? "minimum" : "maximum"}; you asked for ${body.every}).` };
+    },
+  },
   unwatch: {
     use: "unwatch <watcher-id>",
     about: "stop one of your watchers",
     run: (args) => {
       if (!args[0]) throw new Error("unwatch needs a watcher id");
       return request("DELETE", `/api/watchers/${args[0]}`);
+    },
+  },
+  history: {
+    use: "history <room-id> [--limit <n>]",
+    about: "read what was said in a room you are in, newest last, so you can join a discussion with its context",
+    run: async (args) => {
+      const [room] = args;
+      if (!room || room.startsWith("--")) throw new Error("history needs a room id, from `rooms`");
+      const flags = parseFlags(args.slice(1));
+      const limit = Math.max(1, Math.min(200, Number(flags.limit) || 40));
+      const [{ messages }, { bots }] = await Promise.all([
+        request("GET", `/api/bloks/${encodeURIComponent(room)}/messages?limit=${limit}`),
+        request("GET", "/api/bots?messages=0"),
+      ]);
+      const names = new Map((bots ?? []).map((b) => [b.id, b.name]));
+      return (messages ?? [])
+        .filter((m) => m.kind === "text" && m.text && !m.deleted)
+        .map((m) => ({
+          id: m.id,
+          at: localStamp(new Date(m.at)),
+          // only the person's own words read as the person's
+          who: m.from ? (names.get(m.from) ?? "an agent") : m.author ? "a member" : "the person",
+          by: m.from ? "agent" : m.author ? "member" : "person",
+          ...(m.from ? { agentId: m.from } : {}),
+          text: m.text,
+        }));
+    },
+  },
+  stop: {
+    use: 'stop <agent-id> ["<why>"]',
+    about: "stop the current turn of an agent you hired, or one you outrank in a room you share; your reason is the next thing it hears",
+    run: (args) => {
+      const [target, ...rest] = args;
+      if (!target) throw new Error("stop needs the agent to stop");
+      const why = rest.join(" ").trim();
+      return request("POST", `/api/bots/${encodeURIComponent(target)}/interrupt`, why ? { text: why } : {});
+    },
+  },
+  archive: {
+    use: 'archive <agent-id> ["<what was finished>"]',
+    about: "archive an agent you hired once its work is done and nothing is left running, waiting or scheduled for it; the person can restore it",
+    run: (args) => {
+      const [target, ...rest] = args;
+      if (!target) throw new Error("archive needs the agent to archive");
+      const note = rest.join(" ").trim();
+      return request("POST", `/api/bots/${encodeURIComponent(target)}/archive`, note ? { note } : {});
     },
   },
   note: {
@@ -111,18 +260,90 @@ const COMMANDS = {
       return request("POST", `/api/bots/${me.botId ?? me.id}/notes`, { text });
     },
   },
+  secret: {
+    use: 'secret "<what it is>" [--hint "<where to find it>"]',
+    about:
+      "ask the person for an API key or other secret: a secure field appears in the chat, and the value is never shown to you there. " +
+      "Once they save it, it is in your environment on your next turn, under the name this answers with. End your turn after asking",
+    run: async (args) => {
+      const flags = parseFlags(args);
+      // the words that are not a flag or a flag's value are the label
+      const words = [];
+      for (let i = 0; i < args.length; i++) {
+        if (!args[i].startsWith("--")) words.push(args[i]);
+        else if (!args[i].includes("=") && args[i + 1] && !args[i + 1].startsWith("--")) i++;
+      }
+      const name = words.join(" ").trim();
+      if (!name) throw new Error('secret needs to say what it is, like "Transistor API key"');
+      const me = await request("GET", "/api/agent/whoami");
+      return request("POST", `/api/bots/${me.botId}/secrets`, {
+        name,
+        ...(flags.hint && flags.hint !== "true" ? { hint: flags.hint } : {}),
+      });
+    },
+  },
   hire: {
-    use: 'hire --name <name> --title <role> [--about <description>] [--skills "a,b,c"]',
-    about: "add a teammate to the workspace",
+    use: 'hire --name <name> --title <role> [--about <description>] [--skills "a,b,c"] [--section <name>] [--pin] [--at <position>]',
+    about:
+      "add a teammate to the workspace, optionally filed into a sidebar section, and pinned there " +
+      "(--pin puts it after the pins already there; --at puts it at that place among them, 1 at the top)",
     run: (args) => {
       const flags = parseFlags(args);
       if (!flags.name) throw new Error("hire needs a --name");
+      const at = flags.at === undefined ? undefined : placeNumber(flags.at);
       return request("POST", "/api/bots", {
         name: flags.name,
         title: flags.title ?? "",
         description: flags.about ?? "",
         skills: flags.skills ? flags.skills.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+        ...(flags.section !== undefined ? { section: flags.section } : {}),
+        ...(flags.pin !== undefined || at !== undefined ? { pinned: true } : {}),
+        ...(at !== undefined ? { position: at } : {}),
       });
+    },
+  },
+  sidebar: {
+    use: "sidebar",
+    about:
+      "how the person's sidebar is arranged: its sections in order (section null is the unfiled list at the top), " +
+      "and in each what is pinned at which position and what else is there. Read it before you file, pin or move anything",
+    run: async () => {
+      const { sections } = await request("GET", "/api/sidebar");
+      return (sections ?? []).map((s) => ({ section: s.name, pinned: s.pinned, others: s.others }));
+    },
+  },
+  file: {
+    use: "file <agent-id|room-id> <section…>",
+    about: "file an agent (yourself or a teammate) or a room you are in into a sidebar section; an empty section unfiles it. A pinned one stays pinned, after the pins already there",
+    run: (args) => {
+      const [target, ...rest] = args;
+      if (!target) throw new Error("file needs an agent or room id, then the section");
+      return place(target, { section: rest.join(" ").trim() });
+    },
+  },
+  pin: {
+    use: "pin <agent-id|room-id> [--at <position>] [--section <name>]",
+    about:
+      "hold an agent, or a room you are in, in place in the sidebar instead of letting it sort by recent activity with the person: " +
+      "at --at among the pins of its section (1 is the top; without it, after the pins already there), and filed into --section first when given",
+    run: (args) => {
+      const [target, ...rest] = args;
+      if (!target || target.startsWith("--")) throw new Error("pin needs an agent or room id, from `sidebar`");
+      const flags = parseFlags(rest);
+      if (flags.section === "true") throw new Error('--section needs a name, quoted when it has spaces: --section "Travel desk"');
+      return place(target, {
+        pinned: true,
+        ...(flags.at !== undefined ? { position: placeNumber(flags.at) } : {}),
+        ...(flags.section !== undefined ? { section: flags.section } : {}),
+      });
+    },
+  },
+  unpin: {
+    use: "unpin <agent-id|room-id>",
+    about: "let an agent, or a room you are in, sort by recent activity with the person again",
+    run: ([target]) => {
+      if (!target) throw new Error("unpin needs an agent or room id, from `sidebar`");
+      return place(target, { pinned: false });
     },
   },
   room: {
@@ -139,25 +360,74 @@ const COMMANDS = {
   },
   routines: {
     use: "routines",
-    about: "what is scheduled, for everyone",
-    run: () => request("GET", "/api/routines"),
+    about: "what is scheduled, for everyone: when each runs next, and which run once",
+    run: async () => {
+      const { routines } = await request("GET", "/api/routines");
+      // what an agent needs to decide whether to file another, not every
+      // past run of every routine
+      return (routines ?? []).map((r) => ({
+        id: r.id,
+        name: r.name ?? r.prompt.slice(0, 60),
+        for: r.targetId,
+        when: r.summary,
+        ...(r.repeat === "once" ? { once: r.date } : {}),
+        ...(r.quiet ? { quiet: true } : {}),
+        next: r.nextRunAt ? localStamp(new Date(r.nextRunAt)) : null,
+        enabled: r.enabled,
+      }));
+    },
   },
   routine: {
-    use: 'routine --prompt <text> --time HH:MM [--days "1,2,3"] [--name <name>]',
-    about: "file a routine for yourself",
+    use: 'routine --prompt <text> (--time HH:MM [--date YYYY-MM-DD] [--quiet] | --every 30m [--between 09:00-18:00]) [--days "1,2,3"] [--name <name>] [--thread <conversation>]',
+    about:
+      "file a routine for yourself: at a --time on --days (0 is Sunday, 6 is Saturday), once on --date to come back to something later, " +
+      "or a check-in --every 15m to 24h, optionally --between two times. Leave out --days and it runs every day. " +
+      "A check-in's turn may answer QUIET when nothing needs the person, and then they are not told; --quiet lets a --time routine do the same. " +
+      "The prompt can be up to 4,000 characters. " +
+      "It runs in your first conversation, where the person talks to you; --thread runs it in another, by its title (made if missing) or its id",
     run: async (args) => {
       const flags = parseFlags(args);
       if (!flags.prompt) throw new Error("a routine needs a --prompt");
-      if (!/^\d{1,2}:\d{2}$/.test(flags.time ?? "")) throw new Error("a routine needs a --time like 09:00");
+      const every = flags.every !== undefined ? interval(flags.every) : null;
+      if (every === null && flags.between !== undefined) throw new Error("--between is for a check-in; give it --every too");
+      if (every !== null) {
+        if (flags.time !== undefined || flags.date !== undefined) {
+          throw new Error("a check-in runs --every so often, not at a --time or on a --date");
+        }
+      } else if (!/^\d{1,2}:\d{2}$/.test(flags.time ?? "")) {
+        throw new Error("a routine needs a --time like 09:00, or --every like 30m for a check-in");
+      }
+      let once = null;
+      let days = [];
+      if (flags.date !== undefined) {
+        if (flags.days !== undefined) throw new Error("a routine runs once on a --date or weekly on --days, not both");
+        once = onceAt(flags.date, flags.time);
+      } else if (flags.days !== undefined) {
+        days = weekdays(flags.days);
+      }
+      const between = flags.between !== undefined ? hours(flags.between) : null;
       const me = await request("GET", "/api/agent/whoami");
       return request("POST", "/api/routines", {
         targetId: me.botId,
         targetKind: "agent",
         name: flags.name,
         prompt: flags.prompt,
-        time: flags.time,
-        days: (flags.days ?? "").split(",").map((d) => Number(d.trim())).filter((d) => Number.isInteger(d)),
+        ...(every !== null ? { every, ...(between ? { activeHours: between } : {}) } : { time: flags.time }),
+        ...(flags.quiet === "true" && every === null ? { quiet: true } : {}),
+        // another conversation, so it does not share context with the rest
+        ...(flags.thread ? { thread: flags.thread } : {}),
+        ...(once
+          ? { repeat: "once", date: once, days: [] }
+          : { days }),
       });
+    },
+  },
+  unroutine: {
+    use: "unroutine <routine-id>",
+    about: "drop a routine, one you no longer need or a one-time one you filed by mistake",
+    run: (args) => {
+      if (!args[0]) throw new Error("unroutine needs a routine id, from `routines`");
+      return request("DELETE", `/api/routines/${encodeURIComponent(args[0])}`);
     },
   },
   jobs: {
@@ -194,6 +464,23 @@ const COMMANDS = {
       const { bot } = await request("PATCH", `/api/bots/${me.botId}/tasks/${me.taskId}`, { title });
       // the task, not the whole agent record and its transcript
       return (bot?.tasks ?? []).find((t) => t.id === me.taskId) ?? { ok: true };
+    },
+  },
+  close: {
+    use: "close",
+    about: "close the conversation you are in once this turn ends, when its work is done (General is never closed)",
+    run: async () => {
+      const me = await request("GET", "/api/agent/whoami");
+      return request("DELETE", `/api/bots/${me.botId}/tasks/${me.taskId}`);
+    },
+  },
+  fresh: {
+    use: "fresh",
+    about:
+      "start a fresh engine session in the conversation you are in, once this turn ends: the transcript stays, but your next turn begins without the old context. Put anything you need to keep in memory first",
+    run: async () => {
+      const me = await request("GET", "/api/agent/whoami");
+      return request("POST", `/api/bots/${me.botId}/tasks/${me.taskId}/fresh`);
     },
   },
   skills: {
@@ -233,6 +520,107 @@ const COMMANDS = {
   },
 };
 
+/** An agent's engine as `agents` lists it: ready, not signed in, out until
+ * a time on this Mac's clock, or unavailable. Nothing from a workspace too
+ * old to say. */
+function engineWord(engine) {
+  if (!engine?.state) return undefined;
+  if (engine.state === "signedOut") return "not signed in";
+  if (engine.state === "out") return `out until ${localStamp(new Date(engine.until))}`;
+  return engine.state;
+}
+
+/** A place among the pins, checked here so a typo is an error now. */
+function placeNumber(raw) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) throw new Error("--at is a place among the pins: 1, 2, 3, with 1 at the top");
+  return n;
+}
+
+/**
+ * Where an agent or a room sits in the sidebar, changed, and read back as
+ * the sidebar now has it. An id is either; the agent is tried first
+ * because that is what most of them are, as `say` does.
+ */
+async function place(target, body) {
+  const id = encodeURIComponent(target);
+  try {
+    await request("PATCH", `/api/bots/${id}`, body);
+  } catch (error) {
+    if (!/no such agent/i.test(String(error.message))) throw error;
+    await request("PATCH", `/api/bloks/${id}`, body);
+  }
+  const { sections } = await request("GET", "/api/sidebar");
+  for (const section of sections ?? []) {
+    const pin = section.pinned.find((row) => row.id === target);
+    if (pin) return { ...pin, section: section.name, pinned: true };
+    const other = section.others.find((row) => row.id === target);
+    if (other) return { ...other, section: section.name, pinned: false };
+  }
+  return { ok: true };
+}
+
+/** The date a one-time routine runs, checked here so a typo is an error
+ * now and not a routine that silently never fires: a real day, at a time
+ * that has not passed yet on this Mac. */
+function onceAt(date, time) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date ?? "");
+  if (!match) throw new Error("--date is a day like 2026-10-08");
+  const [hours, minutes] = time.split(":").map(Number);
+  if (hours > 23 || minutes > 59) throw new Error("--time is a time of day like 09:00");
+  const at = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), hours, minutes);
+  if (at.getFullYear() !== Number(match[1]) || at.getMonth() !== Number(match[2]) - 1 || at.getDate() !== Number(match[3])) {
+    throw new Error(`there is no ${date}`);
+  }
+  if (at.getTime() <= Date.now()) throw new Error(`${date} ${time} has already passed`);
+  return date;
+}
+
+/** The days a weekly routine runs on, checked here so a typo is an error
+ * now and not a routine on the wrong days. Nothing at all means every day;
+ * anything else has to be days 0 to 6, every one of them. */
+function weekdays(raw) {
+  if (raw === "true") throw new Error('--days needs the days, like --days "1,2,3"; leave it out for every day');
+  if (!raw.trim()) return [];
+  return raw.split(",").map((day) => {
+    if (!/^[0-6]$/.test(day.trim())) {
+      throw new Error(`--days is days of the week as numbers, 0 (Sunday) to 6 (Saturday), like "1,2,3", and "${day.trim()}" is not one`);
+    }
+    return Number(day.trim());
+  });
+}
+
+/** How often a check-in runs, in minutes, from the ways somebody writes
+ * it: 30m, 30, 90min, 2h, 1h30m. Checked here against the same bounds
+ * the workspace keeps, so a typo is an error now and not a check-in at
+ * a pace nobody asked for. */
+function interval(raw) {
+  const text = String(raw ?? "").trim().toLowerCase();
+  const match = /^(?:(\d+)\s*h(?:ours?|rs?)?)?\s*(?:(\d+)\s*(?:m|mins?|minutes?)?)?$/.exec(text);
+  const minutes = match && (match[1] || match[2]) ? Number(match[1] ?? 0) * 60 + Number(match[2] ?? 0) : NaN;
+  if (!Number.isInteger(minutes) || minutes < 15 || minutes > 1440) {
+    throw new Error(`--every is how often, 15m to 24h, like 30m or 2h, and "${raw}" is not one`);
+  }
+  return minutes;
+}
+
+/** A check-in's hours, "09:00-18:00", both ends real times on one day. */
+function hours(raw) {
+  const match = /^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/.exec(String(raw ?? "").trim());
+  const minutes = match ? [Number(match[1]) * 60 + Number(match[2]), Number(match[3]) * 60 + Number(match[4])] : null;
+  if (!match || Number(match[1]) > 23 || Number(match[3]) > 23 || Number(match[2]) > 59 || Number(match[4]) > 59 || minutes[0] >= minutes[1]) {
+    throw new Error(`--between is two times on one day, the earlier first, like 09:00-18:00, and "${raw}" is not that`);
+  }
+  const pad = (n) => String(n).padStart(2, "0");
+  return { from: `${pad(match[1])}:${match[2]}`, to: `${pad(match[3])}:${match[4]}` };
+}
+
+/** A moment in this Mac's own time, the way routines are written. */
+function localStamp(at) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`;
+}
+
 /** `--flag value` and `--flag=value`, both of which somebody will type. */
 function parseFlags(args) {
   const flags = {};
@@ -245,9 +633,39 @@ function parseFlags(args) {
       continue;
     }
     const next = args[i + 1];
-    flags[arg.slice(2)] = next && !next.startsWith("--") ? (i++, next) : "true";
+    // an empty argument is a value, as `--flag=` is, not a bare flag
+    flags[arg.slice(2)] = next !== undefined && !next.startsWith("--") ? (i++, next) : "true";
   }
   return flags;
+}
+
+/**
+ * Why the workspace could not be reached, in words an agent can act on.
+ *
+ * fetch says only "fetch failed" and keeps the reason in its cause. From
+ * inside a sandbox with no network access, which is how Codex runs
+ * commands unless told otherwise, even this computer's own address is
+ * refused, and the bare message read as Bloks being down: an agent spent
+ * its turns retrying a command that only needed permission (GitHub 251).
+ * The address is safe to say; the credential is never part of it.
+ */
+function unreachable(error) {
+  const cause = error?.cause;
+  const codes = [cause?.code, ...(Array.isArray(cause?.errors) ? cause.errors.map((e) => e?.code) : [])].filter(Boolean);
+  const again = "Run the same command again with network access allowed";
+  if (codes.some((code) => code === "EPERM" || code === "EACCES")) {
+    return (
+      `network access required: this command was not allowed to reach the Bloks workspace at ${BASE}, which is on this computer. ` +
+      `A sandbox is blocking it. ${again}. Bloks is running and the command is fine as written.`
+    );
+  }
+  if (codes.includes("ECONNREFUSED")) {
+    return `nothing is answering at ${BASE}. Bloks may be restarting, or not running; try again in a moment.`;
+  }
+  return (
+    `could not reach the Bloks workspace at ${BASE}${codes.length ? ` (${codes[0]})` : ""}. ` +
+    `If this ran in a sandbox without network access, that is the cause: ${again[0].toLowerCase()}${again.slice(1)}.`
+  );
 }
 
 async function request(method, path, body) {
@@ -261,6 +679,8 @@ async function request(method, path, body) {
       origin: BASE,
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  }).catch((error) => {
+    throw new Error(unreachable(error));
   });
   const text = await response.text();
   let parsed;
@@ -278,6 +698,11 @@ function help() {
     about:
       "Act on this Bloks workspace as yourself. Every command answers JSON. " +
       "Your credential is in the environment and lasts one turn.",
+    // said here because an agent reads this before its first command, and
+    // a sandbox's refusal otherwise looks like Bloks being down
+    network:
+      "Every command talks to the workspace on this computer, over its own address. " +
+      'In a sandbox without network access a command answers "network access required": run it again with network access allowed.',
     commands: Object.entries(COMMANDS).map(([name, command]) => ({
       use: command.use,
       about: command.about,

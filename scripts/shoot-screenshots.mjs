@@ -62,11 +62,37 @@ try {
     await wait(500);
   }
 
+  // A few conversations on two agents, one unread, so the sidebar's
+  // conversations view has something to show. Made through the API the
+  // app itself uses, after the seed, so the seed stays one transcript.
+  const api = (path, method = "GET", body) =>
+    fetch(URL + path, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: body && JSON.stringify(body),
+    }).then((r) => r.json());
+  const { bots } = await api("/api/bots");
+  const lead = bots.find((b) => b.name === "Head of Marketing");
+  const chief = bots.find((b) => b.name === "Chief of Staff");
+  if (lead && chief) {
+    const general = lead.tasks[0].id;
+    await api(`/api/bots/${lead.id}/tasks`, "POST", { title: "Pricing page copy" });
+    await api(`/api/bots/${lead.id}`, "PATCH", { unread: true });
+    await api(`/api/bots/${lead.id}/tasks`, "POST", { title: "Launch plan review" });
+    await api(`/api/bots/${lead.id}/tasks/${general}/activate`, "POST");
+    await api(`/api/bots/${chief.id}/tasks`, "POST", { title: "Weekly priorities" });
+    await api(`/api/bots/${chief.id}/tasks/${chief.tasks[0].id}/activate`, "POST");
+  }
+
   const browser = await chromium.launch({ executablePath: CHROME, headless: true });
   for (const [file, shot, dark] of [
     ["hero.png", "room", false],
     ["hero-dark.png", "room", true],
+    ["settings.png", "settings", false],
     ["engines.png", "engines", false],
+    ["pairing/desktop-settings.png", "devices", false],
+    // last: opening a conversation changes which one each shot starts on
+    ["conversations.png", "conversations", false],
   ]) {
     const page = await browser.newPage({
       viewport: { width: 1360, height: 880 },
@@ -75,6 +101,9 @@ try {
       timezoneId: "UTC",
     });
     await page.goto(URL, { waitUntil: "networkidle" });
+    // the conversations view is a per-device choice, kept in the browser
+    await page.evaluate((on) => localStorage.setItem("bloks-show-conversations", on ? "on" : "off"), shot === "conversations");
+    await page.reload({ waitUntil: "networkidle" });
     await wait(2500);
 
     // past the intro and the first run, whatever either offers
@@ -99,7 +128,7 @@ try {
       byText("General")?.click(); await sleep(500);
       byText(wantDark ? "Dark" : "Light")?.click(); await sleep(800);
       [...document.querySelectorAll("button")].reverse()
-        .find((x) => (x.getAttribute("aria-label") || "") === "Close" || (x.textContent || "").trim() === "Close")?.click();
+        .find((x) => ["Close", "Back to your agents"].includes(x.getAttribute("aria-label") || "") || (x.textContent || "").trim() === "Close")?.click();
       await sleep(700);
     }, dark);
 
@@ -107,9 +136,16 @@ try {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const byTitle = (t) => [...document.querySelectorAll("button")].find((x) => (x.getAttribute("title") || "") === t);
       const byText = (t) => [...document.querySelectorAll("button")].find((x) => (x.textContent || "").trim() === t);
-      if (which === "engines") {
+      const settingsPage = { engines: "Engines", settings: "General", devices: "Phone and devices" }[which];
+      if (settingsPage) {
         byTitle("Settings")?.click(); await sleep(900);
-        byText("Engines")?.click(); await sleep(900);
+        byText(settingsPage)?.click(); await sleep(900);
+        return;
+      }
+      if (which === "conversations") {
+        [...document.querySelectorAll("button")]
+          .find((x) => (x.textContent || "").trim().startsWith("Launch plan review"))?.click();
+        await sleep(1200);
         return;
       }
       [...document.querySelectorAll("button")]

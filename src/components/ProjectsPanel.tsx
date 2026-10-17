@@ -22,6 +22,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { BrowseFolderButton } from "@/components/ui/browse-folder";
 import { cn } from "@/lib/cn";
+import { useEscape } from "@/lib/useEscape";
 
 interface FolderStanding {
   path: string;
@@ -71,6 +72,7 @@ export function ProjectsPanel() {
   }, [load]);
 
   const close = () => dispatch({ type: "toggleProjects", open: false });
+  useEscape(close);
 
   const open = (project: ProjectRow) => {
     void api(`/api/projects/${project.id}/open`, { method: "POST" }).catch(() => {});
@@ -84,7 +86,7 @@ export function ProjectsPanel() {
       onClick={close}
     >
       <div
-        className="flex h-[76%] w-[600px] max-w-[92vw] animate-pop-in flex-col rounded-2xl border bg-popover p-5 shadow-2xl shadow-[--shadow-color]"
+        className="flex h-[76%] w-[600px] max-w-[92vw] animate-pop-in flex-col rounded-2xl border bg-popover p-5 shadow-2xl shadow-(color:--shadow-color)"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between">

@@ -26,12 +26,16 @@ import { AgentAvatar } from "./Avatar";
 import { TeamMapView } from "./TeamMap";
 import { cn } from "@/lib/cn";
 import { Button } from "@/components/ui/button";
+import { useEscape } from "@/lib/useEscape";
+import { activityContext, type Fill } from "@/lib/contextCard";
 
 export interface Spend {
   turns: number;
   input: number;
   output: number;
   cost: number;
+  /** Turns whose engine reported no tokens. */
+  unmeasured?: number;
 }
 
 interface Running {
@@ -42,7 +46,7 @@ interface Running {
   kind: "you" | "routine" | "job" | "workflow";
   because: string;
   since?: number;
-  context?: { used: number; limit: number; fraction: number };
+  context?: Fill;
 }
 
 interface Waiting {
@@ -105,6 +109,19 @@ function tokens(n: number): string {
   return `${(n / 1_000_000).toFixed(2)}M`;
 }
 
+/**
+ * The tokens a day's spend shows. An engine that reports none (Pi, for
+ * one) would read as "0 tokens", which says nothing was used; this says
+ * the engine did not tell us, and how many turns that covers.
+ */
+function spentTokens(spend: Spend): string {
+  const used = spend.input + spend.output;
+  const unmeasured = spend.unmeasured ?? 0;
+  if (!unmeasured) return `${tokens(used)} tokens`;
+  const turns = `${unmeasured} ${unmeasured === 1 ? "turn" : "turns"}`;
+  return used > 0 ? `${tokens(used)} tokens, not reported for ${turns}` : `tokens not reported for ${turns}`;
+}
+
 function money(n: number): string {
   return n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(3)}`;
 }
@@ -133,7 +150,7 @@ export function ActivityPanel() {
     load();
     const timer = setInterval(load, 3_000);
     return () => clearInterval(timer);
-  }, [load, visible]);
+  }, [load, visible, state.config]);
 
   // Elapsed times tick on their own, or a row would sit at "2m" for as
   // long as the panel is open and read as frozen. A hidden panel has no
@@ -146,11 +163,11 @@ export function ActivityPanel() {
   }, [visible]);
 
   const close = () => dispatch({ type: "toggleActivity", open: false });
+  useEscape(close);
   const botOf = (id: string) => state.bots.find((b) => b.id === id);
 
   const goTo = (row: { botId: string; threadId: string }) => {
-    dispatch({ type: "select", id: row.botId });
-    dispatch({ type: "selectTask", botId: row.botId, taskId: row.threadId });
+    dispatch({ type: "select", id: row.botId, lane: row.threadId });
     close();
   };
 
@@ -187,7 +204,7 @@ export function ActivityPanel() {
     >
       <div
         className={cn(
-          "flex h-[80%] max-w-[92vw] animate-pop-in flex-col rounded-2xl border bg-popover p-4 shadow-2xl shadow-[--shadow-color] sm:p-5",
+          "flex h-[80%] max-w-[92vw] animate-pop-in flex-col rounded-2xl border bg-popover p-4 shadow-2xl shadow-(color:--shadow-color) sm:p-5",
           view === "map" ? "w-[960px]" : "w-[640px]",
         )}
         onClick={(e) => e.stopPropagation()}
@@ -238,9 +255,13 @@ export function ActivityPanel() {
             <span>
               <span className="text-foreground">{activity.today.turns}</span> turns today
             </span>
-            <span>
-              <span className="text-foreground">{tokens(activity.today.input + activity.today.output)}</span> tokens
-            </span>
+            {activity.today.unmeasured ? (
+              <span>{spentTokens(activity.today)}</span>
+            ) : (
+              <span>
+                <span className="text-foreground">{tokens(activity.today.input + activity.today.output)}</span> tokens
+              </span>
+            )}
             {/* A zero here would read as "this was free" rather than as
                 "nobody told us", which is the difference between a number
                 and a guess. */}
@@ -370,9 +391,7 @@ export function ActivityPanel() {
                       <div className="mt-0.5 text-[11.5px] text-muted-foreground">
                         {row.because}
                         {row.since ? ` · ${elapsed(row.since, now)}` : ""}
-                        {row.context && row.context.fraction >= 0.5
-                          ? ` · ${Math.round(row.context.fraction * 100)}% of the window`
-                          : ""}
+                        {activityContext(row.context) ? ` · ${activityContext(row.context)}` : ""}
                       </div>
                     </div>
                   }
@@ -409,7 +428,7 @@ export function ActivityPanel() {
                       <div className="text-[13px] text-foreground">{row.botName}</div>
                       <div className="mt-0.5 text-[11.5px] text-muted-foreground">
                         {row.today.turns} {row.today.turns === 1 ? "turn" : "turns"} ·{" "}
-                        {tokens(row.today.input + row.today.output)} tokens
+                        {spentTokens(row.today)}
                         {activity.costKnown && row.today.cost > 0 ? ` · ${money(row.today.cost)}` : ""}
                       </div>
                     </div>

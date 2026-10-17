@@ -34,6 +34,7 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/cn";
 import { thisComputer } from "@/lib/thisComputer";
+import { useEscape } from "@/lib/useEscape";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
@@ -97,7 +98,7 @@ function RewindableFrame({ src, alt }: { src: string; alt: string }) {
               const v = Number(e.target.value);
               setCursor(v >= tape.current.length - 1 ? null : v);
             }}
-            className="h-1 min-w-0 flex-1 cursor-pointer accent-[--brand]"
+            className="h-1 min-w-0 flex-1 cursor-pointer accent-(--brand)"
             aria-label="Rewind through recent frames"
           />
           <button
@@ -223,7 +224,7 @@ function LocalVmCard({ bot }: { bot: Bot }) {
             variant="secondary"
             size="sm"
             className="mt-2.5"
-            onClick={() => dispatch({ type: "toggleAppSettings" })}
+            onClick={() => dispatch({ type: "toggleAppSettings", open: true, page: "apps" })}
           >
             Set it up in Settings
           </Button>
@@ -236,6 +237,7 @@ function LocalVmCard({ bot }: { bot: Bot }) {
 
 export function ComputerPanel({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
+  useEscape(() => dispatch({ type: "toggleComputer", open: false }));
   const [phase, setPhase] = useState<Phase>("checking");
   const [boxState, setBoxState] = useState<string | null>(null);
   const [polledFrame, setPolledFrame] = useState<{ png: string; mime: string } | null>(null);
@@ -454,16 +456,16 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         {phase === "unconfigured" && (
           <div className="mt-3 rounded-2xl border bg-card p-4">
             <div className="mb-3 text-[12.5px] leading-relaxed text-muted-foreground">
-              Paste a Box API key to give this agent a cloud computer. It spins up right here.
+              Paste a Boat API key to give this agent a cloud computer. It spins up right here.
             </div>
             <ApiKeyRow
               section="box"
-              label="Box API key"
-              placeholder="Paste your Box API key"
+              label="Boat API key"
+              placeholder="Paste your Boat API key"
               info={{
-                text: "Gives agents an isolated remote Linux computer with a desktop and a terminal. Box is a paid service after its trial, so usage can incur charges.",
-                linkLabel: "Open the Box API key guide",
-                linkHref: "https://docs.ascii.dev/box/api-keys",
+                text: "Gives agents an isolated remote Linux computer with a desktop and a terminal. Boat (formerly Box) is a paid service after its trial, so usage can incur charges.",
+                linkLabel: "Open the Boat API key guide",
+                linkHref: "https://docs.boat.dev/api-keys",
               }}
               onSaved={(configured) => configured && setRetry((n) => n + 1)}
             />
@@ -530,8 +532,8 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           </div>
           {!bot.computer && !state.config?.box?.configured && (
             <div className="mt-2 rounded-xl bg-muted/60 px-3 py-2 text-[12px] text-muted-foreground">
-              No cloud box is set up, so Auto will use this computer. Add a Box
-              token below to give this agent a computer of its own.
+              No cloud computer is set up, so Auto will use this computer. Add a Boat
+              API key below to give this agent a computer of its own.
             </div>
           )}
           <div

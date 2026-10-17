@@ -37,6 +37,8 @@ export type LedgerKind =
   | "genesis"
   | "approval"
   | "agent.created"
+  | "approvals.changed"
+  | "engine.installed"
   | "agent.imported"
   | "agent.exported"
   | "agent.archived"
@@ -50,7 +52,8 @@ export type LedgerKind =
   | "policy.changed"
   | "control.taken"
   | "control.released"
-  | "conversation.rewound";
+  | "conversation.rewound"
+  | "setup.imported";
 
 export interface LedgerEntry {
   /** Counts from zero, one per entry, no gaps. */

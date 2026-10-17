@@ -178,7 +178,7 @@ describe("reading a file someone sent", () => {
       over({ memory: { text: "", topics: [{ name: "a.md", text: "x".repeat(LIMITS.topicBytes + 1) }] } }).ok,
       false,
     );
-    assert.equal(over({ skills: [{ id: "a", name: "A", body: "x".repeat(LIMITS.skillBytes + 1) }] }).ok, false);
+    assert.equal(over({ skills: [{ id: "a", name: "A", body: "x".repeat(LIMITS.skillChars + 1) }] }).ok, false);
     assert.equal(
       over({ skills: Array.from({ length: LIMITS.skills + 1 }, (_, i) => ({ id: `s${i}`, body: "x" })) }).ok,
       false,
@@ -252,6 +252,14 @@ describe("what the preview says before you say yes", () => {
     assert.ok(quiet.notes.some((n) => /needs a speech key/.test(n)));
     const loud = describeAgentFile(file, { skillIds: [], instanceIds: [], voiceReady: true });
     assert.equal(loud.notes.some((n) => /needs a speech key/.test(n)), false);
+  });
+});
+
+describe("the engines it ran on", () => {
+  test("the backup engine travels with the main one", () => {
+    const file = round({ bot: { ...bot, backupSelection: { instanceId: "inst-b", model: "gpt-x" } }, exportedAt: 1 });
+    assert.deepEqual(file.agent.model, { instanceId: "inst-a", model: "claude-opus-5" });
+    assert.deepEqual(file.agent.backup, { instanceId: "inst-b", model: "gpt-x" });
   });
 });
 

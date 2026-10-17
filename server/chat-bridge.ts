@@ -144,7 +144,12 @@ function neutralise(platform: ChatPlatform, text: string): string {
   // WhatsApp has no way to ping a whole group from text
   if (platform === "whatsapp") return text;
   if (platform === "discord") return text.replace(/@(everyone|here)/gi, "@\u200b$1");
-  return text.replace(/<!(channel|here|everyone)[^>]*>/gi, "@$1").replace(/<@([A-Z0-9]+)>/g, "@$1");
+  // a user group (<!subteam^ID|@name>) pings every member of it, which is
+  // a whole channel's worth of people by another route
+  return text
+    .replace(/<!(channel|here|everyone)[^>]*>/gi, "@$1")
+    .replace(/<!subteam\^[A-Z0-9]+(?:\|@?([^>]*))?>/gi, (_m, name) => `@${name || "group"}`)
+    .replace(/<@([A-Z0-9]+)>/g, "@$1");
 }
 
 function escape(platform: ChatPlatform, text: string): string {

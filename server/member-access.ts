@@ -151,13 +151,21 @@ export function memberMessage(message: Message, view: MemberView): Message | nul
   if (!visibleTo(message, view)) return null;
   switch (message.kind) {
     case "text":
-    case "notice":
     case "component":
       return message;
+    case "notice": {
+      // picking up a cut-off turn is the owner's to press
+      const { carryOn: _carryOn, ...notice } = message;
+      return notice;
+    }
     case "activity": {
       if (!message.tool) return null;
-      if (view.activityDetail) return message;
-      return { ...message, tool: { ...message.tool, name: toolKind(message.tool.name) } };
+      // A command's words are the owner's alone, whatever the room shares:
+      // redaction catches the shapes it knows, and a member's device is
+      // not the place to find out which it missed.
+      const { command: _command, ...tool } = message.tool;
+      if (view.activityDetail) return { ...message, tool };
+      return { ...message, tool: { ...tool, name: toolKind(message.tool.name) } };
     }
     case "options": {
       if (!message.card) return null;
@@ -204,14 +212,20 @@ const ROOM_FRAMES = new Set(["room.people", "room.sharing", "room.typing", "room
  * how this member sees a room, or null when they are not in it.
  */
 export function memberFrame(payload: unknown, viewOf: (roomId: string) => MemberView | null): unknown | null {
-  const frame = payload as { kind?: string; threadId?: string; roomId?: string; message?: Message } | null;
+  const frame = payload as { kind?: string; threadId?: string; roomId?: string; message?: Message; moved?: boolean; botId?: string; turnId?: string } | null;
   if (!frame || typeof frame.kind !== "string") return null;
   if (frame.kind === "ping") return frame;
-  if (frame.kind === "message" || frame.kind === "message.patch") {
+  if (frame.kind === "message" || frame.kind === "message.patch" || frame.kind === "reply.settled") {
     const view = frame.threadId ? viewOf(frame.threadId) : null;
     if (!view || !frame.message) return null;
     const shown = memberMessage(frame.message, view);
-    return shown ? { kind: frame.kind, threadId: frame.threadId, message: shown } : null;
+    if (frame.kind === "reply.settled") {
+      return shown && shown.kind === "text" && !shown.deleted
+        ? { kind: frame.kind, threadId: frame.threadId, botId: frame.botId, turnId: frame.turnId, message: shown }
+        : null;
+    }
+    // a queued message that went moves to the end on a member's screen too
+    return shown ? { kind: frame.kind, threadId: frame.threadId, message: shown, ...(frame.moved ? { moved: true } : {}) } : null;
   }
   if (ROOM_FRAMES.has(frame.kind)) {
     return frame.roomId && viewOf(frame.roomId) ? frame : null;

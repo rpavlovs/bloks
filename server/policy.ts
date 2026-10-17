@@ -38,11 +38,12 @@
 //
 // Questions are never governed. An agent asking its owner something is not
 // an action, and a rule that answered it would be inventing an answer.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
+import { readSaved } from "./atomic-write.ts";
 
 export type Effect = "allow" | "deny";
 
@@ -116,6 +117,21 @@ export function targetOf(tool: string, input: Record<string, unknown>, who: { bo
     botId: who.botId,
     agent: who.agent,
   };
+}
+
+/**
+ * One Ask per file when a request names several (a patch across files, a
+ * move), so a rule about one of them is not missed because another was
+ * listed first. See decideEach for how they combine.
+ */
+export function targetsOf(tool: string, input: Record<string, unknown>, who: { botId: string; agent: string }): Ask[] {
+  const one = targetOf(tool, input, who);
+  // the path the input names itself and every path in its list, each once:
+  // either can be the one a rule is about
+  const listed = Array.isArray(input?.paths) ? input.paths : [];
+  const paths = [...new Set([one.path, ...listed].filter((p): p is string => typeof p === "string" && p.trim().length > 0))];
+  if (paths.length <= 1) return [paths[0] ? { ...one, path: paths[0] } : one];
+  return paths.map((path) => ({ ...one, path }));
 }
 
 // ── deciding ───────────────────────────────────────────────────────────
@@ -255,6 +271,18 @@ export function decide(rules: Rule[], ask: Ask): Decision {
     }
   }
   return { verdict: "ask", because: "no rule covers this" };
+}
+
+/** The answer for a request that names several files: refused if any
+ * of them is refused, allowed only if every one of them is allowed,
+ * otherwise asked. */
+export function decideEach(rules: Rule[], asks: Ask[]): Decision {
+  const decisions = asks.map((ask) => decide(rules, ask));
+  return (
+    decisions.find((d) => d.verdict === "deny") ??
+    decisions.find((d) => d.verdict === "ask") ??
+    decisions[0] ?? { verdict: "ask", because: "no rule covers this" }
+  );
 }
 
 /** What the agent is told when a rule refuses. It names the rule, because
@@ -400,14 +428,7 @@ export class PolicyStore {
 
   constructor(file: string = RULES_FILE) {
     this.file = file;
-    try {
-      const parsed = JSON.parse(readFileSync(this.file, "utf8"));
-      if (Array.isArray(parsed)) {
-        this.rules = parsed.filter((r) => r?.id && typeof r.value === "string");
-      }
-    } catch {
-      /* no rules yet, which means every question still reaches a person */
-    }
+    this.rules = readSaved<Rule[]>(this.file, [], Array.isArray).filter((r) => r?.id && typeof r.value === "string");
   }
 
   private readonly file: string;

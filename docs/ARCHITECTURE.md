@@ -39,6 +39,14 @@ Everything below follows from that.
 The canonical event stream is the source of truth. The persisted
 transcript and every client view are projections of it.
 
+A lane reads as working from step 2, but its engine is only started at
+the end of step 3, which can be a moment or, with a box to wake or a
+large folder to photograph, a minute. A stop in between has no engine
+turn to interrupt, so it is kept (`stoppedGettingReady`,
+`interruptLane`) and honoured at the last check before `sendTurn`, the
+same check that turns away a turn for an agent archived or held in that
+time: the turn ends there with a notice, and its engine never hears it.
+
 ## Drivers
 
 A driver turns one provider into the contract in `server/contracts.ts`.
@@ -79,6 +87,22 @@ keyed to its own thread id. `activeRoom` redirects that agent's events
 into whichever room it is currently speaking in. That is why an agent
 remembers a room conversation when you DM it afterwards.
 
+Agents pass a room along between themselves three times at most before
+the person has a say (`MAX_AGENT_HOPS` in `server/room-hops.ts`). The
+count travels with the turn, not with the agent (`turnHops` in
+`server/index.ts`, by lane, set as the turn starts): none for a turn
+anything but a room mention started, the person's post in the room
+included, one more than the turn that named it for a mention's, and
+unchanged for a pickup, a backup engine or a retry. So a room chain that
+has ended does not hold what the same agent says from an unrelated turn
+afterwards, in the room or into it with `bloks say`. A mention that
+waits for a busy agent (`server/room-tags.ts`) is delivered at the count
+it was made at. A mention from a turn already at the bound wakes nobody,
+and neither does one still waiting when a round's further rounds run
+out. Either way the room gets one notice saying who named whom and that
+posting there carries on, where the mention used to be stored and
+dropped without a word.
+
 Team formation (`server/teams.ts`) sits on top: a senior agent can emit a
 fenced plan, which becomes an approval card. Only your yes creates the
 agents and the room.
@@ -91,11 +115,26 @@ Plain JSON under `~/.bloks`, written synchronously. No database.
 | --- | --- |
 | `bots.json` | Agent records, model selection, resume cursors |
 | `bloks.json` | Rooms and members |
+| `sidebar.json` | The order of the sidebar's section headings |
+| `turns-in-flight.json` | Every turn while it runs, so one cut off by a stop is picked up |
+| `room-lines.json` | Room lines waiting for a busy agent, or for Bloks to be back |
 | `messages-<id>.json` | One transcript per agent or room, same key space |
 | `config.json` | Connected providers and keys, `0600` |
 | `skills/*.md` | Installed skills |
+| `setup-import.json` | What was brought over from other agent tools, by item: a digest, where it went, and the exact text added |
 | `events/`, `native/` | Canonical events, and raw provider traffic |
 | `checkpoints/` | Content-addressed file versions, one photograph per folder, and the undo records |
+
+Backups of all of it go beside it, never in it: `~/.bloks-backups`, one
+file each (see Backups and restore).
+
+A store writes its whole file on every change. Where losing that file
+would hurt (agents, transcripts, rooms, config and the like) the write
+goes through `server/atomic-write.ts`: to a file beside it, flushed, then
+renamed over the old one, so a crash leaves the old file or the new one,
+never half. Such a file that is there and will not parse is moved aside
+as `<name>.corrupt-<time>` before its store starts empty, so the next
+save cannot write over the only copy.
 
 Checkpoints are not git. On a Mac without the developer tools
 `/usr/bin/git` is a stub that opens an installer, so the store hashes
@@ -125,6 +164,33 @@ carries ciphertext it cannot open. A browser keeps the two keys as
 non-extractable WebCrypto keys and never the token. Routes that mint new
 pairings answer only on this machine.
 
+The line to the relay (`server/relay-link.ts`) is two things. The stream
+in, which carries asks, is watched for silence and redialled. What goes
+back out, answers and event frames, is its own health reading: an answer
+is retried until the relay's 20 second wait is over (the relay settles an
+ask once, so a repeat is harmless), and `delivering` drops when an answer
+is lost or half the recent posts failed. Status shows green only when
+both hold, because a lossy network can keep the stream open while every
+reply goes nowhere.
+
+The relay takes 2 MB a payload, and sealing grows an answer by about 1.8
+times. So a request that arrives through it gets transcripts cut to their
+newest part: `GET /api/bots`, `GET /api/bloks` and a lane switch each fit
+in about 700 KB of messages, shared evenly so one long conversation cannot
+starve the rest, and each transcript says how many `olderMessages` stayed
+behind. `GET /api/bots/:id/messages?thread=&before=` and
+`GET /api/bloks/:id/messages?before=` page back through them. Requests from
+this machine or the same network are not cut. An answer that would still be
+too big is replaced with a short 413, so the phone hears why instead of
+waiting out the relay's timeout.
+
+Both list routes accept `?messages=N` to keep only the newest N messages
+of each conversation, including zero for names and rosters alone. The CLI
+and MCP room discovery use zero; their history reads use the separate room
+messages route. Missing or invalid counts keep the full local transcript,
+so app hydration still has its history. Through Cloud, `olderMessages`
+counts everything omitted, including when the requested tail is zero.
+
 ## Rehearsals
 
 `server/rehearsals.ts` clones the agent's folder (copy-on-write with
@@ -150,19 +216,587 @@ a fresh session that is replayed only what is left. Memory notes are not
 touched; the memory journal has its own undo. Rooms and rehearsal lanes
 refuse.
 
+## Redo
+
+Saving an edit to a message only rewrites its stored text; the agent has
+already read the old words. `POST /api/threads/:lane/messages/:id/redo`
+with the new `text` is the edit that reaches it, in one call: the lane is
+claimed, the running turn is stopped and waited for (and its change
+card, since a turn's files are on record only then), the lane is rewound
+with the rewind's own function, and the words are sent. `GET` on the
+same path is read-only and says what that would take back (messages,
+files as the folder stands now, whether a turn sent anything that
+stays), or that it is not offered and why; the app's line under the
+editor is those numbers. A refusal before the rewind takes nothing back.
+A send that fails after it answers `sent: false` with the words, which
+is what a rewind leaves.
+
+Where it rewinds to is in `server/redo.ts`, read from the transcript
+alone. A checkpoint covers a whole turn, so a message said into a
+running turn (`joined`, written when the turn takes it) goes back to the
+message that started that turn, and the person's messages from the turn
+are sent again in order, as one burst through the lane's queue. A
+message still waiting (`queued`, `unsent`) is refused, as are words that
+are not the person's own typed here (`agent`, `via`, `fromTelegram`) and
+a message that joined a turn somebody else started. What waits above the
+composer is not taken back; it goes after the redone words.
+
 ## Backup engines
 
-`server/failover.ts` decides whether a failed turn failed because its
-engine is out (a usage or rate limit, no credit, an outage, signed out)
-rather than because of the work, from the turn's runtime errors and stop
-reason, and when the engine should be usable again (an epoch, "try again
-in 20m", "resets 3pm", or a default per reason, capped at twelve hours).
+`server/failover.ts` reads a failed turn's runtime errors and stop
+reason for what kind of failure it was (`failureOf`): its engine being
+out (a usage or rate limit, no credit, an outage, signed out), a safety
+refusal by the provider, or anything else. For an engine that is out it
+also reads when it should be usable again (an epoch, "try again in
+20m", "resets 3pm", or a default per reason, capped at twelve hours).
 The engine rests in a per-instance table in memory, so every agent on it
-skips it until then. An agent with a `backupSelection` has its failed
-solo turn started again on the backup, once, with `fallback: true`; the
-engine switch replays the transcript as any switch does. The raw error
-is held back while a backup takes over and shown if none does. Room
-turns do not retry, but the rest applies to their next turn.
+skips it until then. A stop, a stalled tool, a command and a
+conversation too long for the model (folded and asked again on its own)
+are not failures here.
+
+What happens to a failed solo turn (GitHub 284) is decided at its end
+(`recoverTurn` in `server/index.ts`), once per message. A refusal is
+asked again at once in a new session told the bounded story (see
+Compactions), and the refused session is dropped (`store.dropSession`:
+its cursor goes and `lastInstanceId` is emptied, so whichever engine
+comes next is told the conversation); a refusal in a session that was
+already new is not asked again. An engine that is out is not asked
+again. Anything else is asked again once in the same session after
+`RETRY_WAIT_MS` (a minute; `BLOKS_RETRY_WAIT_MS` in tests), with the
+lane kept busy so new messages queue; Stop, an archive or a hold cancels
+the wait. When the retry fails, or there was none to make, the backup
+takes the message once, with `fallback: true`, for whoever asked: any
+`backupSelection` that is usable and is not what just failed (another
+engine, or another model on the same engine, which resumes the same
+session; after an engine that is out, another engine). When nothing can
+take it, the raw errors are shown as they were, one notice says why (no
+backup and where to set one, the backup unavailable, or both errors when
+the backup failed too), and the lane is marked for the person. The raw
+error is held back while a turn may still go on and said in the notice
+that says what happens next.
+
+After the backup answers, that lane stays on it (`stays`) for `STAY_MS`
+(half an hour; `BLOKS_BACKUP_STAY_MS` in tests), or until the own
+engine's rest ends when it rests; the person changing the agent's engine
+or backup ends it. The own engine's stored session is remembered as away
+from the lane (`away`) from the first message another engine answered.
+When it serves the lane again it resumes that session and is told only
+the messages it missed (`catchUpText` in `server/turn-context.ts`),
+unless it has no stored session or what it missed would not fit a new
+session's bounded story, and then it starts a new session told the story
+as any engine switch does. Each turn after a failure (the retry, the
+backup, the first turn back, the next turn after a stop or after the
+agent gave up) opens with one line in its own words saying what failed,
+when, on which engine and model, and what Bloks did (`failureNotes`).
+All of this is in memory: after a restart the own engine is simply tried
+again.
+
+Room turns are not asked again or handed over, since they belong to the
+room's order of speakers. The error shows in the room, an engine that is
+out rests so the agent's next room turn uses its backup, a refused
+session is dropped, and the agent's next turn is told what failed. A
+turn that answers ends a sign-in rest on its engine early, since the
+login works again.
+
+Other agents read the same facts the person sees
+(`server/engine-readiness.ts`). With an agent's credential,
+`GET /api/bots` gives each agent an `engine`: `ready`, `signedOut`, `out`
+with `until` and `reason`, or `unavailable`, with the engine's name. It
+comes from whether the instance is there and switched on, its rest, and
+its own snapshot (installed, signed in), which is asked at most every half
+minute; an agent whose own engine cannot answer and whose backup can is
+ready. `bloks agents` lists it as ready, not signed in, out until a time,
+or unavailable. A message from another agent to one that cannot answer is
+still delivered, and the answer to the sender carries an `engine`
+sentence saying why and who can fix it. No key, path or engine error is
+part of either.
+
+## Compactions
+
+Claude Code compacts its own session when it fills, and says so with a
+`compact_boundary` frame; the driver turns that into `context.compacted`,
+which leaves a one-line marker in the conversation. Its numbers are the
+lane's own request readings, not the engine's compaction metadata, which
+counts differently: before is the last request the session made ahead of
+the boundary, and after is the first one it makes once past it, patched
+into the same marker when it comes (`store.beginCompaction` and
+`resolveCompaction`). Until then the marker says only where it started
+from, and the lane has no fill to show. A request from another engine,
+model or session (a switch, a rewind, a new session after a resume that
+failed) cancels the wait rather than completing it, and a subagent's own
+boundary or usage never marks or measures the lane it works for. With
+idle compaction on (Settings, off by default), a minute
+timer in `server/index.ts` finds Claude Code lanes over 100k tokens whose
+last request was 55 minutes ago, inside an hour's cache, and sends
+`/compact` into the resumed session with the same tools and system prompt
+as the lane's last turn, so it reads the cache rather than writing it
+again (`idleCompactionDue` in `server/context.ts`). It runs as the lane's
+turn, so anything said meanwhile queues, but nothing else a turn does
+happens: no message in the person's name, no unread, no other agent or
+room. Two run at a time, and a lane whose window has passed is skipped.
+
+How full a lane is comes from the engine, not from the turn's token
+total: `context.reading` events carry the latest request's size and the
+window, which Claude Code gives per message (`promptSize`) and in its
+result (`modelUsage[model].contextWindow`), Codex in
+`thread/tokenUsage/updated` (`last.inputTokens` against
+`modelContextWindow`), an ACP agent in `usage_update` (`used`, `size`),
+and an OpenAI-compatible provider in each response's `prompt_tokens`, one
+reading per request of a tool loop. The lane keeps the latest as
+`reading`, with the engine and model that made it (`store.noteReading`),
+and `laneFill` uses it only while the agent is on that engine and model,
+with the table in `server/context.ts` as the fallback window, which the
+lane then says is the table's. Without such a reading, or with neither
+an engine's window nor a model the table knows, the lane has no fill at
+all: the 32k default stays a margin for the fold, never a number shown.
+The Usage tokens, the turn's own spend, are kept apart and counted as
+before. The chips, the sidebar rows and Activity show that fill past
+their own thresholds, and the composer of an agent's chat shows it as
+one ring from the first answer on (`src/components/ComposerRing.tsx`),
+only while the lane has a reading. Hover or a tap opens a card: the
+tokens used of the window ("about" when the window is the table's), a
+line when Bloks summarised the earlier part, and what the engine's plan
+has left. Claude Code reports its plan's windows in `rate_limit_event`
+(`unifiedWindows`) and Codex in `account/rateLimits/updated`; each engine
+instance keeps only the latest, in memory (`server/plan-usage.ts`), and
+`GET /api/plan-usage` serves it to this Mac alone, never to a phone, a
+remote window or an agent, and it is never put in a prompt. A room has
+no ring, since every agent in it has a context of its own. A turn that
+answered with no tokens reported
+(Pi does not report any) counts as unmeasured, and Activity says "not
+reported" rather than showing zero.
+
+A native session sends its whole context again on every tool call, so a
+long one turns one tool-heavy message into millions of input tokens
+(GitHub 222, 223). Before a turn resumes a session whose reading is over
+the line (the lower of 60% of the window and a ceiling, 200k by default,
+set in Settings as "Compact before a long turn" or off), the session is
+compacted first (`compactBeforeTurn`). Claude Code is sent `/compact`
+into the resumed session from `server/index.ts` with the turn's own tools
+and system prompt, through the idle compaction's books (`compactThenSend`),
+and the turn goes on once it ends; a person who stops the turn meanwhile
+stops both. Codex is asked in the same process with
+`thread/compact/start`, and an ACP agent with its own `/compact` when it
+lists that command. When the engine cannot (an older app-server, an agent
+without the command, a compaction that fails), the driver opens a new
+session and sends the turn's `handoff` instead; an engine with no way to
+compact at all gets a new session from the start. This applies to direct
+and room lanes alike. A compaction that did not bring a lane under the
+line is not asked for again until it has grown a tenth past where that
+one started. A turn already running is never interrupted to compact; it
+is checked again before the next one.
+
+Whenever a new session starts on an existing conversation (an engine
+switch, a backup taking over, a rewind, a cursor that no longer resumes,
+or a replacement after a compaction it could not do), the story it is
+told is bounded (`boundHandoff`): the running summary, then recent
+messages whole while they fit, each clipped to a quarter of the budget,
+which is 15% of the window and never more than 16k tokens. When that
+leaves messages out and the agent's engine can summarise, the older part
+is folded into the summary first; otherwise the message says how many
+were left out. The thread itself keeps every message.
+
+The same cache is why a resumed Claude Code session keeps its system
+prompt byte for byte (`server/standing-prompt.ts`). The agent's
+MEMORY.md and the notes about the person stay as they were when the
+session started; a change since the agent last heard is said ahead of
+the turn's message, after the cached history. In a room, the room's
+recent conversation goes there too, only the lines this session has not
+been shown. A fresh session gets everything current in its system
+prompt, and other engines get the whole persona each turn as before.
+
+## Turns cut off
+
+A turn the Mac slept through, or one running when Bloks stopped, is
+picked up rather than left dead, and both are picked up the same way
+(`server/cut-off.ts`): a notice the person reads, and a separate note
+telling the agent to carry on and to check what already happened before
+repeating anything, naming the tool call that was running. Neither is a
+message from the person, and the original request is not sent again.
+
+Sleep is noticed while Bloks runs. A stop is not, so every turn is
+written to `turns-in-flight.json` when it starts and taken out when it
+ends, which makes a crash count as much as a quit. At startup each one
+left is taken off the list and then picked up once, in the same lane,
+room and engine session, for whoever asked for it; queued messages for
+that lane go in the same turn. One somebody stopped, a workflow step, or
+one whose agent was archived is dropped. One left longer than the queued
+message window (twelve hours), or a pickup cut off in its turn, gets a
+notice with Continue instead. Questions and approvals the old engine was
+waiting on are marked cut off, and `/respond` delivers nothing for an ask
+this run did not raise.
+
+A settings change rebuilds only the engines it changes (a custom
+endpoint, a key, a provider connected), and the rest keep running. A
+turn on a rebuilt engine is ended where it stands, which frees the lane,
+and picked up on the new engine the same way; one whose engine was
+removed says so instead. An engine updated from the app is rebuilt too,
+because engines read their models when they are built, but only once
+nothing is running on it: right away when it is quiet, otherwise when
+its last turn ends.
+
+## Restarting for an update
+
+Before a planned restart Bloks drains (`server/drain.ts`): nothing new
+starts, what is running carries on, and the restart waits until nothing
+is running or a deadline passes (twenty minutes unless asked otherwise,
+an hour at most). The updater asks for it before it installs, and
+`bloks-server drain` does the same for a server you restart yourself;
+both go through `/api/maintenance/drain`, which answers only this
+computer. A turn still running at the deadline is cut off and picked up
+like any other, from the record it already has. While the updater
+waits, the update card says how many turns it is waiting for and how
+long is left, and offers to restart now (what is running is picked up
+after) or to call the drain off and update later
+(`electron/drain-wait.mjs`).
+
+The restart itself is a chain, and every link in it has a time limit
+(`electron/update-restart.mjs`): one more look for a newer release, the
+drain, the native installer having the update, then the quit that hands
+over to it. A link that fails or runs out of time does not stop the
+next. Once the drain is past, nobody can call the restart off and the
+process ends: by the orderly quit when that works, by closing a window
+that stayed open ten seconds later, and by a plain exit ten seconds
+after that. On macOS the installer swaps the app only once the running
+one has gone, so an app that does not exit is an update that never
+installs. Each step is written to the updater's log (`updater.log` in
+the app's log folder), each line starting `restart:`. Before the quit a
+note of the version being left goes into the app's data folder, and a
+start that finds itself still on that version says on the update card
+that the update did not install, once, with the offer to try again or
+to get the installer from bloks.dev.
+
+Nothing that arrives meanwhile is turned away. `startTurn` is where every
+turn starts, so it is where a drain holds them: words for one of an
+agent's lanes wait in that lane's queue, as they would behind a busy
+turn, and that queue is the transcript, so it outlives the restart and
+joins any pickup. Room lines wait the way they do for a busy agent, now
+on disk too. What has no queue waits where it already would: a routine
+stays due and fires late, inside its grace window; a workflow step waits
+for its lane; a job stays open on the board; a watcher set to rehearse
+keeps the change unseen and sees it again; an email waits in its line,
+which is in memory, as it does for a busy Email lane. Questions, approvals and
+workflow gates are left exactly as they are. A drain lives in memory,
+so a restart ends it, and calling it off lets everything held go at once.
+One whose restart never comes ends itself the same way, ten minutes past
+its deadline.
+
+## Backups and restore
+
+`server/backup.ts` writes the whole data folder to one file in
+`~/.bloks-backups` (0700), named with the local date and time, the
+version, and `-auto` or `-before-restore` for those kinds. It is a
+gzipped tar, so any archive tool opens it: `bloks-backup.json` first (the
+format, version, time, kind, and whether the Undo history and saved keys
+are inside), the workspace under `bloks/`, and `manifest.json` last, with
+every file's size, mode, time and SHA-256, written last so each file is
+read once and hashed on the way through. A file is read from an open
+handle up to the size it had when opened, which is one whole version of
+a store (stores replace their files by rename) and a clean prefix of a
+log being appended to. Left out, and named in the manifest: `native/`,
+browser profiles, rehearsal copies (their `index.json` stays), caches,
+dependency folders anywhere (`node_modules` and friends, never `.git`),
+temp files, sockets and links, the server's `server.lock` and `port`,
+and `checkpoints/` unless the Undo history is asked for.
+
+With a passphrase the archive is sealed: scrypt (N 2^17, r 8, p 1) gives
+an AES-256-GCM key, and the archive goes in pieces of a megabyte, each
+with its own nonce and bound to the header, its number and whether it is
+the last, so a piece changed, moved or cut off fails to open. The header
+stays readable, with the summary and an HMAC of the key, so a list needs
+no passphrase and a wrong passphrase is told apart from a changed file.
+Saved keys in `config.json` (the paths in `SECRET_PATHS`, paired device
+digests included, since the relay's keys come from them) go only into a
+sealed backup; otherwise they are taken out of the copy and the manifest
+lists where, and old copies such as `config.json.corrupt-*` stay out too.
+Verifying reads a backup end to end and holds each file to the manifest.
+
+The daily backup is looked for every ten minutes and made when nothing is
+running (the drain's own idle test), no drain or other backup is under
+way, and the newest automatic one is a day old. The newest seven are
+kept; manual backups and the ones taken before a restore are never
+pruned. It is on unless `backups.auto` is false, and never holds keys.
+
+A running server holds every store in memory and writes it back on each
+change, so a restore never swaps the folder under it. The routes
+(`/api/backups`, this computer only, never a paired device or an agent's
+credential) take it in steps: open the backup far enough to know it is
+one and the passphrase is right, drain (ten minutes unless asked), back
+up the workspace as it is (`-before-restore`), unpack the archive into
+`~/.bloks.restoring-<time>` beside the data folder and check every file,
+then write `~/.bloks.restore-pending.json` and stop the server the way a
+quit does. `server/pending-restore.ts` is the first import of
+`server/index.ts`, so on the next start, before any module reads the
+folder, it renames `~/.bloks` to `~/.bloks.before-restore-<time>` and the
+unpacked copy into its place; it waits while another live Bloks holds the
+folder, and a swap that cannot finish puts back what it moved. A backup
+without keys gets this computer's keys carried into its `config.json`.
+Paths in an archive must stay under `bloks/` with no `..`, links and
+devices are refused, and nothing is written for an entry that fails. The
+desktop page relaunches the app when the server says it is restarting,
+and a browser waits for a new pid. `bloks-server backup` writes from its
+own process, and `bloks-server restore FILE` does the whole thing with
+Bloks stopped, or copies the file into the backups folder and hands it to
+the running server.
+
+## Queued messages
+
+What the person says to a lane in the middle of a turn goes into that
+turn when its engine can take it (`steerLane` in `server/index.ts`),
+from the app, the phone or Telegram alike. Claude Code keeps the stdin
+it was given the prompt on open and reads another stream-json message
+after the step it is on; Codex takes it through `turn/steer`, naming the
+turn it is running. A driver says it can with `steerTurn` in
+`server/contracts.ts`. The message joins the conversation as the turn
+takes it, after what the agent has said so far, and nothing is
+interrupted; Stop is still how to do that. Claude's stdin is closed at
+the first `result`, since that is what lets the process end; words
+written just before it are answered by the same process in the same
+turn, which ends on the last result. When the turn cannot take them (the
+engine refused, its input is closed, the turn is a room's, someone
+else's, or a quiet session being compacted, or Bloks is draining for a
+restart), they wait as below. A Telegram follow-up goes into the turn
+its chat is waiting on, and one answer covers both; a turn that did not
+start from Telegram takes the words too, or they wait, and either way
+the answer goes back to the chat instead of a refusal.
+
+Command/Ctrl+Enter in the app stops before submitting the follow-up
+(`src/lib/sendMessage.ts`). When a conversation is named, both requests
+name it. It waits for `/interrupt` to answer, then sends the message with
+`steer: false`. Stop acknowledges the request, not necessarily the engine's
+exit, so the message waits in the normal queue until that turn settles
+instead of joining the dying turn. Either request's failure uses the normal
+draft recovery; a failed Stop submits nothing. Plain Enter still steers.
+
+An empty composer receives failed text and attachments back immediately.
+If newer words or chips occupy it, `src/lib/drafts.ts` retains the failed
+payload separately under that conversation's existing draft key. The
+composer lists each saved submission with explicit Restore/Discard actions.
+Restore fills an empty box and never sends; an occupied box keeps both.
+Accepted input and recovery update the current draft synchronously before
+React renders, so batched failures cannot replace one another. This stays
+in window memory across conversation navigation, not reload or restart,
+and does not imply the server failed to receive a message whose reply was
+lost. Room composers keep their existing draft contract.
+
+Another agent can ask for the same thing when what it says changes the
+work under way: `bloks say <agent> --now <text>`, which is `now: true`
+on `POST /api/bots/:id/messages` from an agent's credential. It is
+honoured only when the sender's own message started the running turn
+(`replyingTo`) or the sender may stop that agent anyway (`mayStop`),
+both decided in `mayJoin`; joining is the gentler of the two, since
+nothing is thrown away and the agent reads it after the step it is on.
+Then it goes in through `steerLane` like the person's words, the engine
+hears who it is from, the conversation keeps it as that agent's
+message, and the sender is told the agent reads it after its current
+step. Otherwise, or when the turn cannot take it, it waits as below and
+the sender's answer says why. Without `--now` nothing changes, and a
+room never takes it: its members speak one at a time.
+
+Everything else said to a lane in the middle of a turn (another agent,
+a webhook, a watcher, a routine, or the person on an engine that cannot
+take words mid-turn) is written down at once, flagged `queued`, and
+waits in memory (`steerQueues` in `server/index.ts`) until the lane
+settles; everything waiting goes in one turn. None of it is part of the
+conversation until then. The app shows it in a strip
+above the composer, where your own can be reworded, sent now or taken
+back, and when they go `deliverQueued` moves them to the end of the
+transcript (`Store.moveToEnd`, ids unchanged) with a `message.patch`
+frame marked `moved`. So the stored order is the order the agent heard
+things in, and everything that reads it (a room's history, a replayed
+transcript, an export) agrees. A room's own queue behind its current
+round, and a pickup after a restart, deliver the same way.
+
+## Agents writing to agents
+
+`bloks say` to an idle agent starts a turn there, a paid one, and a
+turn's own budget (`TURN_BUDGET` in `server/agent-cli.ts`) starts again
+in every one of them, so it bounds a turn and not the back and forth.
+That is counted on its own: each lane's latest turn has a place in a
+chain (`agentChain` in `server/index.ts`), 0 when the person, a routine,
+a watcher, a webhook or an email started it, and one more than the
+sender's turn when an agent's message did, an agent writing to itself
+included. A message that would start or wait for a turn past the
+workspace's `agents.turnLimit` is refused, with no message kept for
+later delivery. It defaults to twelve (`MAX_AGENT_CHAIN` in
+`server/agent-chain.ts`) and takes a whole number from 1 to 50; there is
+no Off, because the whole-chain count is the bound on cost. Settings,
+General, Working with agents exposes the live setting. A malformed
+stored value reads as twelve, and one above 50 as 50. The recipient's
+notice explains who was not reached, the cost bound, how the count
+starts over and where the limit is set; the sender is only told to
+finish its turn and say where things stand. Whoever the person writes to
+next starts over at 0, whether their words start the turn, join it, or
+are among what it takes when it goes. A burst of waiting messages takes
+the furthest place among them, and a pickup, a backup engine or a retry
+keeps the place of the turn it continues. The places live in memory,
+with the queue they ride on, rather than on the lane record: a restart
+begins every chain again, which lets a loop that spans one run a stretch
+more at most, and leaves nothing on disk to clear when a lane closes.
+
+Rooms and the job board carry the count too, or an agent could keep
+another going through them. An agent naming someone in a room, from the
+room or from a conversation, hands the turn it wakes a place one past
+its own; past the limit nobody is woken and the room says why. A room
+also keeps the latest such place (`roomChain`) for a turn that waited,
+behind a busy agent or a round, and anyone but an agent posting there
+clears it as the post goes out. A job posted from an agent's turn
+records the place its taker's turn would take; past the limit it is not
+offered, and the person offering it again clears it. Routines and
+watchers an agent files or changes do the same (`chain` on each): past
+the limit a routine's attempt is recorded as held without consuming its
+scheduled slot, and a watcher holds without looking. When the live value
+allows, an enabled routine runs at its next allowed occurrence under its
+existing missed-run grace, and a watcher rechecks on its next arm,
+clearing the stale error on a good look. A once routine disabled by
+older code is not revived. A once slot past grace stays enabled but
+needs a manual run or deletion; it still counts against the routine
+limit. One latest hold record is kept beside the normal run history, so
+repeated holds cannot evict real runs. Agents cannot file workflows. A
+room has a shorter bound of its own as well (`MAX_AGENT_HOPS`, see
+Rooms), carried with the turn the same way; a mention past both leaves
+one notice in the room, not two.
+
+Changing the limit changes where the line is, never the count: a running
+turn keeps its place and is judged by the live value at its next handoff.
+The setting API stays unavailable to agents and to a shared room's
+members.
+
+A refusal is said where the person will find it
+(`chainNotice`): a notice in the conversation the next turn would have
+gone on in, naming the whole count and its last step, that conversation
+marked unread, and the phone woken for it as for a goal blocked on them.
+A routine or a watcher says so once when its hold starts, not at every
+tick or look. Direct refusals dedupe consecutive notices by sender,
+recipient, depth and limit, ignoring the redacted excerpt. A person's
+message between refusals allows a fresh notice. These notices retain
+`chainHeld`, and their phone and desktop title names the limit.
+
+## Goals
+
+A conversation can be given a goal, and then keeps working turn after
+turn without anyone typing "keep going": what done looks like, a command
+that has to exit 0 for it to count (optional), and how many turns it may
+take, twenty unless the person says otherwise and a hundred at most.
+`/goal` in an agent's chat sets one, with `check:` and `turns:` on lines
+of their own; on its own it opens the same dialog as Set a goal in a
+conversation's menu, which is `PUT /api/bots/:id/tasks/:taskId/goal`
+(`PATCH` pauses, resumes or gives it more turns, `DELETE` clears it).
+`/goal` is Bloks' own: the messages route reads it before anything
+else, so it never reaches an engine, where a command of that name would
+run as one. The goal lives on the lane (`TaskRecord.goal`), goes with it
+when the lane is closed or cleared, and `clientBot` ships a summary for
+the chip over the composer.
+
+Each turn in the lane that ends well is judged (`judgeGoal` in
+`server/index.ts`; the rules and words are `server/goals.ts`). The check
+runs first, in the lane's folder, through the shell as a watcher's check
+does (`runCheck`): its own process group, stopped after five minutes,
+the end of its output kept. Then the agent's own engine is asked once,
+through the one-shot call a fold uses (`generateText`), for a verdict as
+JSON: done, continue or blocked, with a reason and a next step. With no
+small model, or an answer that is not a verdict, the check decides, then
+the agent's own last line ("Goal: done", or "Goal: blocked," and what it
+needs), which every goal note asks for. Done needs the check to pass,
+whatever the judge read. Done and out of turns end the goal with a
+notice; blocked hands it back with what it needs and the lane reads as
+waiting on the person; continue queues the next turn.
+
+That turn goes in through the lane's queue (`queueGoalTurn`) as a
+message marked `via: "goal"`: a note from Bloks, never the person's
+words, so it names no skill, runs no engine command, and keeps the chain
+place of the turn it follows (see Agents writing to agents), and the
+chat labels it as Bloks'. It is counted before it is queued and none is
+queued past the budget, so the budget is a hard cap whatever the judge
+says. The person comes first. Whatever waited for the lane goes before
+the goal is judged, and a verdict is acted on only while nothing waits
+and no other turn has started in the lane since the one it judged
+(`laneTurns`). The person's Stop pauses the goal and takes back a next
+turn already queued; their answer to a blocked goal picks it up again
+after the turn that hears it; a turn that fails pauses it. A turn picked
+up after a cut off, handed to a backup or asked again after a fold is
+not over yet, and is judged when it is. A room's turn or an engine
+command in the lane is not the goal's work, but the goal is judged after
+it on the lane's own last reply rather than left with nothing to start
+its next turn. Goals stay out of shared rooms' lanes, the lane for
+unlisted mail and rehearsals. One left active after a restart with
+nothing running or waiting in its lane was between turns when Bloks
+stopped, and is paused rather than judged again unattended.
+
+While a goal runs, its turns' replies raise no banner; where it ended up
+does, blocked as loudly as a question, and blocked also wakes the
+owner's phone. An agent reads its goal with `bloks goal`
+(`GET /api/agent/goal`, which reads the goal of the lane its credential
+was minted for), and nothing on its list reaches the routes that set
+one.
+
+## The same call, again and again
+
+An agent that has lost the thread can call one tool with the same
+arguments over and over, and every call sends the whole session to the
+model again. A driver that hears a call's arguments puts a `signature` on
+its `item.started`: the tool and the arguments, normalised (keys in
+order, runs of spaces made one) and hashed (`callSignature` in
+`server/repeats.ts`), so the arguments, which can carry a key, ride on no
+event. Claude Code gives `block.input`, Codex the item's own request
+fields (a command and its folder, a patch's changes, an MCP call's server,
+tool and arguments, a search's query), an ACP agent its `rawInput` when it
+is not empty, and an API model the arguments it wrote. Antigravity and the
+cloud computer name the tool and nothing more, so their calls are not
+counted.
+
+`RepeatWatch` counts each running turn's calls by signature, from nothing
+at every `startTurn` and forgotten at its end. When a call reaches 5, 10
+or 20 and that is higher than the turn's chip, its activity row gets
+`repeated` and the row that had it loses it (a `message.patch`), so a turn
+shows one chip, "Same call repeated 10 times", on the run of tool calls
+it sits in (`src/components/ToolRun.tsx`). The first call to reach 20 also
+posts one notice saying the turn may be stuck and can be stopped. Nothing
+is stopped for the person. The notice does not name the call, since a
+shared room's members may see only a tool's kind. Memory is bounded: a
+turn keeps 256 distinct calls, forgetting the one used longest ago (never
+the loop, which is the call it keeps making), and 512 turns at most.
+
+## A finished turn, folded
+
+While a turn runs the chat shows everything it does. Once it has ended,
+what it did on the way folds into one line above its result ("Worked 8
+min · 27 commands · 4 files", then the agents it wrote to), and a click
+opens the work in place. Under the fold go its progress messages, tool
+calls, rows for messages to and from other agents, the message that
+started it when that was not the person's (another agent's, a routine's,
+a watcher's, a webhook's, a goal's note), cards already answered, the
+screen it ended on and the changes card. Left out are the person's own
+words, the turn's last reply, cards that still wait for them, artifacts,
+components and every notice. Quiet check-ins and messages taken back
+keep the rows they have. `src/lib/turnFold.ts` decides all of it from
+the transcript, and no fold is stored.
+
+A turn begins at a message with `role: "user"` and ends where the next
+one begins; the last has ended when its lane is no longer working
+(`turnRunning`, which takes a lane paused on a live approval as still
+going). Its result is the last thing the agent said in its own chat.
+The one thing the transcript could not say afterwards is that a message
+went into a running turn instead of starting one, so `steerOne` marks
+those `midTurn`. The person's words in the middle of a turn stay on the
+page and split its work into a fold on either side. A transcript from
+before the mark takes each such message as the start of a turn, which
+leaves one more progress message showing and never hides a reply.
+
+The line names who asked when it was not the person, and another
+agent's name there opens the exchange, as the "After a message from"
+link above the reply does while the turn runs. A turn that only wrote
+back to the agent that asked is the line alone, ending in "replied".
+The count is of commands when every call was one (`kindOf` in
+`src/lib/tool-summary.ts`) and of steps otherwise, and of files only
+the turn's own.
+
+A room's transcript does not say where an agent's turn began, so there
+a turn is what one agent did until somebody else spoke (`foldRoom`), and
+`RoomView` remembers where a turn it saw start began, so nothing of it
+folds while it runs. When a fold closes over a reader who is not at the
+end, `useHoldPlace` keeps the reply where it was on screen; a find hit
+or a forum link into folded work opens the fold.
 
 ## Chat platforms
 
@@ -173,6 +807,99 @@ can only call a public address, so Bloks Cloud gives each workspace one
 and hands every call over the relay line as an ask; the call arrives
 readable, because Meta sends it that way, and is believed only if Meta's
 signature checks out against the app secret, which stays here.
+
+## Telegram
+
+The person can reach an agent from a Telegram bot that is that agent's
+own (`server/telegram.ts` holds the rules, `server/telegram-bots.ts` the
+saved shape, the Telegram parts of `server/index.ts` the plumbing). A
+bot is a BotFather token in the agent's settings
+(`GET`/`POST /api/bots/:id/telegram`, never with an agent's credential,
+and the token never comes back out). An agent without one is not on
+Telegram, and one Telegram bot cannot be given to two agents: the token
+is checked with `getMe` and its bot id compared with every other
+agent's. Each bot that is switched on has its own long-polling loop
+(`TelegramRuntime`), so nothing listens on a port.
+
+Everything hangs on the pairing. The owner is the Telegram account that
+sends the single-use pairing word to the bot in a private chat, kept by
+its user id (`ownerUserId`), since a chat id or a display name says
+where a message came from and not who wrote it. The word is made with
+the system's random source and is good once. A chat that is not paired
+is refused once and never reaches an agent, and nothing below happens
+anywhere else. Guest mail and shared rooms never come this way.
+
+A connection has a `generation`, renewed whenever its token, its switch
+or its pairing changes. A poll, a card's buttons, the rest of a long
+reply and a message waiting for a turn each carry the generation they
+began under, and stop when it is no longer the agent's
+(`currentTelegram`, `telegramConnectionCurrent`): a bot taken off an
+agent, or another put on it, never finishes the old one's business.
+Words that were waiting stay in the conversation as unsent, with a
+notice. Putting a new token on the same bot keeps its owner and its
+place in the queue of updates; a different bot starts with no one
+paired. Deleting an agent removes its bot and token.
+
+The workspace bot from before 2.8.0 moves to the agent it was set to
+answer as (`migrateTelegram`), with its place and its paired chats, and
+asks for the pairing word once more so it learns its owner's user id.
+Until admission of other people exists, chats paired before the move
+keep the reach they had. When the agent it named is gone, or already
+has a bot, nothing is assigned by guesswork: the old bot waits, stopped,
+for the person to choose an agent in Settings. Bot tokens are left out
+of an unsealed backup like every other key (`SECRET_PATHS`), and a
+restore without them keeps this computer's own.
+
+A card a Telegram turn raises goes to the chat it came from
+(`telegramCards`, `server/telegram-cards.ts`). An approval comes with
+Allow and Deny to tap, a question with one button per choice; a question
+with no choices, or more than eight, is answered by typing, and typing a
+number or yes / no still works on any card. A button carries a short
+random token and the choice's place, never the request id: Telegram
+allows it 64 bytes, and a token that means nothing outside this process
+cannot be replayed. Tokens live in memory for a day at most, so a button
+from before a restart answers that its card has closed. A press counts
+only from a paired chat, under the message the card became, from the
+person it is paired with (`decide`); anyone else's is ignored without a
+reply. The press is answered (`answerCallbackQuery`), the ask is
+resolved like a typed answer, and the card's message is rewritten to say
+how ("Allowed", "Denied", "Answered: ...") with its buttons gone. A card
+answered anywhere else (the app, the phone typing, an engine giving up)
+is rewritten the same way from `request.resolved`, and the chat's next
+line is a message again rather than an answer to it.
+
+What a Telegram turn leaves behind follows its answer to the chat
+(`deliverablesIn`, `telegramFiles`): files it saved to its deliverables
+folder (see `sweepArtifacts`) and the last look at its screen. Images go
+as photos (`sendPhoto`) so they show in the chat, anything else as a file
+(`sendDocument`), each a multipart upload read from disk only as it goes.
+Five at most come with one answer, and Telegram takes 50 MB from a bot,
+so the rest and anything bigger are named in one line saying they are in
+the app. A request held through a restart gets its files after its answer
+the same way (`TelegramReturns`), and only once that answer has arrived.
+Files go only with an answer that goes to the chat: a turn started in
+the app, a routine or a mail sends nothing there.
+
+While a Telegram turn runs the chat shows "typing" (`keepTyping`).
+Completed visible notes from its consuming turn go out as new silent messages
+in order, starting after twenty seconds (`telegram.Progress`, fed from stored
+bot text through request-scoped `TurnProgress`). Notes in the first twenty
+seconds or within the four-second throttle are batched; a batch over 4,000
+UTF-16 units splits at whole-note boundaries. Only an individually oversized
+note is cut with an ellipsis. The latest text stays pending until a following
+tool or another visible text confirms it as a note, so a delayed turn-end
+event cannot send the final-only reply as progress. Reasoning items and tool
+names do not feed the messages; without a note there is nothing extra. Notes are never edited.
+Cleanup cancels pending notes, awaits the post in flight, and deletes every
+known message before the new notifying answer or notice. A failed deletion
+does not prevent the answer. While a card waits on the person neither typing
+nor notes post, since the agent is waiting then. An uncertain post suppresses
+further notes in that turn because its message may have arrived without an id.
+The tool line is deliberately removed. Normal answers take the last eligible
+text after the request in its consuming turn, with waiting rows excluded;
+completion captures that span before a later turn starts. Drain returns keep
+their existing `after` span and have no notes messages. With no reply, a plain
+redacted notice is sent; only a turn with neither keeps the empty-answer line.
 
 ## Teams as files
 
@@ -192,7 +919,71 @@ ready for a look. No model call. A minute timer makes one when the chosen
 time has passed and today's has not been made (`briefDue`), and a
 `brief.ready` frame wakes the owner's phone with a sealed preview.
 `/api/briefs/:id/parts/:n/audio` speaks one part in that agent's voice,
-or a Mac voice picked per agent.
+or a Mac voice picked per agent. Quiet check-ins (see Routines) are left
+out of what an agent worked on and said as one count at the end of its
+part ("12 quiet check-ins, nothing needed you"); they are not things in
+the headline, and a night of nothing but them is still a quiet night,
+which wakes no phone.
+
+## Routines and check-ins
+
+`server/routines.ts` keeps routines in `routines.json` and a thirty
+second timer (`runDueRoutines` in `server/index.ts`) fires whatever is
+due. A routine runs at a time of day on chosen days, once on a date, or,
+for an agent, as a check-in: `every` so many minutes (15 to 1440),
+within `activeHours` (`from` and `to`, local, on one day, both ends
+included) on chosen days. A check-in's slots start where its hours do
+and step by its interval, so they fall at the same times every day
+(`checkInsOn`); its `time` is its first slot, for clients that read only
+that. A missed slot fires once, within the grace window (two hours, or
+half the interval for a check-in, since by then the next one is nearly
+due), and never for a slot from before its schedule was set
+(`scheduledAt`, moved by a change of time, days, date, interval or
+hours). An interval or hours that cannot run, a check-in that is also
+once, and a check-in or quiet routine for a room are refused with the
+reason (`scheduleProblem`); a room's routine keeps to a time of day,
+since several agents answer it and a channel may be reading. The agent
+command line files one with `bloks routine --every 30m --between
+09:00-18:00`, and `--quiet` for a time of day.
+
+A check-in is always quiet, and a time-of-day routine can be (`quiet`).
+Its prompt is marked `routine.quiet`, and the turn is told, in its own
+words after the line saying where it came from and never in the system
+prompt, which a resumed session keeps byte for byte, that if nothing
+needs the person it answers with exactly QUIET (`QUIET_ASK`). While it
+runs the lane is in `checkInTurns`: its start leaves the lane's unread
+as it was, its message frames carry `checkIn` so the app holds their
+banner (`CheckInHold` in `src/lib/notify.ts`), and an answer of QUIET
+(trimmed, any case, with a full stop or exclamation) is written with
+`quiet: true` at once. When the turn ends well with QUIET as its last
+words, nothing but words, tool calls, a screen or a compaction marker
+after the prompt, and none of the person's words joined it,
+`foldQuietRun` marks the prompt and everything after it `quiet`: no
+unread, nothing for a banner, a linked chat or the phone, the run is recorded
+`quiet` in its history (an "ok" run with the flag) and left out of the
+record, whose recent view a check-in every quarter of an hour would
+flood. A check-in that fails, reports anything else, raises a card or
+saves a file is shown like any turn, and its held reply is announced when
+it ends. The chat folds a run of quiet messages into one muted line ("3
+quiet check-ins, last at 10:30", `quietRunAt`), which opens to show
+them; the sidebar's line and a lane's `lastAt` read past them.
+
+Each routine keeps what its last run that was not quiet said
+(`lastReport`, apart from the twenty `runs`, which quiet runs would
+otherwise push it out of), and its next turn carries it as a note before
+the prompt ("Last time this routine reported: ...", one line, about 600
+characters at most), so a run that lands in a fresh or summarised
+session still knows what it said. The note is said only as the turn
+goes; a replayed transcript has the answer in it already.
+
+The routine editor (`src/components/RoutinesDialog.tsx`) chooses At a
+time or Every, in minutes or hours, with hours and days, and the quiet
+switch for a time of day (`src/lib/checkIns.ts` holds its checks). The
+calendar in Automations draws a check-in as one thin band over its hours
+with a tick per run, rather than a card per run that would bury the
+week, as one chip a day in the month, and as a row in words in a
+Check-ins strip under the grid; its history folds a stretch of quiet
+runs into one row.
 
 ## Watchers
 
@@ -202,10 +993,10 @@ as the change, optionally only when it mentions something) or a feed
 (RSS or Atom entries not seen before). Folders are watched with
 `fs.watch` and settle for twenty seconds; everything is also looked at on
 its `every`. A first look is a baseline. A change becomes a turn in the
-watcher's own lane, or a rehearsal (`openRehearsals`), with the message
-marked `via: "watcher"`. A look is skipped while the agent is busy, so
-its own edits are not news to it, and `mayFire` caps a watcher at six
-turns an hour.
+agent's first conversation or the one the watcher names (see Lanes), or a
+rehearsal (`openRehearsals`), with the message marked `via: "watcher"`.
+A look is skipped while the agent is busy, so its own edits are not news
+to it, and `mayFire` caps a watcher at six turns an hour.
 
 ## Meeting notes
 
@@ -219,13 +1010,130 @@ turn in its Meetings lane with `notesPrompt`, and `actionItems` reads
 
 ## Recall and notes about the person
 
-`server/recall.ts` searches an agent's own lanes and the rooms it is in
-(only the room itself, from a lane of a shared room), words in any
-order, with the message before each hit. Agents reach it with the CLI's
-`recall` and chat engines with the `search_history` tool.
+`server/recall.ts` searches an agent's own lanes, the rooms it is in and
+its memory files (MEMORY.md and `memory/*.md`, each cut into pieces under
+their headings and named by file), words in any order, with the message
+before each hit. From a lane of a shared room it reaches only that room,
+and no memory; the lane that answers mail from anyone reaches nothing,
+and no other lane reaches it. Agents reach it with the CLI's `recall` and
+chat engines with the `search_history` tool.
+
+Ranking is BM25 in plain TypeScript (`server/recall-index.ts`): a word
+counts for more the rarer it is in this agent's own past (its lanes,
+rooms and memory together are the corpus), saying it again counts for
+less each time, and a long message does not win by length. A gentle
+recency edge (at most 15%, halving every 30 days) and a bonus for words in
+the order asked or within eight words of each other come on top. Words
+are folded before they meet (plurals, -ing and -ed, a silent e), small
+words are left out, and a file name or a hyphenated word is matched whole
+and by its parts. An agent's own search wants most of the words, as
+before, and a hit's text is cut around where they sit.
+
+Each conversation has an index in memory, built the first time it is
+searched and kept in step by two hooks on the store: `onAppend` adds a
+message to an index already built, and `onRewrite` hears every patch, move
+and dropped transcript. The same words at another time (a reaction, a
+queued message going) keep the index, and an edit, a deletion or a closed
+lane drops it to be built again. A memory file's index is rebuilt when its
+size or time moves, and a link is never read through. `IndexCache` holds
+them all to a budget of three million postings, a few bytes each: once a
+search is done, the least recently searched go until what is left fits,
+and are built again if asked for. A test indexes 30,000 messages and
+answers in well under a second.
+
+The person's own search, the command palette and the MCP server's
+`search` (`GET /api/search`), reads the same indexes over every
+conversation of every agent still in the list and every room, ranked the
+same way and wanting most of the words, so the message that answers comes
+before the one that happens to be newest. Nothing taken back, rewound or
+still waiting is in an index. A query of nothing but small words ("to be
+or not") has nothing to rank on and is matched as typed, newest first, as
+it always was.
+
+Recall also runs before the person's own turn in one of an agent's
+conversations (`recallAhead` in `server/index.ts`): never in a room,
+shared or not, nor for a stranger's mail, another agent, a routine, a
+watcher, a native command, a rehearsal, or a turn going on with an earlier
+one (a pickup, a backup engine, a retry). It searches the agent's other
+conversations and its memory topic files with the person's words; not
+MEMORY.md, which the standing prompt carries, and not the conversation it
+is in. A hit has to share at least two of the words, hold at least 45% of
+what makes them particular (their words, each weighted by how rare it is)
+and score at least 4.5, which is about two telling words in a history of
+a few hundred messages (a very short history scores nothing that high,
+which is the point); a message of fewer than two words worth matching is
+not looked up at all. Up to three excerpts of about 500 characters each, each with
+where and when it was said and by whom, go ahead of the person's words in
+the turn's text, in a block that says they were found by matching words
+and may be ignored. Never in the system prompt, so a resumed Claude Code
+session keeps reading its cache (see Compactions). Nothing the
+conversation's last forty messages were already given, or already say, is
+given again. The person's message keeps what was added as `recalled`
+(where, when, who, the excerpt), which the chat shows as "Recalled 2
+notes" under it (`src/components/RecalledNotes.tsx`), opening to each
+excerpt with where and when it was said, and a link to the conversation
+or room it came from; GET `/api/bots` leaves it out for an agent's credential,
+since it came from the agent's other conversations. Words that waited for
+a turn are looked up together and the last of them keeps the notes. An
+engine that is told the transcript each turn hears the notes once, with
+the message they came with, since the transcript replays what was said.
+It is on unless turned off, for one agent (`recallBeforeTurn`, in its
+settings under Memory) or for the workspace (`recall.beforeTurn`, Settings,
+General).
 `server/profile-notes.ts` holds suggested and kept notes about the
 person; agents suggest with `note` or `note_about_person` (three a turn),
 only kept notes reach the prompt, and never in a shared room.
+
+## Bringing a setup over
+
+`server/setup-import.ts` reads what a person already taught other agent
+tools, from a short list of known places under their home: Claude Code
+(`~/.claude/CLAUDE.md`, `~/.claude/skills/*/SKILL.md`, the top level
+`mcpServers` of `~/.claude.json`, and the allow and deny rules in
+`~/.claude/settings.json`), Codex (`~/.codex/AGENTS.md` and the
+`[mcp_servers.*]` tables of `~/.codex/config.toml`, read by a small TOML
+reader of its own), OpenClaw (`SOUL.md`, `IDENTITY.md`, `MEMORY.md`,
+`memory/*.md`, `USER.md` and `skills/*/SKILL.md` in
+`~/.openclaw/workspace`) and Hermes (`SOUL.md`, the memories folder and
+skills a few folders down in `~/.hermes`, each looked for rather than
+assumed). Nothing is searched for and nothing there is written.
+
+No credential is read or copied. A file named like one (`auth.json`,
+`.credentials.json`, `.env`, tokens, keys, keychains) is never opened,
+and a link is followed only to see where it goes, so a `SKILL.md` that
+points at a credentials file is named as left out. Every file is capped
+by size. Text is scrubbed of anything key-shaped (provider key prefixes,
+bearer tokens, `name = value` pairs whose value looks generated,
+passwords in addresses, private key blocks) and the item says how many
+were taken out. An MCP server's environment and header values are
+dropped whole, never scrubbed: the names come across with empty values,
+and the server waits for the person to fill them in under Apps and keys
+(`PATCH /api/mcp-servers/:id`, names it already has only). A name with
+no value is never handed to an engine. Names that change how programs
+start (`PATH`, `NODE_OPTIONS` and the rest of `server/env-names.ts`) are
+not carried.
+
+`GET /api/setup-import` is the review: every item by source, with a
+preview, where it would go and whether it was brought over before.
+`POST` imports the items the window names, and only those. It reads the
+files again and takes from the window only which items and where, so an
+item whose digest no longer matches the review is refused. Instructions
+become an agent's instructions (if they fit) or a block in its
+`MEMORY.md`, written through the memory journal so the Memory panel can
+undo it; `memory/*.md` files become topic files. A new agent is made once
+per source per import. Skills go to the library under a free id, never
+over somebody's skill, and no agent has them until the person attaches
+them. Servers go to the registry on no agent. Rules go through the
+policy's own checks and wait for the person to tick them: a Bloks rule
+looks at one thing, so a translation may be broader than the original
+only when it denies, and an allow that would let agents do more is left
+out with the reason. `USER.md` lines become suggestions in About you.
+`setup-import.json` keeps each item's digest, destination and the exact
+text it added, so importing again replaces that text in place, or says
+nothing changed, rather than adding a second copy. Both routes answer
+only Bloks on this computer, never an agent's credential, a paired phone
+or a remote window. The first run offers the review as an optional step
+when something new was found, and Settings has it as a page.
 
 ## Engine scout
 
@@ -241,9 +1149,50 @@ suggested for that agent.
 Mail to `<agent>.<id>@agents.bloks.dev` is received by Bloks Cloud and
 arrives as a `hook:` ask with `platform: "email"`, like WhatsApp.
 `onEmailHook` routes it by the name before the dot, checks `allowFrom`,
-dedupes by Message-ID, and queues it into the agent's Email lane; the
-reply is the agent's last message, sent back through Bloks Cloud, which
-only sends to an address that wrote in.
+dedupes by Message-ID, and queues it into the agent's Email lane (or
+"Unlisted email", below); the reply is the agent's last message, sent
+back through Bloks Cloud, which only sends to an address that wrote in.
+
+With `allowFrom` empty anyone may write, so a mail's turn runs on none
+of the owner's standing trust: its requester is `MAIL_FROM_ANYONE`, and
+it is answered the way a guest in a shared room is (`guestMail` in
+`startClaimedTurn`). Only an engine whose tools can be switched off
+(`sharedSafe`) answers it; on Codex, an ACP engine or the computer the
+lane says why and nobody is emailed, since a shell that asks before
+acting still reads the whole disk without asking, the owner's keys
+included. The driver gets `shared: { tools: "conversation" }` and
+`untrusted`: no tools, none of the owner's connectors, MCP servers,
+computer, browser or extra folders, no CLAUDE.md or auto memory, no saved
+secret and no agent credential. The persona leaves out the owner's
+profile, notes, memory, attached skills, project brief, folders and the
+team protocol, and no team plan is read from its answer. Each mail
+starts a session of its own with no transcript and nothing compacted
+first, and its session is dropped when it ends, unfolded and unread for
+skills, so one stranger never reads another's mail and no turn of the
+owner's resumes one. The reply is what was said after the mail, and any
+other turn starting in the lane ends the wait for it, so nobody is
+emailed words that were not their answer. A pickup after a cut off takes
+none of the words queued in the lane, and a context error is not folded
+and retried. `search_history`, `read_message`, `note_about_person`,
+`request_secret` and `request_connection` are refused: a secret saved or
+an app connected from such a card would resume the turn as the owner's.
+A question it asks the owner says whose mail it is for and is never
+sent to the owner's phone. It is answered in a lane of its own, made as "Unlisted email" and
+marked (`TaskRecord.guestMail`) rather than known by its title, so it
+keeps all of this when the person renames it; nothing names it, and a
+lane 2.5.36 made under that title is marked on the next start. Never in
+"Email", and at the lane cap it waits rather than borrow another lane;
+no other work falls back into that lane either, and work that names no
+lane (a phone message, a room's turn) goes to the first conversation
+when that lane is the one open (`activeLaneOf`). A backup engine or a
+retry after a fold goes on for the same requester, read when the error
+arrives, and a pickup after a restart reads it from the turn's record.
+During a drain it waits in the mail line rather than as a note in a
+lane, since a note runs as the owner's. Mail from an address or @domain
+in `allowFrom`, checked when its turn starts, runs as the owner's own,
+in "Email".
+Webhooks are not affected: their address is a secret the owner handed
+out.
 
 ## MCP server
 
@@ -254,6 +1203,130 @@ conversation, search, the latest brief, what is waiting). It has no tool
 that approves, deletes or configures. `/api/mcp-config` gives the command
 to paste, using the runtime the server itself runs on.
 
+## Lanes, unread and the sidebar
+
+An agent keeps up to twenty lanes (`MAX_TASKS` in `server/store.ts`), each
+its own transcript, engine cursors and busy flag. Closing the last lane
+opens a fresh General in its place, because the active lane is what
+`threadId` names everywhere and an agent without one would be a special
+case in every route.
+
+One conversation per agent is the default. A routine, a watcher or an
+agent's webhook speaks in the agent's first lane, General, where the
+person talks to it, unless it names another with `thread` (the routine
+editor's Conversation, `--thread`, the webhook's Conversation), so two
+routines can still run side by side with their own context. `namedLane`
+reads a name as a lane's id first and its title second; a title nobody
+has is made when the work first needs it, and an id never is: one that
+is not this agent's lane is refused when filed and, once its lane has
+closed, sends the work to the first lane. A turn there shares the lane
+with the person, so what they say meanwhile queues behind it or joins it
+as steering. Everything filed before this kept going where it went: on
+the first start after the update, each one that named no lane was given
+the one it used ("Routines", "Webhooks", a watcher's "Watching: <name>"
+by its title then), once, marked by `oneConversationAt` in
+`config.json`. A watcher's own lane is one it made under that name, and
+closes with it.
+
+The chat's tab strip shows only while an agent has more than one lane;
+New conversation is on the agent's row in the sidebar (its menu, and the
+`+` of the conversations view), as Clear is.
+
+Unread is per lane: a turn that ends in a lane marks that lane
+(`store.markLane`), except a quiet check-in (see Routines and check-ins),
+which leaves it as it was, and the agent's own `unread` is kept as "any lane
+unread" so the iPhone app and the Dock badge read it unchanged. Opening a
+lane (`POST .../tasks/:id/activate`) reads it; `PATCH /api/bots/:id` with
+`unread` reads or marks the lane on screen. The client's `select` goes to
+the lane that pinged (`pingedLane` in `src/state/reducer.ts`) unless it is
+given one, so a dot on an agent always leads somewhere. `clientBot` ships
+each lane's `unread` and `lastAt` for the sidebar.
+
+Inside each list of the sidebar (a section, or the unfiled Rooms and
+Agents at the top) the order is one rule, `compareRows` in
+`src/lib/sections.ts`: pinned rows first by `pinOrder`, then the rest by
+`activeWithYouAt`, most recent first, with `createdAt` and the id settling
+ties. All of those fields live on the agent and room records, so every
+device draws the same list; `sidebarLayout` gives the whole sidebar in
+that order for anything that walks it. `activeWithYouAt` moves when the
+person writes, when a turn they started replies, and when anything asks
+them something (`towardYou` in `server/activity.ts`), never for one
+agent messaging another or a routine waking one. Pins and places are set
+through `PATCH /api/bots/:id` and `PATCH /api/bloks/:id` with `section`,
+`pinned` and `position`, which renumber the section's pins; the order of
+the headings is `GET /api/sidebar` and `PUT /api/sidebar/sections`, kept
+in `sidebar.json` and announced as a `sidebar` frame.
+
+The sidebar's conversations view (`src/components/SidebarParts.tsx`) is a
+per-device choice in `localStorage`. Settings is a page beside the
+sidebar, like Automations, with its pages listed once in
+`SETTINGS_PAGES` (`src/components/AppSettingsPanel.tsx`); anything that
+links into Settings passes a `page`, and the command palette searches the
+same list. Escape is handled once (`src/lib/useEscape.ts`): the most
+recently opened surface that asked for it closes, and Radix menus and
+dialogs keep their own.
+
+## Approval modes
+
+An agent's `approvals` is `ask`, `edits`, `auto` or `full`, and new agents
+start on `cfg.agentDefaults.approvals` (`GET`/`PUT /api/approvals`, which
+can also move every agent; never reachable with an agent's credential).
+The first three are Bloks' own gate: deny rules first, then the mode
+decides whether a request becomes a card. `full` also sets `fullAccess`
+on the turn, and each driver takes its engine's own guard off: Claude
+Code runs with `bypassPermissions` and no approval bridge, Codex with
+`danger-full-access` and `approvalPolicy: never` (stated on resume too),
+ACP engines in their `yolo` mode, Antigravity with
+`--dangerously-skip-permissions`. Nothing asks, so rules cannot refuse
+anything in that mode. A shared room never gets `fullAccess`, and nor
+does an email from anyone (see Email your agent): a turn somebody other
+than the owner asked for is held to the owner's yes, whatever the mode.
+
+The agent's command line (`bin/bloks.mjs`) reaches the workspace over
+this computer's own address, so it needs network access even though
+nothing leaves the machine. Outside `full`, Codex runs commands in its
+`workspace-write` sandbox, which has no network access unless Codex asks
+for it and the person allows it, and a `bloks` command run inside it
+cannot connect. The command line says so (`network access required`,
+with the address and "run the same command again with network access
+allowed") rather than `fetch failed`, and `bloks help` carries the same
+note, so the agent asks for the access instead of reading it as Bloks
+being down (GitHub 251). A workspace that is not running answers
+`nothing is answering at <address>` instead.
+
+## Security checkup
+
+Settings has a Security checkup page (`src/components/SecurityCheckup.tsx`)
+that lists everything letting an agent, a device or a stranger reach
+further than the person may remember choosing, each as "ok", "worth a
+look" or "risky", with one sentence on why it matters and the way to
+narrow it. `securityReport` in `server/index.ts` gathers names and counts
+from what is stored (never a key, a secret's value, a device token or a
+webhook address), and `checkup` in `server/security.ts` decides what to
+say: agents in full access (risky), pairing on and how many devices,
+email open to anyone and which agents' engines would refuse unlisted
+mail, shared rooms opening the owner's tools, agents with a browser or
+the use of this machine, saved secrets by name, the modes of `~/.bloks`
+and its key files (`config.json`, `webhooks.json`, `pair-links.json`,
+`people.json`, `identities/`; anything but 0700 and 0600 is risky),
+webhooks switched on, engines an agent uses that are signed out, and
+automatic backups when the build has them. Engines are asked through
+the half minute snapshot cache.
+
+Most fixes are links to where the setting already lives. The page does
+three things itself: it moves an agent from full access to Auto (the
+ordinary `PATCH /api/bots/:id`, since narrowing never needs asking
+twice), puts file modes back (`POST /api/security/permissions`, which
+leaves a link inside the folder alone, since changing its mode changes
+whatever it points at), and forgets a saved secret
+(`DELETE /api/security/secrets/:name`). All three routes and
+`GET /api/security` answer only this machine: never a phone, a paired
+browser, a remote window or an agent's credential, and `/api/security`
+is on the agents' never list too. When something is risky, Settings
+wears a red dot in the sidebar and the page a count in its list
+(`src/lib/securityCheckup.ts` holds the one shared report); worth a look
+waits on the page.
+
 ## Boundaries worth knowing
 
 - `server/http-guard.ts` checks `Origin` and `Host` on every request.
@@ -263,3 +1336,16 @@ to paste, using the runtime the server itself runs on.
   returned to the client.
 - Approval requests block the turn. The driver holds the provider's
   request open until `respondToRequest` resolves it.
+
+## Engine setup
+
+`server/engine-setup.ts` installs an engine CLI when the person presses
+Install, and opens Terminal at its sign-in when they press Sign in. Installs
+run through the person's login shell, so they see the same node and PATH
+their Terminal does, and write only under `~/.local`: the native installer
+for Claude Code, `npm install -g --prefix "$HOME/.local"` for the npm ones.
+A failure comes back as the next step (install Node, check the network)
+with the installer's own output behind a disclosure. The routes answer
+only a window on this computer and never an agent. Claude Code and Codex
+report signed in or not (`claude auth status`, `codex login status`), and
+the first-run check counts an engine as ready only when it is both.

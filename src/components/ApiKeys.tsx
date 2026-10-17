@@ -16,6 +16,7 @@ import { api, useStore, type ConfigStatus } from "@/state/store";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/cn";
+import { composioKeyMistake } from "@/lib/keyShape";
 
 export type ConfigSection = "composio" | "composioApi" | "box" | "elevenlabs" | "openaiSpeech";
 
@@ -67,6 +68,9 @@ export function ApiKeyRow({
 
   const save = () => {
     if (saving || (!value.trim() && !configured)) return;
+    const mistake =
+      section === "composio" || section === "composioApi" ? composioKeyMistake(section, value) : null;
+    if (mistake) return setError(mistake);
     setSaving(true);
     setError(null);
     api("/api/config", {

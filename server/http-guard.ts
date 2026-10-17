@@ -9,7 +9,8 @@
 // your stored credentials and your global agent instructions.
 //
 // Two checks close it:
-//   Origin, must be absent (Electron, curl, same-origin) or loopback.
+//   Origin, must be absent (curl, the CLIs, same-origin navigations),
+//            or this server's own origin (or the dev UI that proxies to it).
 //   Host, must be loopback, which defeats DNS rebinding (evil.com
 //            resolving to 127.0.0.1 still sends Host: evil.com).
 //
@@ -55,18 +56,37 @@ export function isLocalRequest(req: IncomingMessage): boolean {
   const host = req.headers.host;
   if (!host || !LOOPBACK_HOSTS.has(hostnameOf(host))) return false;
 
-  // No Origin: not a browser-initiated cross-site request (Electron's
-  // file://, curl, same-origin navigations). Browsers always attach one
-  // to cross-origin fetches, including no-cors simple requests.
+  // No Origin: not a browser-initiated cross-site request (curl, the
+  // CLIs, the app's own main process, same-origin navigations). Browsers
+  // always attach one to cross-origin fetches, including no-cors simple
+  // requests.
   const origin = req.headers.origin;
-  if (!origin || origin === "null") return true;
+  if (!origin) return true;
+  // "null" is an opaque origin: a sandboxed frame, or a page opened from
+  // a sandboxed response, such as an agent's own HTML artifact. That is
+  // exactly the content this check must not let act as the owner, and
+  // nothing of the app's own sends it (its window is served over http).
+  if (origin === "null") return false;
 
+  // A loopback origin is not enough: agents serve dev servers, notebooks
+  // and desktops on other loopback ports, and a page from one of those,
+  // opened in a browser, is not the app. The app's page is this server's
+  // own origin, or the Vite dev server that proxies to it.
   try {
-    return LOOPBACK_HOSTS.has(new URL(origin).hostname);
+    const from = new URL(origin);
+    if (!LOOPBACK_HOSTS.has(from.hostname)) return false;
+    return from.host === host || (from.port === DEV_UI_PORT && !servesItsOwnPage());
   } catch {
     return false;
   }
 }
+
+/** The port `pnpm dev` serves the UI on (vite.config.ts), which proxies
+ * the API here, so its pages carry that origin. Trusted only while this
+ * server is not serving the page itself: the installed app and
+ * bloks-server do, and there a page on 5199 is just another local page. */
+const DEV_UI_PORT = "5199";
+const servesItsOwnPage = () => Boolean(process.env.BLOKS_STATIC_DIR);
 
 /** The bearer token a request carries, if it carries a well formed one. */
 export function bearerToken(req: IncomingMessage): string | null {

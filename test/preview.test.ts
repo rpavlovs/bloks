@@ -7,19 +7,60 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
-import { describeComponent, plainText, previewLine } from "../src/lib/preview.ts";
+import { agentPreview, describeComponent, lastHeardAt, lastSaid, plainText, previewLine } from "../src/lib/preview.ts";
 import type { Message } from "../src/state/reducer.ts";
 
 const msg = (over: Partial<Message>): Message =>
   ({ id: "m", role: "bot", kind: "text", at: 0, ...over }) as Message;
 
 describe("every kind says something", () => {
+  test("an own-only changes summary has the ordinary file-count row line", () => {
+    const summary = {
+      checkpointId: "checkpoint",
+      files: [{ path: "a.md", status: "modified" as const }, { path: "b.md", status: "added" as const }],
+      total: 2,
+    };
+    const line = previewLine(msg({ kind: "changes", changes: summary }));
+    assert.equal(line, "Changed 2 files");
+    assert.equal(line.includes("while others"), false);
+  });
+
   test("nothing at all is a new agent", () => {
     assert.equal(previewLine(undefined), "New agent");
   });
 
   test("words, with the markdown stripped", () => {
     assert.equal(previewLine(msg({ text: "**Done.** See `report.md`" })), "Done. See report.md");
+  });
+
+  test("a take-back record names the removed messages after a textless turn", () => {
+    const record = msg({
+      kind: "activity",
+      at: 20,
+      takeBack: {
+        peerId: "agent-b",
+        peerName: "Agent B",
+        messages: [
+          { id: "first", laneId: "lane-one", text: "Use the first version." },
+          { id: "second", laneId: "lane-two", text: "Use the first version." },
+        ],
+      },
+    });
+    const sender = { threadId: "sender-lane", busy: false, messages: [msg({ text: "Ready.", at: 10 }), record] };
+    assert.equal(lastSaid(sender.messages), record);
+    assert.equal(previewLine(record), "Took back 2 messages");
+    assert.equal(agentPreview(sender), "Took back 2 messages");
+    assert.equal(agentPreview({ ...sender, busy: true }), "Working…");
+    assert.equal(
+      previewLine(msg({ ...record, takeBack: { ...record.takeBack!, messages: [record.takeBack!.messages[0]] } })),
+      "Took back 1 message",
+    );
+    assert.equal(previewLine(msg({ ...record, deleted: true })), "Message taken back");
+  });
+
+  test("ordinary activity still names its tool or says Working", () => {
+    assert.equal(previewLine(msg({ kind: "activity" })), "Working");
+    assert.equal(previewLine(msg({ kind: "activity", tool: { name: "Read", ok: true } })), "Read");
   });
 
   test("a card shows what it asks", () => {
@@ -98,4 +139,59 @@ describe("a message taken back", () => {
 
 test("markdown markers are stripped, not the words", () => {
   assert.equal(plainText("# Heading\n- one\n- two"), "Heading one two");
+});
+
+describe("the row's last message (#206)", () => {
+  test("a compaction marker is not what the agent last said", () => {
+    const reply = msg({ id: "r", text: "Booked the 9:40 ferry.", at: 1 });
+    const marker = msg({ id: "c", kind: "notice", text: "Compacted while idle", at: 2, compaction: { before: 222_000, after: 10_000, idle: true } });
+    assert.equal(lastSaid([reply, marker])?.id, "r");
+  });
+
+  test("nor is a message still waiting to reach the agent", () => {
+    const reply = msg({ id: "r", text: "Done.", at: 1 });
+    const waiting = msg({ id: "q", role: "user", text: "and then?", at: 2, queued: true });
+    assert.equal(lastSaid([reply, waiting])?.id, "r");
+    assert.equal(lastSaid([waiting]), undefined);
+  });
+});
+
+describe("an agent whose words did not come along", () => {
+  const agent = (over: Record<string, unknown> = {}) => ({
+    title: "Research lead",
+    threadId: "t-1",
+    messages: [] as Message[],
+    tasks: [{ id: "t-1", createdAt: 100, lastAt: 100 }],
+    ...over,
+  });
+
+  test("through Bloks Cloud, trimmed to nothing, it reads as who it is and when it last spoke", () => {
+    // One long message can be more than the relay carries, so an agent can
+    // arrive with no messages and a count of those left behind. Its row
+    // said "New agent", about an agent with a whole history.
+    const trimmed = agent({ olderMessages: 12, tasks: [{ id: "t-1", createdAt: 100, lastAt: 900 }] });
+    assert.equal(agentPreview(trimmed), "Research lead");
+    assert.equal(lastHeardAt(trimmed), 900);
+    assert.equal(agentPreview({ ...trimmed, title: "" }), "Open to see what was said");
+  });
+
+  test("its open conversation's own time says it has history, even without the count", () => {
+    // a conversation opened on another device, still on its way here
+    assert.equal(agentPreview(agent({ tasks: [{ id: "t-1", createdAt: 100, lastAt: 500 }] })), "Research lead");
+  });
+
+  test("an agent that really has said nothing is still a new agent", () => {
+    assert.equal(agentPreview(agent()), "New agent");
+    assert.equal(lastHeardAt(agent()), undefined);
+    assert.equal(
+      agentPreview(agent({ tasks: [{ id: "t-1", createdAt: 100, lastAt: 100 }, { id: "t-2", createdAt: 50, lastAt: 80 }] })),
+      "New conversation",
+    );
+  });
+
+  test("words that are here are still what it shows", () => {
+    const said = agent({ olderMessages: 3, messages: [msg({ text: "Found three papers.", at: 700 })] });
+    assert.equal(agentPreview(said), "Found three papers.");
+    assert.equal(lastHeardAt(said), 700);
+  });
 });

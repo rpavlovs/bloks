@@ -70,7 +70,7 @@ export function TeamMapView({ onNavigate }: { onNavigate: (id: string) => void }
                   <text
                     x={c.x + 24}
                     y={c.y + 30}
-                    className="fill-[--color-muted-foreground] text-[11px] font-medium uppercase tracking-[0.08em]"
+                    className="fill-(--color-muted-foreground) text-[11px] font-medium uppercase tracking-[0.08em]"
                   >
                     {c.name}
                   </text>
@@ -89,7 +89,7 @@ export function TeamMapView({ onNavigate }: { onNavigate: (id: string) => void }
                     y2={to.y}
                     className={cn(
                       "stroke-border",
-                      edge.active && "animate-pulse stroke-[--color-brand]",
+                      edge.active && "animate-pulse stroke-(--color-brand)",
                     )}
                     strokeWidth={edge.active ? 2 : 1.25}
                   />
@@ -125,8 +125,8 @@ export function TeamMapView({ onNavigate }: { onNavigate: (id: string) => void }
                   <span
                     className={cn(
                       "rounded-2xl ring-2 ring-transparent",
-                      bot.busy && "animate-pulse ring-[--color-brand]",
-                      needsYou.has(bot.id) && "ring-[--color-warning]",
+                      bot.busy && "animate-pulse ring-(--color-brand)",
+                      needsYou.has(bot.id) && "ring-(--color-warning)",
                     )}
                   >
                     <AgentAvatar bot={bot} size={44} />

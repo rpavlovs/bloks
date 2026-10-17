@@ -16,6 +16,7 @@ import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
 import { thisComputer } from "@/lib/thisComputer";
+import { usePageVisible } from "@/lib/pageVisible";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
@@ -117,11 +118,13 @@ export function LocalVmSection() {
       });
   }, []);
 
+  const visible = usePageVisible();
   useEffect(() => {
+    if (!visible) return;
     load();
     const t = setInterval(load, 5_000);
     return () => clearInterval(t);
-  }, [load]);
+  }, [load, visible]);
 
   const act = (verb: "prepare" | "create" | "remove", confirmText?: string) => {
     if (confirmText && !window.confirm(confirmText)) return;

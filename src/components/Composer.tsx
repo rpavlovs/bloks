@@ -1,5 +1,5 @@
 import { track } from "@/lib/analytics";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type SetStateAction } from "react";
 import ArrowUp from "lucide-react/dist/esm/icons/arrow-up.mjs";
 import Mic from "lucide-react/dist/esm/icons/mic.mjs";
 import Plus from "lucide-react/dist/esm/icons/plus.mjs";
@@ -9,8 +9,9 @@ import Archive from "lucide-react/dist/esm/icons/archive.mjs";
 import FileIcon from "lucide-react/dist/esm/icons/file.mjs";
 import X from "lucide-react/dist/esm/icons/x.mjs";
 import FlaskConical from "lucide-react/dist/esm/icons/flask-conical.mjs";
-import { api, useStore, type Bot } from "@/state/store";
+import { api, useStore, openLaneWorking, type Bot } from "@/state/store";
 import { ReplyChip, type ReplyDraft } from "./MessageActions";
+import { ComposerRing } from "./ComposerRing";
 import { cn } from "@/lib/cn";
 import { AgentAvatar } from "./Avatar";
 import {
@@ -26,7 +27,9 @@ import {
 import { Button } from "@/components/ui/button";
 import { modKey } from "@/lib/thisComputer";
 import { composerCeiling, edgeMask } from "@/lib/composerSize";
-import { insert as insertCommand, matches as matchCommands, segments, slashAt, type Command } from "@/lib/slashCommands";
+import { acceptDraft, boxFor, carryFocus, discardRecovery, isEmptyDraft, keepDraft, readDraft, readRecoveries, recoverDraft, restoreRecovery, showBox, takeFocus, type Draft } from "@/lib/drafts";
+import { insert as insertCommand, matches as matchCommands, segments, slashAt, withBloksCommands, type Command } from "@/lib/slashCommands";
+import { escapeTaken } from "@/lib/useEscape";
 
 /** Fade whichever edges have more text beyond them (see edgeMask). */
 function shadeEdges(el: HTMLTextAreaElement) {
@@ -72,11 +75,16 @@ function useAutoSize(value: string) {
     // the height comes off entirely rather than being measured. An empty
     // textarea does not report the scrollHeight of one line, which is how
     // the composer came to stand at its ceiling whenever it was empty.
+    // A placeholder longer than the line (a long agent name on a phone)
+    // wraps onto a second row the one-row box hides, and the box grows a
+    // scrollbar for it. Empty, there is nothing to scroll to.
     if (!value) {
       el.style.height = "";
+      el.style.overflowY = "hidden";
       shadeEdges(el);
       return;
     }
+    el.style.overflowY = "";
     const style = getComputedStyle(el);
     const ceiling = composerCeiling(
       parseFloat(style.lineHeight),
@@ -124,11 +132,31 @@ function VoiceMeter({ level }: { level: number }) {
   );
 }
 
+function AttachmentChip({ attachment: a, onRemove }: { attachment: Attachment; onRemove?: () => void }) {
+  return (
+    <span className="flex max-w-[240px] items-center gap-1.5 rounded-xl border bg-muted/50 py-1 pl-1.5 pr-1 text-[12px] text-foreground">
+      {a.kind === "image" ? (
+        <img src={`/api/attachments/${attachmentBasename(a.path)}`} alt={a.name} className="size-7 shrink-0 rounded-lg object-cover" />
+      ) : (
+        <FileIcon size={14} className="shrink-0 text-muted-foreground" />
+      )}
+      <span className="min-w-0 flex-1 truncate">{a.kind === "paste" ? `Pasted text, ${a.lines} lines` : a.name}</span>
+      <span className="shrink-0 text-muted-foreground">{formatBytes(a.bytes)}</span>
+      {onRemove && (
+        <button onClick={onRemove} className="shrink-0 rounded-full p-0.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground" aria-label={`Remove ${a.kind === "paste" ? "pasted text" : a.name}`}>
+          <X size={12} />
+        </button>
+      )}
+    </span>
+  );
+}
+
 export function Composer({
   bot,
   replyTo,
   onClearReply,
   prefill,
+  onEditLast,
 }: {
   bot: Bot;
   /** reply context to send with the next message */
@@ -136,9 +164,34 @@ export function Composer({
   onClearReply?: () => void;
   /** Words to put in the box, such as a message handed back by a rewind. */
   prefill?: { text: string; nonce: number } | null;
+  /** ↑ in the empty box: open your last message for editing. False when
+   * there is none that can be. */
+  onEditLast?: () => boolean;
 }) {
   const { state, dispatch } = useStore();
-  const [text, setText] = useState("");
+  // One composer per conversation: ChatView keys it by agent and lane, so
+  // nothing in it (the words, the chips, rehearsing, dictation) can be
+  // carried to another agent and sent there. What it holds is kept for
+  // this conversation when it goes, and found again when it comes back.
+  const draftKey = `${bot.id}:${bot.activeTaskId ?? bot.threadId}`;
+  const [draft, setDraftState] = useState(() => readDraft<Attachment>(draftKey));
+  const { text, attachments } = draft;
+  const latest = useRef(draft);
+  // Accepted typing and asynchronous intake are visible to a failure in
+  // the same batch, before React has rendered the new words or chips.
+  const setDraft = (next: Draft<Attachment>) => {
+    setDraftState(acceptDraft(latest, next));
+  };
+  const setText = (next: SetStateAction<string>) => setDraft({
+    ...latest.current,
+    text: typeof next === "function" ? next(latest.current.text) : next,
+  });
+  const setAttachments = (next: SetStateAction<Attachment[]>) => setDraft({
+    ...latest.current,
+    attachments: typeof next === "function" ? next(latest.current.attachments) : next,
+  });
+  const [recoveries, setRecoveries] = useState(() => readRecoveries(draftKey));
+  const [blockedRecovery, setBlockedRecovery] = useState<string | null>(null);
   useEffect(() => {
     if (prefill) setText(prefill.text);
   }, [prefill]);
@@ -161,8 +214,53 @@ export function Composer({
   // replacing what someone had started writing
   const baseText = useRef("");
   const inputRef = useAutoSize(text);
-  /** Chips riding with the next message. */
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const mounted = useRef(true);
+  // the words a failed send hands back, into this box when it is the one
+  // on screen for this conversation
+  const receive = (sent: Draft<Attachment>) => {
+    const back = recoverDraft(draftKey, latest, sent);
+    if (back) setDraft(back);
+    else setRecoveries(readRecoveries(draftKey));
+  };
+  const receiveRef = useRef(receive);
+  receiveRef.current = receive;
+  useEffect(() => {
+    mounted.current = true;
+    const hide = showBox<Attachment>(draftKey, (sent) => receiveRef.current(sent));
+    return () => {
+      mounted.current = false;
+      hide();
+      keepDraft(draftKey, latest.current);
+    };
+  }, [draftKey]);
+  // Layout, not passive: on the way out the box has to still be in the
+  // page to tell whether it had the keyboard, and the box replacing it
+  // takes the keyboard in the same commit.
+  useLayoutEffect(() => {
+    if (takeFocus()) inputRef.current?.focus();
+    const input = inputRef.current;
+    return () => carryFocus(Boolean(input) && document.activeElement === input);
+  }, [draftKey]);
+  // A send that did not go comes back to the box it left; when this
+  // conversation was left meanwhile, to the box now on screen for it, or
+  // else to the draft kept for it.
+  const giveBack = (sent: Draft<Attachment>) => {
+    if (mounted.current) return receive(sent);
+    const box = boxFor<Attachment>(draftKey);
+    if (box) return box(sent);
+    const back = recoverDraft(draftKey, { current: readDraft<Attachment>(draftKey) }, sent);
+    if (back) keepDraft(draftKey, back);
+  };
+  const restore = (id: string) => {
+    if (!readRecoveries(draftKey).some((item) => item.id === id)) return;
+    if (!isEmptyDraft(latest.current)) return setBlockedRecovery(id);
+    const back = restoreRecovery(draftKey, id, latest);
+    if (!back) return;
+    setDraft(back);
+    setRecoveries(readRecoveries(draftKey));
+    setBlockedRecovery(null);
+    inputRef.current?.focus();
+  };
   /** Why something did not become a chip, said once, dismissible. */
   const [attachNotice, setAttachNotice] = useState<string | null>(null);
   const pickerRef = useRef<HTMLInputElement>(null);
@@ -174,17 +272,30 @@ export function Composer({
   const [slash, setSlash] = useState<{ start: number; query: string } | null>(null);
   const [pick, setPick] = useState(0);
   const skillKey = (bot.skillIds ?? []).join(",");
+  const laneId = bot.activeTaskId ?? bot.threadId;
+  const commandTick = state.ticks[`commands:${laneId}`] ?? 0;
+  const engine = state.instances.find((i) => i.instanceId === bot.modelSelection.instanceId);
+  const commandEngine = `${engine?.driverKind}:${engine?.snapshot.version}`;
   useEffect(() => {
     let live = true;
-    api(`/api/bots/${bot.id}/commands`)
+    setCommands([]);
+    api(`/api/bots/${bot.id}/commands?taskId=${encodeURIComponent(laneId)}`)
       .then((r: { commands: Command[] }) => live && setCommands(r.commands ?? []))
       .catch(() => live && setCommands([]));
     return () => {
       live = false;
     };
-  }, [bot.id, skillKey]);
-  const commandIds = new Set(commands.map((c) => c.id));
-  const offered = slash ? matchCommands(commands, slash.query) : [];
+  }, [bot.id, skillKey, laneId, bot.modelSelection.instanceId, bot.cwd, bot.busy, commandTick, commandEngine]);
+  // Bloks' own (`/goal`) ride along with the agent's, except while
+  // rehearsing, where the message becomes a rehearsal and not a turn
+  const lane = bot.tasks?.find((t) => t.id === laneId);
+  const listed = rehearse ? commands : withBloksCommands(commands, lane);
+  const commandIds = new Set(listed.filter((c) => !c.prefix).map((c) => c.id));
+  const dollarIds = new Set(listed.filter((c) => c.prefix === "$").map((c) => c.id));
+  const offered = slash ? matchCommands(listed, slash.query, 8, slash.start === 0) : [];
+  // whether the list is on screen: a slash with nothing to offer under it
+  // draws nothing
+  const slashShown = Boolean(slash && (offered.length > 0 || (listed.length === 0 && slash.query === "")));
   const readSlash = (el: HTMLTextAreaElement) => {
     setSlash(slashAt(el.value, el.selectionStart ?? el.value.length));
     setPick(0);
@@ -194,7 +305,7 @@ export function Composer({
     if (!slash || !el) return;
     // the word being typed ends where the query does; the caret is not
     // trusted here, since a key handler can see it before it settles
-    const next = insertCommand(text, slash.start, slash.start + 1 + slash.query.length, command.id);
+    const next = insertCommand(text, slash.start, slash.start + 1 + slash.query.length, command.id, command.prefix);
     setText(next.text);
     setSlash(null);
     requestAnimationFrame(() => {
@@ -215,40 +326,111 @@ export function Composer({
     });
   };
 
-  const send = () => {
-    if (rehearse) return void startRehearsal();
-    if (!text.trim() && !attachments.length) return;
+  // A file dropped anywhere in the window attaches here, not only one
+  // dropped on this box: aiming at the bottom edge is fiddly, and with a
+  // hidden Dock it brings the Dock up instead. A drop something else in
+  // the window already took (it called preventDefault) is left to it.
+  const intakeRef = useRef(intake);
+  intakeRef.current = intake;
+  const [dropping, setDropping] = useState(false);
+  useEffect(() => {
+    let depth = 0;
+    const hasFiles = (e: DragEvent) => Boolean(e.dataTransfer?.types.includes("Files"));
+    const enter = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      depth++;
+      setDropping(true);
+    };
+    const leave = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setDropping(false);
+    };
+    const over = (e: DragEvent) => {
+      if (hasFiles(e)) e.preventDefault();
+    };
+    const drop = (e: DragEvent) => {
+      depth = 0;
+      setDropping(false);
+      if (e.defaultPrevented || !e.dataTransfer?.files.length) return;
+      e.preventDefault();
+      intakeRef.current([...e.dataTransfer.files]);
+    };
+    window.addEventListener("dragenter", enter);
+    window.addEventListener("dragleave", leave);
+    window.addEventListener("dragover", over);
+    window.addEventListener("drop", drop);
+    return () => {
+      window.removeEventListener("dragenter", enter);
+      window.removeEventListener("dragleave", leave);
+      window.removeEventListener("dragover", over);
+      window.removeEventListener("drop", drop);
+    };
+  }, []);
+
+  const send = (stopFirst = false) => {
+    const { text, attachments } = latest.current;
+    // These branches submit no message to sequence after Stop, but the
+    // modifier shortcut still stops as it did before.
+    const stopOnly = () => {
+      if (stopFirst) dispatch({ type: "interrupt", botId: bot.id });
+    };
+    if (rehearse) { stopOnly(); return void startRehearsal(); }
+    if (!text.trim() && !attachments.length) { stopOnly(); return; }
+    // `/goal` alone has nothing to aim at yet, so it opens the dialog
+    // that asks, rather than sending a goal the server would refuse
+    if (/^\s*\/goal\s*$/.test(text) && !attachments.length && !lane?.noGoals) {
+      stopOnly();
+      dispatch({ type: "openGoal", botId: bot.id, taskId: laneId });
+      setDraft({ text: "", attachments: [] });
+      setSlash(null);
+      return;
+    }
+    const sent = { text, attachments };
     dispatch({
       type: "send",
       botId: bot.id,
       text: composeOutgoing(text, attachments),
       replyTo: replyTo ?? undefined,
+      stopFirst,
+      onFailed: () => giveBack(sent),
     });
     track("message_sent", { driver: bot.modelSelection?.instanceId });
-    setText("");
+    // Empty now, before a quick refusal can hand the input back.
+    setDraft({ text: "", attachments: [] });
     setSlash(null);
-    setAttachments([]);
     setAttachNotice(null);
     onClearReply?.();
   };
 
 
   const startRehearsal = () => {
+    const { text, attachments } = latest.current;
     const task = composeOutgoing(text, attachments).trim();
     if (!task || rehearsing) return;
     setRehearsing(true);
     setRehearseError(null);
+    // Emptied as it goes, like a send. Starting a rehearsal opens its own
+    // lane, which can unmount this box before the answer comes back, and
+    // the words left in it were then kept as this conversation's draft:
+    // back here, Enter would have sent the task for real.
+    const sent = { text, attachments };
+    setDraft({ text: "", attachments: [] });
     api("/api/rehearsals", { method: "POST", body: JSON.stringify({ botId: bot.id, text: task, compareWith }) })
       .then(() => {
         track("rehearsal_started", { compared: compareWith.length });
-        setText("");
-        setAttachments([]);
+        if (!mounted.current) return;
         setRehearse(false);
         setCompareWith([]);
         onClearReply?.();
       })
-      .catch((e: Error) => setRehearseError(e.message))
-      .finally(() => setRehearsing(false));
+      .catch((e: Error) => {
+        giveBack(sent);
+        if (mounted.current) setRehearseError(e.message);
+      })
+      .finally(() => {
+        if (mounted.current) setRehearsing(false);
+      });
   };
 
   // Dictation runs through a native helper rather than the browser speech
@@ -359,8 +541,10 @@ export function Composer({
         <div className="mx-auto flex max-w-[760px] items-center gap-3 rounded-2xl border bg-muted/40 px-3.5 py-3">
           <Archive size={15} className="shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1 text-[13px] leading-relaxed text-muted-foreground">
-            {bot.name} is archived. Everything it said is still here, and it will not take new work
-            until you restore it.
+            {bot.archivedBy
+              ? `${state.bots.find((b) => b.id === bot.archivedBy)?.name ?? "The agent that hired it"} archived ${bot.name}${bot.archiveNote ? `: "${bot.archiveNote}"` : ""}. `
+              : `${bot.name} is archived. `}
+            Everything it said is still here, and it will not take new work until you restore it.
           </span>
           <Button
             size="sm"
@@ -411,10 +595,43 @@ export function Composer({
         intake([...e.dataTransfer.files]);
       }}
     >
+      {dropping && (
+        // the whole window is the target, so say so where the eye is
+        <div className="pointer-events-none fixed inset-2 z-50 flex animate-pop-in items-center justify-center rounded-2xl border-2 border-dashed border-brand/50 bg-background/70">
+          <span className="rounded-xl bg-popover px-3.5 py-2 text-[13px] text-foreground shadow-lg shadow-(color:--shadow-color)">
+            Drop to attach to {bot.name}
+          </span>
+        </div>
+      )}
       {replyTo && (
         <div className="mx-auto mb-2 max-w-[760px]">
           <ReplyChip draft={replyTo} onClear={() => onClearReply?.()} />
         </div>
+      )}
+      {recoveries.length > 0 && (
+        <section aria-label="Saved submissions" className="mx-auto mb-2 max-h-64 max-w-[760px] space-y-2 overflow-y-auto">
+          {recoveries.map((item) => (
+            <div key={item.id} role="group" aria-label="Saved submission" className="rounded-xl border bg-card px-3 py-2 text-[12px]">
+              <p className="font-medium">Saved submission</p>
+              <p className="text-muted-foreground">Check the conversation before sending again.</p>
+              {item.draft.text && <p className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap break-words">{item.draft.text}</p>}
+              {item.draft.attachments.length > 0 && (
+                <div className="mt-1 flex flex-wrap gap-1.5">
+                  {item.draft.attachments.map((a) => <AttachmentChip key={a.id} attachment={a} />)}
+                </div>
+              )}
+              <div className="mt-1 flex gap-2">
+                <button type="button" onClick={() => restore(item.id)} className="rounded-lg px-2 py-1 hover:bg-accent">Restore draft</button>
+                <button type="button" onClick={() => {
+                  discardRecovery(draftKey, item.id);
+                  setRecoveries(readRecoveries(draftKey));
+                  setBlockedRecovery(null);
+                }} className="rounded-lg px-2 py-1 text-muted-foreground hover:bg-accent">Discard</button>
+              </div>
+              {blockedRecovery === item.id && <p className="mt-1 text-muted-foreground">Finish or clear the current draft first.</p>}
+            </div>
+          ))}
+        </section>
       )}
       {attachNotice && (
         <div className="mx-auto mb-2 flex max-w-[760px] animate-rise-in items-center gap-2 rounded-xl bg-warning/10 px-3 py-2 text-[12px] text-warning">
@@ -431,31 +648,7 @@ export function Composer({
       {attachments.length > 0 && (
         <div className="mx-auto mb-2 flex max-w-[760px] flex-wrap gap-1.5">
           {attachments.map((a) => (
-            <span
-              key={a.id}
-              className="flex max-w-[240px] items-center gap-1.5 rounded-xl border bg-muted/50 py-1 pl-1.5 pr-1 text-[12px] text-foreground"
-            >
-              {a.kind === "image" ? (
-                <img
-                  src={`/api/attachments/${attachmentBasename(a.path)}`}
-                  alt={a.name}
-                  className="size-7 shrink-0 rounded-lg object-cover"
-                />
-              ) : (
-                <FileIcon size={14} className="shrink-0 text-muted-foreground" />
-              )}
-              <span className="min-w-0 flex-1 truncate">
-                {a.kind === "paste" ? `Pasted text, ${a.lines} lines` : a.name}
-              </span>
-              <span className="shrink-0 text-muted-foreground">{formatBytes(a.bytes)}</span>
-              <button
-                onClick={() => setAttachments((cur) => cur.filter((x) => x.id !== a.id))}
-                className="shrink-0 rounded-full p-0.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                aria-label={`Remove ${a.kind === "paste" ? "pasted text" : a.name}`}
-              >
-                <X size={12} />
-              </button>
-            </span>
+            <AttachmentChip key={a.id} attachment={a} onRemove={() => setAttachments((cur) => cur.filter((x) => x.id !== a.id))} />
           ))}
         </div>
       )}
@@ -529,12 +722,12 @@ export function Composer({
           </button>
         </div>
       )}
-      {slash && (offered.length > 0 || (commands.length === 0 && slash.query === "")) && (
+      {slash && slashShown && (
         <div className="mx-auto mb-1.5 max-w-[760px]">
           <div
             role="listbox"
-            aria-label={`${bot.name}'s skills`}
-            className="overflow-hidden rounded-xl border bg-popover p-1 shadow-lg shadow-[--shadow-color]"
+            aria-label={`${bot.name}'s commands`}
+            className="overflow-hidden rounded-xl border bg-popover p-1 shadow-lg shadow-(color:--shadow-color)"
           >
             {offered.length === 0 ? (
               <div className="px-2 py-1.5 text-[12.5px] text-muted-foreground">
@@ -557,13 +750,13 @@ export function Composer({
                     i === pick ? "bg-accent" : "hover:bg-accent/60",
                   )}
                 >
-                  <span className="shrink-0 font-mono text-[12.5px] font-medium text-brand-ink">/{c.id}</span>
+                  <span className="shrink-0 font-mono text-[12.5px] font-medium text-brand-ink">{c.prefix ?? "/"}{c.id}</span>
                   <span className="min-w-0 flex-1 truncate text-[12.5px] text-muted-foreground">
                     {c.description || c.name}
                   </span>
-                  {c.source === "engine" && (
-                    <span className="shrink-0 text-[11px] text-muted-foreground/70">Claude Code</span>
-                  )}
+                  <span className="shrink-0 text-[11px] text-muted-foreground/70">
+                    {c.source === "bloks" ? "Bloks" : c.source === "library" ? "Agent skill" : c.kind === "command" ? "Engine command" : "Engine skill"}
+                  </span>
                 </button>
               ))
             )}
@@ -604,7 +797,7 @@ export function Composer({
           className="pointer-events-none absolute inset-0 overflow-hidden px-1 py-1 text-[14.5px] leading-relaxed text-transparent [overflow-wrap:break-word] [white-space:pre-wrap]"
         >
           <div>
-            {segments(text, commandIds).map((run, i) =>
+            {segments(text, commandIds, dollarIds).map((run, i) =>
               run.skill ? (
                 <span key={i} className="rounded-[5px] bg-brand-soft ring-2 ring-brand-soft">
                   {run.text}
@@ -660,21 +853,51 @@ export function Composer({
               }
             }
             if (slash && e.key === "Escape") {
-              e.preventDefault();
-              return setSlash(null);
-            }
-            // Enter sends; Shift+Enter starts a new line. While the agent
-            // works, plain Enter queues behind the running turn, and
-            // Cmd+Enter stops the turn first: both the patient road and
-            // the impatient one, the same way the CLIs offer both.
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              if ((e.metaKey || e.ctrlKey) && bot.busy) {
-                dispatch({ type: "interrupt", botId: bot.id });
+              setSlash(null);
+              // Only a list that was on screen takes the key. A slash with
+              // nothing offered under it had nothing to close, and Esc
+              // goes on to what it means next.
+              if (slashShown) {
+                e.preventDefault();
+                return;
               }
-              send();
             }
-            if (e.key === "Escape" && recording) setRecording(false);
+            // ↑ in an empty box edits the last thing you said, the way
+            // chat apps do. With anything in the box, a chip included, it
+            // is only the caret moving, and it stays that.
+            if (
+              e.key === "ArrowUp" &&
+              !e.altKey &&
+              !e.metaKey &&
+              !e.ctrlKey &&
+              !e.shiftKey &&
+              !text &&
+              !attachments.length &&
+              e.currentTarget.selectionStart === 0 &&
+              e.currentTarget.selectionEnd === 0 &&
+              onEditLast?.()
+            ) {
+              e.preventDefault();
+              return;
+            }
+            // Enter sends; Shift+Enter starts a new line. Cmd/Ctrl+Enter
+            // stops a running turn first, then sends the same message.
+            // Not while a keyboard is still composing a character: that
+            // Enter picks the character, and must not stop the turn.
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              send((e.metaKey || e.ctrlKey) && openLaneWorking(bot));
+            }
+            if (e.key === "Escape" && recording) return setRecording(false);
+            // Esc stops the agent, as the stop button does (GitHub 258).
+            // Last in line: the `/` list and dictation have taken theirs
+            // above, anything open on top of the conversation closes
+            // first, and a keyboard still composing a character cancels
+            // that. The box keeps what is in it.
+            if (e.key === "Escape" && !e.nativeEvent.isComposing && openLaneWorking(bot) && !escapeTaken()) {
+              e.preventDefault();
+              dispatch({ type: "interrupt", botId: bot.id });
+            }
           }}
           placeholder={
             recording
@@ -683,11 +906,14 @@ export function Composer({
                 ? compareWith.length
                   ? "Describe the task for each of them to rehearse…"
                   : `Describe the task for ${bot.name} to rehearse…`
-                : bot.busy
-                ? `${bot.name} is working. Enter queues, ${modKey()}Enter interrupts…`
-                : `Message ${bot.name}`
+                : openLaneWorking(bot)
+                ? `${bot.name} is working. Enter tells it without stopping, ${modKey()}Enter stops it first.`
+                : // stopped on a card: words typed here are read after it is answered
+                  lane?.state === "needs-you"
+                  ? `${bot.name} is waiting for your answer above.`
+                  : `Message ${bot.name}`
           }
-          className="relative block w-full min-w-0 resize-none bg-transparent px-1 py-1 text-[14.5px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground"
+          className="relative block w-full min-w-0 resize-none bg-transparent px-1 py-1 text-[14.5px] leading-relaxed text-foreground outline-none placeholder:truncate placeholder:text-muted-foreground placeholder-shown:[mask-image:linear-gradient(to_right,#000_calc(100%-28px),transparent)]"
         />
         </div>
         <button
@@ -701,41 +927,42 @@ export function Composer({
         >
           <FlaskConical size={16} />
         </button>
-        {bot.busy ? (
+        <ComposerRing bot={bot} />
+        <button
+          onClick={() => void toggleMic()}
+          className={cn(
+            "flex size-8 shrink-0 items-center justify-center rounded-full transition-colors duration-150 active:scale-95",
+            recording
+              ? "animate-pulse bg-destructive/15 text-destructive"
+              : "text-muted-foreground hover:bg-accent hover:text-foreground",
+          )}
+          title={recording ? "Stop dictation (Esc)" : "Dictate"}
+        >
+          {recording ? <VoiceMeter level={level} /> : <Mic size={17} />}
+        </button>
+        {openLaneWorking(bot) && !canSend ? (
           <button
             onClick={() => dispatch({ type: "interrupt", botId: bot.id })}
             className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground active:scale-95"
-            title="Stop"
+            title="Stop (Esc)"
           >
             <Square size={13} className="fill-current" />
           </button>
         ) : (
           <button
-            onClick={() => void toggleMic()}
+            onClick={() => send()}
+            disabled={!canSend}
             className={cn(
-              "flex size-8 shrink-0 items-center justify-center rounded-full transition-colors duration-150 active:scale-95",
-              recording
-                ? "animate-pulse bg-destructive/15 text-destructive"
-                : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              "flex size-8 shrink-0 items-center justify-center rounded-full transition-[background-color,color,transform,opacity] duration-150 ease-out active:scale-95",
+              canSend
+                ? "bg-primary text-primary-foreground hover:opacity-90"
+                : "cursor-not-allowed bg-muted text-muted-foreground/60",
             )}
-            title={recording ? "Stop dictation (Esc)" : "Dictate"}
+            title="Send"
           >
-            {recording ? <VoiceMeter level={level} /> : <Mic size={17} />}
+            <ArrowUp size={17} strokeWidth={2.4} />
           </button>
         )}
-        <button
-          onClick={send}
-          disabled={!canSend}
-          className={cn(
-            "flex size-8 shrink-0 items-center justify-center rounded-full transition-[background-color,color,transform,opacity] duration-150 ease-out active:scale-95",
-            canSend
-              ? "bg-primary text-primary-foreground hover:opacity-90"
-              : "cursor-not-allowed bg-muted text-muted-foreground/60",
-          )}
-          title="Send"
-        >
-          <ArrowUp size={17} strokeWidth={2.4} />
-        </button>
       </div>
     </div>
   );

@@ -5,7 +5,6 @@
 import { useCallback, useEffect, useState } from "react";
 import AlertTriangle from "lucide-react/dist/esm/icons/alert-triangle.mjs";
 import Check from "lucide-react/dist/esm/icons/check.mjs";
-import Copy from "lucide-react/dist/esm/icons/copy.mjs";
 import Loader2 from "lucide-react/dist/esm/icons/loader-2.mjs";
 import Mic from "lucide-react/dist/esm/icons/mic.mjs";
 import Monitor from "lucide-react/dist/esm/icons/monitor.mjs";
@@ -19,6 +18,9 @@ import { cn } from "@/lib/cn";
 import { recommendedFor, WORK_TYPES } from "@/lib/recommend";
 import { AGENT_TEMPLATES } from "@/lib/agentTemplates";
 import { ThisComputer, thisComputer } from "@/lib/thisComputer";
+import { ApprovalsChooser, confirmWidening, type ApprovalMode } from "./ApprovalsChooser";
+import { EngineSetupActions } from "./EngineSetup";
+import { SetupPrivacyLine, SetupReviewList, useSetupReview } from "./BringYourSetup";
 
 type InstanceRow = {
   instanceId: string;
@@ -34,42 +36,26 @@ type InstanceRow = {
 
 const isElectron = navigator.userAgent.includes("Electron");
 
-/** An install command you can take with you. */
-function CommandRow({ command }: { command: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <button
-      onClick={() => {
-        void navigator.clipboard?.writeText(command);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1600);
-      }}
-      className="mt-2 flex w-full items-center gap-2 rounded-lg bg-muted px-2.5 py-1.5 text-left transition-colors duration-150 hover:bg-accent active:scale-[0.99]"
-      title="Copy to clipboard"
-    >
-      <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">
-        {command}
-      </code>
-      {copied ? (
-        <Check size={13} className="shrink-0 text-success" />
-      ) : (
-        <Copy size={13} className="shrink-0 text-muted-foreground" />
-      )}
-    </button>
-  );
-}
-
+/** One engine: ready, installed but signed out, or missing, each with
+ * the button that gets it to ready. */
 function EngineRow({
-  ok,
+  kind,
+  name,
+  state,
   title,
   detail,
   command,
+  onChanged,
 }: {
-  ok: boolean;
+  kind: string;
+  name: string;
+  state: "ready" | "signed-out" | "missing";
   title: string;
   detail: string;
   command?: string;
+  onChanged: () => void;
 }) {
+  const ok = state === "ready";
   return (
     <div className="rounded-xl border bg-card p-3.5">
       <div className="flex items-start gap-3">
@@ -84,7 +70,16 @@ function EngineRow({
         <div className="min-w-0 flex-1">
           <div className="text-[13.5px] font-medium text-foreground">{title}</div>
           <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted-foreground">{detail}</div>
-          {!ok && command && <CommandRow command={command} />}
+          {!ok && (
+            <EngineSetupActions
+              kind={kind}
+              name={name}
+              installed={state === "signed-out"}
+              signedOut={state === "signed-out"}
+              fallback={command}
+              onChanged={onChanged}
+            />
+          )}
         </div>
       </div>
     </div>
@@ -149,6 +144,35 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [work, setWork] = useState<string[]>([]);
   const [hiring, setHiring] = useState<string | null>(null);
   const [hired, setHired] = useState<string[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalMode>("ask");
+  const [approvalsNote, setApprovalsNote] = useState<string | null>(null);
+  const [savingApprovals, setSavingApprovals] = useState(false);
+  /** What the person's other agent tools already know. The step that
+   * offers it is only shown when there is something new to offer. */
+  const setup = useSetupReview();
+  const [broughtAgents, setBroughtAgents] = useState(0);
+  const [brought, setBrought] = useState(false);
+  const offerSetup = (setup.review?.fresh ?? 0) > 0;
+  const afterSetup = () => (isElectron ? setStep(4) : finish());
+
+  /** Where every agent starts, the one already here included. */
+  const chooseApprovals = async () => {
+    setApprovalsNote(null);
+    if (!(await confirmWidening("ask", approvals, "your agents"))) {
+      setApprovalsNote("Not confirmed. Pick again, or continue with Ask first.");
+      setApprovals("ask");
+      return;
+    }
+    setSavingApprovals(true);
+    await fetch("/api/approvals", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: approvals, applyToAll: true }),
+    }).catch(() => {});
+    setSavingApprovals(false);
+    track("setup_approvals", { mode: approvals });
+    setStep(3);
+  };
 
   useEffect(() => {
     void fetch("/api/config")
@@ -159,24 +183,65 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
 
   /** Everything already here is worth keeping unless somebody says
    * otherwise, so this moves it aside rather than deleting it: the
-   * folder is renamed with a timestamp and can be renamed back. */
-  const startFresh = () => {
+   * folder is renamed with a timestamp and can be renamed back.
+   *
+   * The server ends itself once the folder is moved, because it still
+   * holds the old workspace in memory. The desktop app relaunches to
+   * start a fresh one; in a browser, the page waits for the server to
+   * come back (a supervisor restarts it) and then loads the new one. */
+  const [resetNote, setResetNote] = useState<string | null>(null);
+  const startFresh = async () => {
     if (
       !window.confirm(
-        "Move your existing agents and conversations aside and start fresh?\n\nNothing is deleted: everything is kept in a timestamped folder next to it, and the app will reload.",
+        "Start fresh?\n\nYour agents, rooms and conversations are moved into a timestamped folder beside this one, and nothing is deleted. Your keys, engines and Bloks Cloud stay set up. Bloks restarts to finish.",
       )
     ) {
       return;
     }
     setResetting(true);
-    void fetch("/api/workspace/reset", { method: "POST" })
-      .then(() => {
-        // the harness reseeds itself on the next boot; a reload is the
-        // shortest honest way to land in that fresh workspace
-        localStorage.removeItem("bloks-setup-done");
+    setResetNote(null);
+    const before = await fetch("/api/health")
+      .then((r) => r.json())
+      .then((h) => h?.pid ?? null)
+      .catch(() => null);
+    const res = await fetch("/api/workspace/reset", { method: "POST" }).catch(() => null);
+    if (!res?.ok) {
+      const body = await res?.json().catch(() => null);
+      setResetting(false);
+      setResetNote(`That didn't work: ${body?.error ?? "Bloks could not move the workspace aside"}. Nothing was changed.`);
+      return;
+    }
+    // what this browser remembered about the old workspace goes with it
+    for (const key of [
+      "bloks-setup-done",
+      "bloks-selected",
+      "bloks-folded-sections",
+      "bloks-intro-plugins",
+      "bloks-project",
+      "bloks-room-lens",
+    ]) {
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        /* private mode */
+      }
+    }
+    if (window.bloks?.relaunch) {
+      await window.bloks.relaunch();
+      return;
+    }
+    for (let waited = 0; waited < 30_000; waited += 1000) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const pid = await fetch("/api/health")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((h) => h?.pid ?? null)
+        .catch(() => null);
+      if (pid && pid !== before) {
         location.reload();
-      })
-      .catch(() => setResetting(false));
+        return;
+      }
+    }
+    setResetNote("Your old workspace is moved aside. Restart Bloks to open the fresh one.");
   };
 
   const checkEngines = useCallback(() => {
@@ -189,14 +254,16 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   }, []);
 
   useEffect(() => {
-    track("setup_step", { step });
+    // Reaching the setup step would say another tool was found here, and
+    // that screen promises nothing about the person's setup leaves.
+    if (step !== 5) track("setup_step", { step });
     if (step === 0) {
       void checkEngines();
       // the user may install a CLI in another window and come back
       const timer = setInterval(checkEngines, 5000);
       return () => clearInterval(timer);
     }
-    if (step === 3 && isElectron) {
+    if (step === 4 && isElectron) {
       const poll = () => window.bloks?.permStatus?.().then(setPerms).catch(() => {});
       poll();
       const timer = setInterval(poll, 2000);
@@ -238,10 +305,11 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     // chat with a stranger. Choosing a role is what teaches that agents
     // have jobs, and it is the one idea the rest of the product rests on.
     // Skipping is fine: Nova is seeded on the server and already waiting.
-    // Somebody who took a recommendation already has an agent with a job.
-    // Opening the picker on top of that would read as though the choice
-    // they just made had not counted.
-    if (hired.length === 0) {
+    // Somebody who took a recommendation, or brought an agent over from
+    // another tool, already has an agent with a job. Opening the picker on
+    // top of that would read as though the choice they just made had not
+    // counted.
+    if (hired.length === 0 && broughtAgents === 0) {
       dispatch({ type: "toggleNewAgent", open: true, firstRun: true });
     }
   };
@@ -264,21 +332,21 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     {
       kind: "claudeAgent",
       name: "Claude Code",
-      command: "npm i -g @anthropic-ai/claude-code",
+      command: "curl -fsSL https://claude.ai/install.sh | bash",
       have: "Installed and ready to power agents.",
-      want: "Not found. Install it, then this turns green on its own.",
+      want: "Not installed yet. Install it here; it turns green on its own.",
     },
     {
       kind: "codex",
       name: "Codex",
-      command: "npm i -g @openai/codex",
+      command: "npm i -g --prefix ~/.local @openai/codex",
       have: "Installed. Agents can run on Codex too.",
       want: "Optional. Adds a second engine your agents can use.",
     },
     {
       kind: "pi",
       name: "Pi",
-      command: "npm i -g --ignore-scripts @earendil-works/pi-coding-agent && npm i -g pi-acp",
+      command: "npm i -g --prefix ~/.local --ignore-scripts @earendil-works/pi-coding-agent pi-acp",
       have: "Installed. Agents can run on Pi too.",
       want: "Optional. Install Pi and pi-acp to add a tool-running engine.",
     },
@@ -305,12 +373,21 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     },
   ];
 
-  const ready = instances?.some((i) => i.snapshot.state === "available") ?? false;
+  // signed out is not ready: it installs green and then fails the first
+  // message, which is the setup problem this screen exists to catch
+  const ready =
+    instances?.some((i) => i.snapshot.state === "available" && i.snapshot.authenticated !== false) ?? false;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background p-4">
       <BlockField />
-      <div className="relative flex w-full max-w-[440px] animate-pop-in flex-col rounded-2xl border bg-popover p-6 shadow-2xl shadow-[--shadow-color] sm:p-8">
+      <div
+        className={cn(
+          "relative flex w-full animate-pop-in flex-col rounded-2xl border bg-popover p-6 shadow-2xl shadow-(color:--shadow-color) sm:p-8",
+          // the review needs room for a preview and a destination on one line
+          step === 5 ? "max-h-full max-w-[560px] overflow-y-auto" : "max-w-[440px]",
+        )}
+      >
         {/* A first boot seeds one agent that says hello, so "is anything
             here" would greet every new install with "welcome back". What
             marks a real workspace is that somebody has spoken in it, or
@@ -339,14 +416,18 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               <Button onClick={() => setPrior(null)} disabled={resetting}>
                 Continue where I left off
               </Button>
-              <Button variant="secondary" onClick={startFresh} disabled={resetting}>
-                {resetting ? "Setting up…" : "Start fresh"}
+              <Button variant="secondary" onClick={() => void startFresh()} disabled={resetting}>
+                {resetting ? "Starting fresh…" : "Start fresh"}
               </Button>
             </div>
-            <p className="mt-3 text-center text-[12px] leading-relaxed text-muted-foreground">
-              Starting fresh keeps the old workspace in a timestamped folder beside this one.
-              Nothing is deleted.
-            </p>
+            {resetNote ? (
+              <p className="mt-3 text-center text-[12px] leading-relaxed text-warning">{resetNote}</p>
+            ) : (
+              <p className="mt-3 text-center text-[12px] leading-relaxed text-muted-foreground">
+                Starting fresh keeps the old workspace in a timestamped folder beside this one.
+                Nothing is deleted, and your keys and engines stay set up.
+              </p>
+            )}
           </div>
         ) : step === 0 ? (
           <div className="flex flex-col">
@@ -369,19 +450,29 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                   <div className="-mr-1 flex max-h-[264px] flex-col gap-2 overflow-y-auto pr-1">
                     {ENGINES.map((engine) => {
                       const found = byKind(engine.kind);
-                      const ok = found?.snapshot.state === "available";
+                      const installed = found?.snapshot.state === "available";
+                      const state = !installed ? "missing" : found?.snapshot.authenticated === false ? "signed-out" : "ready";
                       return (
                         <EngineRow
                           key={engine.kind}
-                          ok={ok}
+                          kind={engine.kind}
+                          name={engine.name}
+                          state={state}
                           title={
                             engine.name +
-                            (ok && found?.snapshot.version
+                            (installed && found?.snapshot.version
                               ? ` · ${found.snapshot.version.split(" ")[0]}`
                               : "")
                           }
-                          detail={ok ? engine.have : engine.want}
+                          detail={
+                            state === "ready"
+                              ? engine.have
+                              : state === "signed-out"
+                                ? "Installed, but not signed in yet, so it cannot answer. One step left."
+                                : engine.want
+                          }
                           command={engine.command}
+                          onChanged={() => void checkEngines()}
                         />
                       );
                     })}
@@ -407,7 +498,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 Check again
               </button>
               {instances && !ready && (
-                <span className="text-[12px] text-warning">No engine yet, agents can't reply</span>
+                <span className="text-[12px] text-warning">No engine ready yet, agents can't reply</span>
               )}
             </div>
 
@@ -464,6 +555,28 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         )}
 
         {step === 2 && (
+          // Asked once, up front, because the default decides how the
+          // first hour feels: a card for everything, or agents that get on
+          // with it. Every agent made from here starts on the choice.
+          <div className="flex flex-col">
+            <h1 className="text-[17px] font-semibold tracking-tight text-foreground">
+              How much should your agents ask?
+            </h1>
+            <p className="mt-1 text-[13px] leading-relaxed text-muted-foreground">
+              You can change this any time in Settings, and for any one agent in its own
+              settings.
+            </p>
+            <div className="mt-4">
+              <ApprovalsChooser value={approvals} onChange={setApprovals} compact />
+            </div>
+            {approvalsNote && <div className="mt-2 text-[12px] text-warning">{approvalsNote}</div>}
+            <Button size="lg" className="mt-5 w-full" disabled={savingApprovals} onClick={() => void chooseApprovals()}>
+              Continue
+            </Button>
+          </div>
+        )}
+
+        {step === 3 && (
           <div className="flex flex-col">
             <h1 className="text-[17px] font-semibold tracking-tight text-foreground">
               Start with one of these
@@ -508,13 +621,50 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 );
               })}
             </div>
-            <Button size="lg" className="mt-5 w-full" onClick={() => (isElectron ? setStep(3) : finish())}>
+            <Button size="lg" className="mt-5 w-full" onClick={() => (offerSetup ? setStep(5) : afterSetup())}>
               {hired.length ? "Continue" : "Skip for now"}
             </Button>
           </div>
         )}
 
-        {step === 3 && (
+        {step === 5 && setup.review && (
+          // Optional, and only here when another agent tool left something
+          // worth bringing. Last of the agent steps so the agents just
+          // hired can be chosen as a destination.
+          <div className="flex min-h-0 flex-col">
+            <h1 className="text-[17px] font-semibold tracking-tight text-foreground">Bring your setup</h1>
+            <p className="mt-1 text-[13px] leading-relaxed text-muted-foreground">
+              Found in {setup.review.sources.map((s) => s.name).join(", ")}. Tick what to bring over. You can
+              do this later from Settings too.
+            </p>
+            <SetupPrivacyLine className="mt-4" />
+            <div className="mt-4 min-h-0">
+              <SetupReviewList
+                review={setup.review}
+                onReview={setup.set}
+                compact
+                onImported={({ brought: count, created }) => {
+                  if (count) setBrought(true);
+                  setBroughtAgents((n) => n + created);
+                }}
+              />
+            </div>
+            {brought ? (
+              <Button size="lg" onClick={afterSetup} className="mt-3 w-full">
+                Continue
+              </Button>
+            ) : (
+              <button
+                onClick={afterSetup}
+                className="mt-3 text-[12px] text-muted-foreground transition-colors hover:text-foreground"
+              >
+                Skip for now
+              </button>
+            )}
+          </div>
+        )}
+
+        {step === 4 && (
           <div className="flex flex-col">
             <h1 className="text-[17px] font-semibold tracking-tight text-foreground">Permissions</h1>
             <p className="mt-1 text-[13px] text-muted-foreground">

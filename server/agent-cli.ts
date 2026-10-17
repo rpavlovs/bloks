@@ -35,8 +35,15 @@ export interface AgentToken {
   spent: number;
 }
 
-/** A turn that runs longer than this has bigger problems. */
+/** How long a credential lasts without its turn vouching for it. A turn
+ * that is still running renews it (see `alive` below): long turns are
+ * ordinary work now, an hour of comparing quotes in a browser, and an
+ * agent that lost its credential partway could not deliver what it
+ * found. The hour is the backstop for a turn that never ended cleanly. */
 export const TOKEN_TTL_MS = 60 * 60 * 1000;
+
+/** Whether the turn a credential belongs to is still running. */
+export type TurnAlive = (taskId: string) => boolean;
 
 /**
  * How many things one turn may do.
@@ -47,6 +54,12 @@ export const TOKEN_TTL_MS = 60 * 60 * 1000;
  * ceiling the two of them can spend an afternoon and a lot of somebody's
  * money agreeing with each other. Twelve is more than any real piece of
  * work needs and far less than a loop.
+ *
+ * It starts again with every turn, so it bounds one turn and not the
+ * back and forth. That is counted across turns as well: a turn another
+ * agent's message started is one further along a chain than the
+ * sender's, and past MAX_AGENT_CHAIN (server/index.ts) the next message
+ * waits for the person.
  */
 export const TURN_BUDGET = 12;
 
@@ -72,17 +85,28 @@ export const RULES: Rule[] = [
   // list like everything else, because the guard runs before any route
   // does and a route nobody listed is a route nobody reaches.
   { method: "GET", path: "/api/agent/whoami", why: "find out who this credential says you are" },
+  // The goal the person set for the conversation this turn runs in, if
+  // any. Reading only: a goal starts turns unattended and can run a
+  // command on the person's computer, so setting one is theirs alone,
+  // and no rule here reaches the routes that do.
+  { method: "GET", path: "/api/agent/goal", why: "read the goal the person set for this conversation, if there is one" },
 
   // Who is here, so an agent can address someone by name rather than
   // guessing. Names, roles and skills only: the roster route already
   // returns nothing secret.
   { method: "GET", path: "/api/bots", why: "see who else is in the workspace" },
   { method: "GET", path: "/api/bloks", why: "see which rooms exist" },
+  // How the sidebar is arranged, so an agent filing or pinning a teammate
+  // can see where things stand first. The order of the headings is read
+  // here and only the person moves it.
+  { method: "GET", path: "/api/sidebar", why: "see how the sidebar is arranged: its sections in order, and what is pinned where" },
 
   // Saying something to somebody. This is the one that turns a chat
   // between one agent and one person into a workspace.
   { method: "POST", path: "/api/bots/:id/messages", why: "say something to another agent" },
+  { method: "POST", path: "/api/bots/:id/take-back", why: "take back its own messages still waiting for another agent" },
   { method: "POST", path: "/api/bloks/:room/messages", why: "say something in a room it is in" },
+  { method: "GET", path: "/api/bloks/:room/messages", why: "read what was said in a room it is in" },
 
   // Getting a colleague, and somewhere to work with them.
   { method: "POST", path: "/api/bots", why: "hire a teammate" },
@@ -91,11 +115,12 @@ export const RULES: Rule[] = [
 
   // Work that repeats, and work nobody has been named for.
   { method: "GET", path: "/api/routines", why: "see what is scheduled" },
-  { method: "POST", path: "/api/routines", why: "file a routine" },
+  { method: "POST", path: "/api/routines", why: "file a routine: at a time of day, or a check-in every so often that may answer QUIET" },
   { method: "PATCH", path: "/api/routines/:id", why: "change a routine" },
   { method: "DELETE", path: "/api/routines/:id", why: "drop a routine" },
   { method: "GET", path: "/api/watchers", why: "see its own watchers" },
-  { method: "POST", path: "/api/watchers", why: "watch a folder, a web page or a feed, and act when it changes" },
+  { method: "POST", path: "/api/watchers", why: "watch a folder, a web page or a feed, or run a cheap check, and act when it finds something" },
+  { method: "PATCH", path: "/api/watchers/:id", why: "change one of its own watchers without replacing it" },
   { method: "DELETE", path: "/api/watchers/:id", why: "stop one of its own watchers" },
   { method: "GET", path: "/api/jobs", why: "read the job board" },
   { method: "POST", path: "/api/jobs", why: "post work to the board" },
@@ -103,7 +128,16 @@ export const RULES: Rule[] = [
   // Its own notes, and nobody else's.
   { method: "GET", path: "/api/bots/:me/memory", why: "read its own memory" },
   { method: "GET", path: "/api/bots/:me/recall", why: "look something up in its own past conversations" },
+  { method: "GET", path: "/api/bots/:me/recall/:id", why: "read in full a message its recall found" },
+  // Stopping is an authority: the route allows it only for an agent the
+  // caller hired, or one it outranks in a room they share.
+  { method: "POST", path: "/api/bots/:id/interrupt", why: "stop the current turn of an agent it hired or leads in a room" },
+  { method: "POST", path: "/api/bots/:id/archive", why: "archive an agent it hired, once that agent has nothing left to do" },
   { method: "POST", path: "/api/bots/:me/notes", why: "suggest a short note about the person, for them to keep or not" },
+  // The same secure field the request_secret tool plants, for an engine
+  // that has no such tool. Asking is not a permission: the person still
+  // types the value, and the agent never sees it in the chat.
+  { method: "POST", path: "/api/bots/:me/secrets", why: "ask the person for an API key or other secret, through a secure field in the chat" },
   { method: "PUT", path: "/api/bots/:me/memory", why: "write its own memory" },
   { method: "GET", path: "/api/bots/:me/artifacts", why: "list what it has produced" },
 
@@ -114,7 +148,14 @@ export const RULES: Rule[] = [
   // Answering with something other than a paragraph.
   { method: "POST", path: "/api/bots/:me/show", why: "answer with a chart, a table or another component" },
   { method: "PATCH", path: "/api/bots/:me", why: "change its own settings" },
+  // A section, a pin and a place among the pins are where a row sits in
+  // the sidebar: they change nothing another agent can do or see, and the
+  // person can move them back. The route itself refuses anything else on
+  // an agent that is not the caller.
+  { method: "PATCH", path: "/api/bots/:id", why: "file a teammate into a sidebar section, pin it or place it among the pins (nothing else of its)" },
   { method: "PATCH", path: "/api/bots/:me/tasks/:id", why: "rename one of its own conversations" },
+  { method: "DELETE", path: "/api/bots/:me/tasks/:id", why: "close one of its own conversations, once its turn there ends" },
+  { method: "POST", path: "/api/bots/:me/tasks/:id/fresh", why: "start a fresh engine session in the conversation it is in, keeping the transcript" },
 ];
 
 /**
@@ -125,17 +166,27 @@ export const RULES: Rule[] = [
  */
 export const NEVER = [
   "/api/config",
+  // how much every agent may do without asking is the person's alone
+  "/api/approvals",
   "/api/providers",
   "/api/custom-endpoints",
   "/api/instances",
+  // installing software and opening Terminal are the person's to start
+  "/api/engines",
   "/api/pair",
   "/api/mcp-servers",
+  // reading the person's other tools out of their home folder
+  "/api/setup-import",
   "/api/ledger",
   "/api/relay",
   "/api/calls",
   "/api/terminal",
   "/api/usage",
   "/api/profile",
+  // a backup is the whole workspace, and a restore replaces it
+  "/api/backups",
+  // a map of what reaches the person's keys and screen, and its fixes
+  "/api/security",
 ];
 
 const PATH_PART = /^[\w.-]+$/;
@@ -267,16 +318,24 @@ export class AgentTokens {
     return minted;
   }
 
-  /** Who is calling, or nobody. */
-  identify(token: string | null | undefined, now: number): AgentToken | null {
+  /** Who is calling, or nobody. A credential past its hour still works
+   * while its turn is running, and is renewed for another; once the turn
+   * is over it is gone. */
+  identify(token: string | null | undefined, now: number, alive?: TurnAlive): AgentToken | null {
     if (!token) return null;
     const found = this.byToken.get(token);
     if (!found) return null;
-    if (found.expiresAt <= now) {
+    if (found.expiresAt <= now && !this.renew(found, now, alive)) {
       this.byToken.delete(token);
       return null;
     }
     return found;
+  }
+
+  private renew(held: AgentToken, now: number, alive?: TurnAlive): boolean {
+    if (!alive?.(held.taskId)) return false;
+    held.expiresAt = now + TOKEN_TTL_MS;
+    return true;
   }
 
   /** The turn ended. Whatever it was given stops working now rather than
@@ -303,9 +362,9 @@ export class AgentTokens {
     }
   }
 
-  sweep(now: number) {
+  sweep(now: number, alive?: TurnAlive) {
     for (const [token, held] of this.byToken) {
-      if (held.expiresAt <= now) this.byToken.delete(token);
+      if (held.expiresAt <= now && !this.renew(held, now, alive)) this.byToken.delete(token);
     }
   }
 
@@ -317,6 +376,31 @@ export class AgentTokens {
 /** What the agent is told, once, when it has a credential. Short on
  * purpose: a paragraph of instructions in every prompt is a paragraph
  * competing with the actual request. */
+/** The opening of a turn whose session last ran the CLI some other way.
+ * `before` is the command it was told then, when that was recorded. */
+export function cliMovedNote(command: string, before?: string): string {
+  return before
+    ? `(Bloks has moved since your earlier turns. Run its command as \`${command}\` from now on. Earlier commands in this conversation that run \`${before}\` reach the copy that used to be there, so do not reuse them.)`
+    : `(Run the bloks command as \`${command}\` from now on. Earlier commands in this conversation that run bloks.mjs from a written-out path may reach an older copy of Bloks that has since moved, so do not reuse them.)`;
+}
+
+/**
+ * How an agent asks for a key, said in terms of what it actually has
+ * (GitHub 172). Claude Code and the API engines with tools have the
+ * request_secret tool, the other engines with a credential have `secret`
+ * on the command line, and an engine with neither is told nothing, since
+ * pointing it at a tool it cannot call only makes it pretend to.
+ */
+export function secretHint(route: "tool" | "cli" | null, command: string): string | null {
+  if (route === "tool") {
+    return "When a task needs an API key or other secret from the user, call the request_secret tool and they get a secure field in the chat; never ask for keys in plain conversation.";
+  }
+  if (route === "cli") {
+    return `When a task needs an API key or other secret from the user, run \`${command} secret "<what it is>" --hint "<where to find it>"\` and they get a secure field in the chat; never ask for keys in plain conversation.`;
+  }
+  return null;
+}
+
 export function cliBriefing(command: string): string {
   return [
     `You can act on this workspace yourself, not only describe what should happen. Run \`${command} help\` to see how.`,

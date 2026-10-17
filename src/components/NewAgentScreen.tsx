@@ -34,6 +34,7 @@ import { AGENT_FILE_ACCEPT, ImportAgentDialog, readAgentFile } from "./ImportAge
 const isElectron = navigator.userAgent.includes("Electron");
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
+import { plural } from "@/lib/plural";
 
 const SUGGESTION_COUNT = 3;
 
@@ -80,7 +81,7 @@ function TemplateRow({
         <span className="ml-2 text-[13.5px] text-muted-foreground">{template.title}</span>
       </span>
       <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground opacity-0 transition-opacity duration-150 group-hover:opacity-100">
-        {template.skills.length} skills
+        {plural(template.skills.length, "skill")}
       </span>
     </button>
   );
@@ -328,7 +329,7 @@ export function NewAgentScreen() {
               ? "Pick a role or describe the job. You can add more any time."
               : "Describe the job. It'll come with the skills to do it."
             : matched.current
-              ? `Set up as a ${matched.current.name.toLowerCase()}, with ${matched.current.skills.length} skills included.`
+              ? `Set up as a ${matched.current.name.toLowerCase()}, with ${plural(matched.current.skills.length, "skill")} included.`
               : "We picked one from your description. Change it if you like."}
         </p>
 

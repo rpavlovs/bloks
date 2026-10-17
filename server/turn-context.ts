@@ -29,14 +29,49 @@ export function engineIsFresh(input: FreshnessInput): boolean {
   return !(holders.length === 1 && holders[0] === input.instanceId);
 }
 
-/** The inline replay a fresh session-cursor engine receives. */
+/**
+ * The inline replay a fresh session-cursor engine receives.
+ *
+ * The transcript is expected bounded already (boundHandoff in
+ * server/context.ts); `left` is how many messages that left out, said so
+ * the agent knows the story has a gap rather than assuming it has all of
+ * it. `why` is what the opening line says happened: another engine had
+ * the conversation, or the old session could not be carried on.
+ */
 export function freshTurnText(
   transcript: ReadonlyArray<{ role: "user" | "assistant"; text: string }>,
   turnText: string,
+  opts: { left?: number; why?: "engine" | "session" } = {},
 ): string {
   if (transcript.length === 0) return turnText;
   const history = transcript
     .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`)
     .join("\n\n");
-  return `You are picking up this conversation mid-thread; a different engine handled it until now. The conversation so far:\n\n${history}\n\n--- the new message ---\n\n${turnText}`;
+  const opening =
+    opts.why === "session"
+      ? "You are picking up this conversation in a new session; the earlier one could not be carried on."
+      : "You are picking up this conversation mid-thread; a different engine handled it until now.";
+  const left = opts.left ?? 0;
+  const gap =
+    left > 0
+      ? ` To keep this short, ${left === 1 ? "one earlier message is" : `${left} earlier messages are`} left out; ask if you need something from them.`
+      : "";
+  return `${opening}${gap} The conversation so far:\n\n${history}\n\n--- the new message ---\n\n${turnText}`;
+}
+
+/**
+ * What a session that is resumed after another engine answered for a
+ * while is told (GitHub 284): only the messages it missed, since it
+ * still has everything before them. `missed` is expected bounded already
+ * and whole; a catch-up that would leave messages out is a new session
+ * told the story instead. `by` is the engine that answered.
+ */
+export function catchUpText(
+  missed: ReadonlyArray<{ role: "user" | "assistant"; text: string }>,
+  by: string,
+  turnText: string,
+): string {
+  if (missed.length === 0) return turnText;
+  const history = missed.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`).join("\n\n");
+  return `You are back on this conversation after ${by} answered in your place. Your session has everything up to then. What was said since:\n\n${history}\n\n--- the new message ---\n\n${turnText}`;
 }

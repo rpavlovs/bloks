@@ -1,19 +1,27 @@
-// App-level settings, as a centered overlay: appearance plus the
-// credentials shared by all agents. Per-agent settings live in
-// SettingsPanel; contextual Box-token entry also stays in ComputerPanel.
+// App-level settings, as a page of its own beside the sidebar: how Bloks
+// looks and behaves, and everything shared by all agents. Per-agent
+// settings live in SettingsPanel; contextual Box-token entry also stays in
+// ComputerPanel.
+//
+// A page rather than a window because it outgrew one: a dozen areas in a
+// 720px box meant scrolling inside a scroll. Pages are grouped the way
+// people look for them (you, your agents, what they connect to, what they
+// leave behind), and search finds the page a word lives on.
 import { useEffect, useRef, useState } from "react";
 import Check from "lucide-react/dist/esm/icons/check.mjs";
 import Monitor from "lucide-react/dist/esm/icons/monitor.mjs";
 import Moon from "lucide-react/dist/esm/icons/moon.mjs";
 import Sun from "lucide-react/dist/esm/icons/sun.mjs";
 import { api, useStore } from "@/state/store";
+import { DEFAULT_TURN_LIMIT, MAX_TURN_LIMIT, MIN_TURN_LIMIT } from "@/lib/turn-limit";
 import { useTheme, type Theme } from "@/lib/theme";
 import type { UpdateState } from "@/types/bridge";
+import { drainingLine } from "./UpdateCard";
 import { RecordPanel } from "./RecordPanel";
+import { BackupsSection } from "./BackupsSection";
 import { RulesPanel } from "./RulesPanel";
 import { ApiKeyRow } from "./ApiKeys";
 import { McpServersCard } from "./McpServers";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { EnginesPanel } from "./EnginesPanel";
 import { CloudSection } from "./CloudSection";
 import { DevicesSection } from "./DevicesSection";
@@ -22,14 +30,38 @@ import { ChatSection } from "./ChatSection";
 import { RemoteSection } from "./RemoteSection";
 import { LocalVmSection } from "./LocalVmSection";
 import { Button } from "@/components/ui/button";
-import { InfoTip } from "@/components/ui/info-tip";
 import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/cn";
 import { thisComputer } from "@/lib/thisComputer";
 import { UseFromOtherApps } from "./UseFromOtherApps";
+import { SecurityCheckup } from "./SecurityCheckup";
+import { riskyCount, useSecurityCheckup } from "@/lib/securityCheckup";
+import { BringYourSetupPage } from "./BringYourSetup";
 import { BoxSleep } from "./BoxSleep";
 import { AgentDefaults } from "./AgentDefaults";
+import { SettingRow, SettingsGroup, SettingsPageHeader } from "./SettingsLayout";
+import { Segmented } from "@/components/ui/segmented";
+import { useConversationsView } from "@/lib/conversationsView";
+import ArrowLeft from "lucide-react/dist/esm/icons/arrow-left.mjs";
+import Archive from "lucide-react/dist/esm/icons/archive.mjs";
+import CloudIcon from "lucide-react/dist/esm/icons/cloud.mjs";
+import Cpu from "lucide-react/dist/esm/icons/cpu.mjs";
+import History from "lucide-react/dist/esm/icons/history.mjs";
+import Info from "lucide-react/dist/esm/icons/info.mjs";
+import LayoutGrid from "lucide-react/dist/esm/icons/layout-grid.mjs";
+import MessageCircle from "lucide-react/dist/esm/icons/message-circle.mjs";
+import Mic from "lucide-react/dist/esm/icons/mic.mjs";
+import SearchIcon from "lucide-react/dist/esm/icons/search.mjs";
+import ShieldAlert from "lucide-react/dist/esm/icons/shield-alert.mjs";
+import ShieldCheck from "lucide-react/dist/esm/icons/shield-check.mjs";
+import SlidersHorizontal from "lucide-react/dist/esm/icons/sliders-horizontal.mjs";
+import Smartphone from "lucide-react/dist/esm/icons/smartphone.mjs";
+import UserIcon from "lucide-react/dist/esm/icons/user.mjs";
+import UserPlus from "lucide-react/dist/esm/icons/user-plus.mjs";
+import Luggage from "lucide-react/dist/esm/icons/luggage.mjs";
+import { useEscape } from "@/lib/useEscape";
+import { APPROVAL_MODES, ApprovalsChooser, confirmWidening, useWorkspaceApprovals, type ApprovalMode } from "./ApprovalsChooser";
 
 const THEME_OPTIONS: Array<{ value: Theme; label: string; icon: React.ReactNode }> = [
   { value: "light", label: "Light", icon: <Sun size={14} /> },
@@ -59,20 +91,153 @@ function Compaction() {
   };
 
   return (
-    <div className="mt-4 rounded-2xl border bg-card p-4">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <div className="flex items-center gap-1.5 text-[13.5px] font-semibold text-foreground">
-            Summarise as you go
-            <InfoTip text="A long conversation has to be summarised to keep fitting. Off, that happens once when it fills up, which is a pause before your next message. On, one message is folded in after each turn instead, so it never pauses. The cost: folding rewrites what was already sent, so the provider cannot reuse its cache, which on some providers costs more than the pause it removes. Your own messages are never summarised either way." />
-          </div>
-          <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted-foreground">
-            Fold the conversation a little after each turn instead of all at once when it fills up.
-          </div>
-        </div>
-        <Switch aria-label="Summarise as you go" checked={on} disabled={saving} onCheckedChange={set} />
+    <SettingRow
+      label="Summarise as you go"
+      info="A long conversation has to be summarised to keep fitting. Off, that happens once when it fills up, which is a pause before your next message. On, one message is folded in after each turn instead, so it never pauses. The cost: folding rewrites what was already sent, so the provider cannot reuse its cache, which on some providers costs more than the pause it removes. Your own messages are never summarised either way."
+      description="Fold the conversation a little after each turn instead of all at once when it fills up."
+      control={<Switch aria-label="Summarise as you go" checked={on} disabled={saving} onCheckedChange={set} />}
+    />
+  );
+}
+
+/**
+ * Whether a quiet Claude Code conversation is compacted before its cache
+ * expires (GitHub 162). Off by default: it saves on the first message
+ * after a long pause, and pays for that with detail the summary drops.
+ */
+function IdleCompaction() {
+  const { state, dispatch } = useStore();
+  const on = state.config?.compaction?.idle ?? false;
+  const [saving, setSaving] = useState(false);
+
+  const set = (idle: boolean) => {
+    setSaving(true);
+    api("/api/config", { method: "PUT", body: JSON.stringify({ compaction: { idle } }) })
+      .then((status) => dispatch({ type: "configStatus", config: status }))
+      .catch(() => {})
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <SettingRow
+      label="Compact while idle"
+      info="Claude Code keeps a conversation cached for an hour after its last request. The first message after that writes the whole conversation to the cache again, which for a long one is the most expensive message of the day. With this on, a Claude Code conversation over 100k tokens that has been quiet for 55 minutes is compacted first, while it is still cached, so the next message starts from about a third of the size. A compaction drops some detail, and a line in the chat says where it happened."
+      description="Compact a long Claude Code conversation shortly before its cache expires."
+      control={<Switch aria-label="Compact while idle" checked={on} disabled={saving} onCheckedChange={set} />}
+    />
+  );
+}
+
+const BEFORE_TURN_CEILINGS = [
+  { value: "0", label: "Never" },
+  { value: "100000", label: "100k" },
+  { value: "200000", label: "200k" },
+  { value: "400000", label: "400k" },
+] as const;
+
+function SharedChanges() {
+  const { state, dispatch } = useStore();
+  const on = state.config?.changes?.showShared ?? true;
+  const [saving, setSaving] = useState(false);
+
+  const set = (showShared: boolean) => {
+    setSaving(true);
+    api("/api/config", { method: "PUT", body: JSON.stringify({ changes: { showShared } }) })
+      .then((status) => dispatch({ type: "configStatus", config: status }))
+      .catch(() => {})
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <SettingRow
+      label="Show files changed beside a turn"
+      description="Show a card for files changed while a turn was working, even when it lists no files of its own. Cards for its own files still appear."
+      control={<Switch aria-label="Show files changed beside a turn" checked={on} disabled={saving} onCheckedChange={set} />}
+    />
+  );
+}
+
+/**
+ * How big a Claude Code, Codex or Pi conversation may get before its
+ * next message compacts it first (GitHub 222, 223). On by default, unlike
+ * the two above: every tool call of a turn sends the whole conversation
+ * again, so a long one can spend a five-hour limit in minutes, and that
+ * costs far more than the detail a compaction drops.
+ */
+function BeforeTurnCompaction() {
+  const { state, dispatch } = useStore();
+  const ceiling = String(state.config?.compaction?.beforeTurn ?? 200_000);
+  const [saving, setSaving] = useState(false);
+
+  const set = (next: string) => {
+    setSaving(true);
+    api("/api/config", { method: "PUT", body: JSON.stringify({ compaction: { beforeTurn: Number(next) } }) })
+      .then((status) => dispatch({ type: "configStatus", config: status }))
+      .catch(() => {})
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <SettingRow
+      label="Compact before a long turn"
+      info="Claude Code, Codex and Pi keep a conversation in a session of their own, and every tool call in a turn sends that whole session to the model again. A turn with twenty tool calls on a long conversation can use millions of tokens. With this set, a session that has grown past this size, or past 60% of what the model will take, is compacted before your next message goes, by the engine's own compaction where it has one, or by starting a new session that is told a summary and the recent messages. A line in the chat says where it happened."
+      description="Compact a long Claude Code, Codex or Pi conversation before the next message, from this size."
+    >
+      <div className="mt-3">
+        <Segmented
+          aria-label="Compact before a long turn"
+          value={BEFORE_TURN_CEILINGS.some((o) => o.value === ceiling) ? ceiling : "200000"}
+          onChange={(next) => !saving && set(next)}
+          options={BEFORE_TURN_CEILINGS.map((o) => ({ value: o.value, label: o.label }))}
+        />
       </div>
-    </div>
+    </SettingRow>
+  );
+}
+
+const SILENT_CALL_LIMITS = [
+  { value: "5", label: "5 min" },
+  { value: "15", label: "15 min" },
+  { value: "30", label: "30 min" },
+  { value: "60", label: "1 hour" },
+  { value: "0", label: "Never" },
+] as const;
+
+/**
+ * How long one tool call may sit without a word from the engine before
+ * its turn is stopped (GitHub 146). The model thinking, or a command that
+ * keeps reporting, is never cut short; only a call that has gone silent,
+ * and never while an approval card is waiting on you.
+ */
+function SilentCallLimit() {
+  const { state, dispatch } = useStore();
+  const minutes = String(state.config?.turns?.stallMinutes ?? 15);
+  const [saving, setSaving] = useState(false);
+
+  const set = (next: string) => {
+    setSaving(true);
+    api("/api/config", { method: "PUT", body: JSON.stringify({ turns: { stallMinutes: Number(next) } }) })
+      .then((status) => dispatch({ type: "configStatus", config: status }))
+      .catch(() => {})
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <SettingRow
+      label="Stop a tool call that goes silent"
+      info="Now and then a command waits on something that never answers: a cloud folder holding a read, a prompt nobody can see. The engine says nothing more and the agent stays on working. After this long with no word, Bloks ends the turn and tells you and the agent which call it was. Thinking, writing, and commands that keep reporting are never cut short, and time spent waiting on your approval does not count."
+      description="End the turn when one call has made no progress for this long."
+    >
+      {/* five choices do not fit beside the label, so they sit under it */}
+      <div className="mt-3">
+        <Segmented
+          aria-label="Stop a tool call that goes silent"
+          value={SILENT_CALL_LIMITS.some((o) => o.value === minutes) ? minutes : "15"}
+          onChange={(next) => !saving && set(next)}
+          options={SILENT_CALL_LIMITS.map((o) => ({ value: o.value, label: o.label }))}
+        />
+      </div>
+    </SettingRow>
   );
 }
 
@@ -98,21 +263,87 @@ function ProposeSkills() {
   };
 
   return (
-    <div className="mt-4 rounded-2xl border bg-card p-4">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <div className="flex items-center gap-1.5 text-[13.5px] font-semibold text-foreground">
-            Suggest skills
-            <InfoTip text="Nothing is ever installed on its own. A suggestion waits in Skills with the words already written, and keeping it is one press. Reading a session back costs one cheap call, on your own key, for work you did not ask for, which is why this is off until you turn it on." />
-          </div>
-          <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted-foreground">
-            After a conversation that worked something out, read it back and write the procedure
-            down as a skill. Most conversations teach nothing and nothing is suggested for them.
-          </div>
-        </div>
-        <Switch aria-label="Suggest skills" checked={on} disabled={saving} onCheckedChange={set} />
+    <SettingRow
+      label="Suggest skills"
+      info="Nothing is ever installed on its own. A suggestion waits in Skills with the words already written, and keeping it is one press. Reading a session back costs one cheap call, on your own key, for work you did not ask for, which is why this is off until you turn it on."
+      description="After a conversation that worked something out, write the procedure down as a skill for you to keep or not."
+      control={<Switch aria-label="Suggest skills" checked={on} disabled={saving} onCheckedChange={set} />}
+    />
+  );
+}
+
+/**
+ * How many turns in a row agents may start in one another before the
+ * person has a say. A number within the server's bounds, never Off: the
+ * whole-chain count is what keeps a loop from spending the usage.
+ */
+function AgentTurnLimit() {
+  const { state, dispatch } = useStore();
+  const stored = state.config?.agents?.turnLimit ?? DEFAULT_TURN_LIMIT;
+  const [number, setNumber] = useState(String(stored));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => setNumber(String(stored)), [stored]);
+
+  const saveNumber = () => {
+    const value = Number(number);
+    if (!/^[0-9]+$/.test(number) || !Number.isSafeInteger(value) || value < MIN_TURN_LIMIT || value > MAX_TURN_LIMIT) {
+      setError(`Enter a whole number from ${MIN_TURN_LIMIT} to ${MAX_TURN_LIMIT}.`);
+      return;
+    }
+    setSaving(true);
+    setError("");
+    api("/api/config", { method: "PUT", body: JSON.stringify({ agents: { turnLimit: value } }) })
+      .then((status) => dispatch({ type: "configStatus", config: status }))
+      .catch((cause: unknown) => {
+        setNumber(String(stored));
+        setError(cause instanceof Error ? cause.message : "The turn limit could not be saved.");
+      })
+      .finally(() => setSaving(false));
+  };
+  return (
+    <SettingRow
+      label="Agents' turn limit"
+      description={`Stop a chain after this many agent-started turns, from ${MIN_TURN_LIMIT} to ${MAX_TURN_LIMIT}. Every turn costs usage, so the limit keeps agents from keeping each other going without you. Your message in a conversation starts its count over.`}
+    >
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <input aria-label="Maximum consecutive agent turns" type="number" min={MIN_TURN_LIMIT} max={MAX_TURN_LIMIT} step="1" value={number} disabled={saving}
+          onChange={(event) => { setNumber(event.target.value); setError(""); }}
+          className="h-8 w-24 rounded-lg border bg-background px-2 text-[13px] outline-none focus:border-primary" />
+        <span className="text-[12px] text-muted-foreground">turns</span>
+        <Button size="sm" variant="secondary" disabled={saving || number === String(stored)} onClick={saveNumber} aria-label="Save turn limit">Save</Button>
       </div>
-    </div>
+      {error && <p role="alert" className="mt-2 text-[12px] text-destructive">{error}</p>}
+    </SettingRow>
+  );
+}
+
+/**
+ * Whether agents are reminded of their other conversations before your
+ * turn. On, unlike the switches above that spend money: it costs no call,
+ * only a few hundred words in a turn when something matches closely, and
+ * each agent can still turn it off for itself.
+ */
+function RecallBeforeTurn() {
+  const { state, dispatch } = useStore();
+  const on = state.config?.recall?.beforeTurn ?? true;
+  const [saving, setSaving] = useState(false);
+
+  const set = (beforeTurn: boolean) => {
+    setSaving(true);
+    api("/api/config", { method: "PUT", body: JSON.stringify({ recall: { beforeTurn } }) })
+      .then((status) => dispatch({ type: "configStatus", config: status }))
+      .catch(() => {})
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <SettingRow
+      label="Bring up other conversations"
+      info="When you write to an agent, Bloks looks through its other conversations and its topic notes for what matches your message. Only a close match counts, and at most three short notes go with your words for that turn, never into the agent's standing instructions. Each says where and when it was said, the agent is told it may ignore them, and your message shows what was added. Rooms and email from people you have not listed never get them."
+      description="Give an agent what it said elsewhere that matches your message, before it answers."
+      control={<Switch aria-label="Bring up other conversations" checked={on} disabled={saving} onCheckedChange={set} />}
+    />
   );
 }
 
@@ -144,52 +375,63 @@ function AboutCard() {
         : update.state === "current"
           ? "You are on the latest version."
           : update.state === "ready"
-            ? `${update.version ?? "An update"} is downloaded and ready.`
+            ? update.draining
+              ? drainingLine(update.draining)
+              : `${update.version ?? "An update"} is downloaded and ready.`
             : update.state === "error"
               ? update.reason === "install"
                 ? "The update downloaded but didn't install. Quit and reopen Bloks to try again."
                 : update.reason === "server"
                   ? "GitHub didn't hand over the update just now. Try again in a few minutes."
-                  : "The update check didn't reach the server. It will retry on next launch."
+                  : "The update check didn't reach the server. Bloks tries again in a few hours."
               : update.state === "dev"
                 ? "Updates apply to the installed app, not a dev build."
                 : null;
+  // a restart into an update that came back on the same version says so
+  // before whatever the updater is doing now
+  const description = update.notInstalled
+    ? `The update did not install. ${line ?? "You can get the installer from bloks.dev."}`
+    : (line ?? "Updates download on their own and install when you restart.");
 
   return (
-    <div className="mt-4 rounded-2xl border bg-card p-4">
-      <div className="flex items-center justify-between">
-        <div className="text-[13.5px] font-semibold text-foreground">
-          Bloks {version ?? ""}
-        </div>
-        {update.state === "ready" ? (
-          <Button size="sm" onClick={() => void window.bloks?.updateInstall?.()}>
-            Restart to update
+    <SettingsGroup title="Version">
+      <SettingRow
+        label={`Bloks ${version ?? ""}`}
+        description={description}
+        control={
+          update.state === "ready" ? (
+            <Button size="sm" disabled={Boolean(update.draining)} onClick={() => void window.bloks?.updateInstall?.()}>
+              Restart to update
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={!window.bloks || update.state === "checking" || update.state === "downloading"}
+              onClick={() => void window.bloks?.updateCheck?.().then(setUpdate)}
+            >
+              Check for updates
+            </Button>
+          )
+        }
+      />
+      <SettingRow
+        label="Something broken, or missing?"
+        description="Opens a GitHub issue. For anything gnarly, paste the diagnostics below into it."
+        control={
+          <Button size="sm" variant="secondary" asChild>
+            <a
+              href={`https://github.com/hamedgitty/bloks/issues/new?body=${encodeURIComponent(`\n\n---\nBloks ${version ?? ""} on ${navigator.platform}`)}`}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Send feedback
+            </a>
           </Button>
-        ) : (
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={!window.bloks || update.state === "checking" || update.state === "downloading"}
-            onClick={() => void window.bloks?.updateCheck?.().then(setUpdate)}
-          >
-            Check for updates
-          </Button>
-        )}
-      </div>
-      {line && <div className="mt-1.5 text-[12.5px] text-muted-foreground">{line}</div>}
-      <div className="mt-2 text-[12.5px] text-muted-foreground">
-        Something broken, or missing?{" "}
-        <a
-          href={`https://github.com/hamedgitty/bloks/issues/new?body=${encodeURIComponent(`\n\n---\nBloks ${version ?? ""} on ${navigator.platform}`)}`}
-          target="_blank"
-          rel="noreferrer"
-          className="underline underline-offset-2 hover:text-foreground"
-        >
-          Send feedback
-        </a>
-        {" "}(opens GitHub; paste the diagnostics below into anything gnarly).
-      </div>
-    </div>
+        }
+      />
+      <Diagnostics />
+    </SettingsGroup>
   );
 }
 
@@ -217,26 +459,28 @@ function Diagnostics() {
     }
   };
   return (
-    <div className="mt-4 rounded-2xl border bg-card p-4">
-      <div className="flex items-center gap-1.5 text-[13.5px] font-semibold text-foreground">
-        Diagnostics
-        <InfoTip text="The report holds versions, engine connection states, which keys are set as yes or no, and agent counts. Never the keys themselves, and the finished text is scrubbed for anything credential-shaped besides." />
-      </div>
-      <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted-foreground">
-        Copies a short report about this install, ready to paste into a bug report.
-      </div>
-      <button
-        onClick={() => void copy()}
-        className="mt-3 rounded-xl border bg-background px-3 py-1.5 text-[12.5px] font-medium text-foreground transition-colors hover:bg-accent"
-      >
-        {copied ? "Copied" : "Copy diagnostics"}
-      </button>
-      {failed && (
-        <div className="mt-2 text-[12px] text-destructive">
-          Couldn't build the report. Is the server running?
-        </div>
-      )}
-    </div>
+    <SettingRow
+      label="Diagnostics"
+      info="The report holds versions, engine connection states, which keys are set as yes or no, and agent counts. Never the keys themselves, and the finished text is scrubbed for anything credential-shaped besides."
+      description={
+        failed ? (
+          <span className="text-destructive">Couldn't build the report. Is the server running?</span>
+        ) : (
+          "Copies a short report about this install, ready to paste into a bug report."
+        )
+      }
+      control={
+        <Button size="sm" variant="secondary" onClick={() => void copy()} className="min-w-[128px]">
+          {copied ? (
+            <>
+              <Check size={14} /> Copied
+            </>
+          ) : (
+            "Copy diagnostics"
+          )}
+        </Button>
+      }
+    />
   );
 }
 
@@ -273,25 +517,32 @@ function AboutYou() {
   };
 
   return (
-    <div className="mt-4 rounded-2xl border bg-card p-4">
-      <div className="flex items-center justify-between">
-        <div className="text-[13.5px] font-semibold text-foreground">About you</div>
-        {justSaved && (
-          <span className="flex items-center gap-1 text-[11.5px] text-success">
+    <SettingsGroup>
+      <SettingRow
+        label="What every agent knows about you"
+        htmlFor="about-you"
+        description={`Optional. Stays on ${thisComputer()}, and is never shared with people you invite into a room.`}
+        control={
+          <span
+            className={cn(
+              "flex items-center gap-1 text-[11.5px] text-success transition-opacity duration-200",
+              justSaved ? "opacity-100" : "opacity-0",
+            )}
+            aria-live="polite"
+          >
             <Check size={12} /> Saved
           </span>
-        )}
-      </div>
-      <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted-foreground">
-        Optional context every agent gets. Stays on {thisComputer()}.
-      </div>
-      <Textarea
-        value={value}
-        onChange={(e) => save(e.target.value)}
-        placeholder="e.g. I'm a founder building a local-first agent app. Keep replies short and skip the preamble."
-        className="mt-3 min-h-[88px] resize-none text-[13px]"
-      />
-    </div>
+        }
+      >
+        <Textarea
+          id="about-you"
+          value={value}
+          onChange={(e) => save(e.target.value)}
+          placeholder="I'm a founder building a local-first agent app. Keep replies short and skip the preamble."
+          className="mt-3 min-h-[120px] resize-y text-[13px]"
+        />
+      </SettingRow>
+    </SettingsGroup>
   );
 }
 
@@ -341,17 +592,6 @@ function OpenAIKeyHint() {
   return null;
 }
 
-const SETTINGS_TABS = [
-  ["general", "General"],
-  ["engines", "Engines"],
-  ["apps", "Apps"],
-  ["localvm", "Local VM"],
-  ["voices", "Voices"],
-  ["devices", "Devices"],
-  ["rules", "Rules"],
-  ["record", "Record"],
-] as const;
-type SettingsTab = (typeof SETTINGS_TABS)[number][0];
 
 
 /**
@@ -413,205 +653,511 @@ function QuickAskShortcut() {
   if (!window.bloks) return null;
 
   return (
-    <div className="mt-4 rounded-2xl border bg-card p-4">
-      <div className="text-[13.5px] font-semibold text-foreground">Quick ask</div>
-      <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted-foreground">
-        A shortcut that works anywhere on {thisComputer()}. It opens one line over whatever
-        you are doing, sends it to an agent, and gets out of the way.
-      </div>
-      <div className="mt-3 flex items-center gap-2">
-        <button
-          onClick={() => {
-            setProblem(null);
-            setCapturing(true);
-          }}
-          onKeyDown={capturing ? capture : undefined}
-          className={cn(
-            "min-w-[168px] rounded-xl border px-3 py-2 text-[13px] transition-colors",
-            capturing
-              ? "border-brand bg-brand-soft text-foreground"
-              : "border-input text-foreground hover:border-foreground/25",
+    <SettingRow
+      label="Quick ask shortcut"
+      info="Tab picks a different agent, Enter sends, Escape closes."
+      description={
+        problem ? (
+          <span className="text-destructive">{problem}</span>
+        ) : (
+          `Ask any agent from anywhere on ${thisComputer()}. It opens one line over whatever you are doing.`
+        )
+      }
+      control={
+        <div className="flex items-center gap-1.5">
+          {accelerator && !capturing && (
+            <button
+              onClick={() => void save(null)}
+              className="rounded-lg px-2 py-1 text-[12.5px] text-muted-foreground transition-colors hover:text-foreground"
+            >
+              Clear
+            </button>
           )}
-        >
-          {capturing ? "Press the keys…" : (accelerator ?? "Not set")}
-        </button>
-        {accelerator && !capturing && (
           <button
-            onClick={() => void save(null)}
-            className="rounded-lg px-2 py-1 text-[12.5px] text-muted-foreground transition-colors hover:text-foreground"
+            onClick={() => {
+              setProblem(null);
+              setCapturing(true);
+            }}
+            onKeyDown={capturing ? capture : undefined}
+            onBlur={() => setCapturing(false)}
+            className={cn(
+              "min-w-[132px] rounded-lg border px-3 py-1.5 text-[12.5px] font-medium tabular-nums transition-[border-color,background-color,scale] duration-150 ease-out active:scale-[0.96]",
+              capturing
+                ? "border-brand bg-brand-soft text-foreground"
+                : "border-input text-foreground hover:border-foreground/25",
+            )}
           >
-            Clear
+            {capturing ? "Press the keys…" : (accelerator ?? "Not set")}
           </button>
-        )}
-      </div>
-      {problem && <div className="mt-2 text-[12px] text-destructive">{problem}</div>}
-      <div className="mt-2 text-[11.5px] text-muted-foreground">
-        Tab picks a different agent, Enter sends, Escape closes.
-      </div>
-    </div>
+        </div>
+      }
+    />
   );
 }
 
-export function AppSettingsPanel() {
-  const { dispatch } = useStore();
+interface SettingsPage {
+  id: string;
+  label: string;
+  icon: React.ComponentType<{ size?: number; className?: string }>;
+  description: string;
+  /** Words people search for that the label does not say. */
+  keywords: string;
+}
+
+/** Every page, grouped the way people look for them. Opened by id from
+ * anywhere in the app: `toggleAppSettings` with a `page`. */
+export const SETTINGS_PAGES: Array<{ group: string; pages: SettingsPage[] }> = [
+  {
+    group: "You",
+    pages: [
+      {
+        id: "general",
+        label: "General",
+        icon: SlidersHorizontal,
+        description: `How Bloks looks and behaves on ${thisComputer()}.`,
+        keywords: "theme dark light appearance sidebar conversations threads shortcut quick ask hotkey summarise compaction compact idle cache long turn tokens quota skills suggest recall remember memory other conversations files changes cards shared folder agents turn limit consecutive chain",
+      },
+      {
+        id: "about-you",
+        label: "About you",
+        icon: UserIcon,
+        description: "Context every agent gets, so you do not have to repeat yourself.",
+        keywords: "profile context personal instructions",
+      },
+      {
+        id: "bring-setup",
+        label: "Bring your setup",
+        icon: Luggage,
+        description: "Instructions, skills and tool servers from the agent tools you already use, without their keys.",
+        keywords: "import migrate claude code codex openclaw hermes claude.md agents.md skills mcp memory rules move switch",
+      },
+    ],
+  },
+  {
+    group: "Agents",
+    pages: [
+      {
+        id: "engines",
+        label: "Engines",
+        icon: Cpu,
+        description: "The AI tools and API keys your agents think with.",
+        keywords: "models providers claude codex gemini grok openai api key cli sign in",
+      },
+      {
+        id: "new-agents",
+        label: "New agents",
+        icon: UserPlus,
+        description: "Where every new agent starts, whoever hires it.",
+        keywords: "defaults folder hire approvals model effort",
+      },
+      {
+        id: "rules",
+        label: "Rules and approvals",
+        icon: ShieldCheck,
+        description: "How much agents do before asking you, and what they may never do.",
+        keywords: "deny allow permissions safety approval gate full access auto ask conservative",
+      },
+      {
+        id: "security",
+        label: "Security checkup",
+        icon: ShieldAlert,
+        description: "What can reach your keys, accounts and computer, and how to narrow it.",
+        keywords: "security checkup audit risk full access pairing devices email webhooks secrets browser computer file permissions signed out",
+      },
+      {
+        id: "voices",
+        label: "Voices",
+        icon: Mic,
+        description: "Give agents a voice and take calls with them.",
+        keywords: "speech elevenlabs openai tts call audio",
+      },
+    ],
+  },
+  {
+    group: "Connections",
+    pages: [
+      {
+        id: "apps",
+        label: "Apps and keys",
+        icon: LayoutGrid,
+        description: `Accounts and tools shared by every agent. Keys stay on ${thisComputer()}.`,
+        keywords: "composio slack gmail connectors mcp servers box key claude desktop",
+      },
+      {
+        id: "devices",
+        label: "Phone and devices",
+        icon: Smartphone,
+        description: `Reach ${thisComputer()} from your phone and other devices.`,
+        keywords: "iphone pairing remote relay qr",
+      },
+      {
+        id: "chat",
+        label: "Chat and email",
+        icon: MessageCircle,
+        description: "Talk to your agents from Telegram, Slack, Discord or email.",
+        keywords: "telegram slack discord email mail",
+      },
+      {
+        id: "cloud",
+        label: "Bloks Cloud",
+        icon: CloudIcon,
+        description: "Your agents on the go, and the relay that carries them.",
+        keywords: "subscription licence relay cloud",
+      },
+      {
+        id: "computers",
+        label: "Computers",
+        icon: Monitor,
+        description: `A private computer agents can work on, on ${thisComputer()} or in the cloud.`,
+        keywords: "vm virtual machine local box sandbox desktop",
+      },
+    ],
+  },
+  {
+    group: "Data",
+    pages: [
+      {
+        id: "record",
+        label: "Record",
+        icon: History,
+        description: "Everything that happened, signed and in order.",
+        keywords: "ledger audit history log",
+      },
+      {
+        id: "backups",
+        label: "Backups",
+        icon: Archive,
+        description: "Copies of your whole workspace, made every day or when you ask, and putting one back.",
+        keywords: "backup restore archive copy export move new computer undo history passphrase encrypt seal daily automatic",
+      },
+      {
+        id: "about",
+        label: "About and updates",
+        icon: Info,
+        description: "Your version, updates, and a way to tell us what broke.",
+        keywords: "version update feedback diagnostics bug",
+      },
+    ],
+  },
+];
+
+const ALL_PAGES = SETTINGS_PAGES.flatMap((g) => g.pages);
+
+function GeneralPage() {
   const { theme, setTheme } = useTheme();
-  const [tab, setTab] = useState<SettingsTab>("general");
+  const [conversations, setConversations] = useConversationsView();
+  return (
+    <>
+      <SettingsGroup title="Appearance">
+        <SettingRow
+          label="Theme"
+          control={
+            <Segmented
+              aria-label="Theme"
+              value={theme}
+              onChange={setTheme}
+              options={THEME_OPTIONS.map((o) => ({ value: o.value, label: <>{o.icon}{o.label}</> }))}
+            />
+          }
+        />
+        <SettingRow
+          label="Show conversations in the sidebar"
+          description="List each agent's conversations under it, each with its own unread dot and state."
+          control={
+            <Switch
+              aria-label="Show conversations in the sidebar"
+              checked={conversations}
+              onCheckedChange={setConversations}
+            />
+          }
+        />
+      </SettingsGroup>
+      <SettingsGroup title="Working with agents">
+        <QuickAskShortcut />
+        <ProposeSkills />
+        <RecallBeforeTurn />
+        <AgentTurnLimit />
+        <SharedChanges />
+        <Compaction />
+        <IdleCompaction />
+        <BeforeTurnCompaction />
+        <SilentCallLimit />
+      </SettingsGroup>
+    </>
+  );
+}
+
+/**
+ * The one approvals choice for the workspace. Picking a mode makes it
+ * where every new agent starts, at once; agents already working keep
+ * theirs until you move them, because a mode changing under an agent
+ * mid-task is not something to do by accident.
+ */
+function WorkspaceApprovals() {
+  const { state, save } = useWorkspaceApprovals();
+  const [note, setNote] = useState<string | null>(null);
+  if (!state) return null;
+  const mode = state.mode;
+  const total = Object.values(state.agents).reduce((a, b) => a + b, 0);
+  const elsewhere = total - (state.agents[mode] ?? 0);
+  const label = APPROVAL_MODES.find((m) => m.id === mode)?.label ?? mode;
+
+  const choose = async (next: ApprovalMode) => {
+    setNote(null);
+    if (next === mode) return;
+    if (!(await confirmWidening(mode, next, "new agents"))) {
+      setNote("Not confirmed, so nothing changed.");
+      return;
+    }
+    await save(next, false);
+  };
+  const applyToAll = async () => {
+    setNote(null);
+    if (!(await confirmWidening("ask", mode, "every agent"))) {
+      setNote("Not confirmed, so nothing changed.");
+      return;
+    }
+    await save(mode, true);
+    setNote(`Every agent is on ${label} now.`);
+  };
 
   return (
-    <Dialog
-      open
-      onOpenChange={(open) => !open && dispatch({ type: "toggleAppSettings", open: false })}
-    >
-      <DialogContent className="flex h-[85vh] max-h-[640px] w-full max-w-[720px] flex-col gap-0 overflow-hidden p-0">
-        <div className="flex h-[52px] shrink-0 items-center border-b px-5">
-          <DialogTitle className="text-[14.5px]">Settings</DialogTitle>
+    <SettingsGroup title="How much agents ask">
+      <div className="p-4">
+        <ApprovalsChooser value={mode} onChange={(next) => void choose(next)} />
+        <div className="mt-3 flex items-center gap-3 text-[12.5px] text-muted-foreground">
+          <span className="min-w-0 flex-1 text-pretty">
+            {note ??
+              (elsewhere > 0
+                ? `New agents start on ${label}. ${elsewhere} of your ${total} agent${total === 1 ? " is" : "s are"} on something else.`
+                : `New agents start on ${label}, and so is every agent you have.`)}
+          </span>
+          {elsewhere > 0 && (
+            <Button size="sm" variant="secondary" onClick={() => void applyToAll()}>
+              Move all to {label}
+            </Button>
+          )}
         </div>
+        <div className="mt-2 text-[12px] text-muted-foreground">
+          Each agent can still be set differently in its own settings. Shared rooms always ask, whatever is set here.
+        </div>
+      </div>
+    </SettingsGroup>
+  );
+}
 
-        <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
-          {/*
-            The category rail, which stops being a rail on a narrow
-            window. Below sm it is a scrolling row above the content,
-            because 150px of nav out of 375px of window leaves body copy
-            wrapping every two or three words. Kept as one list rather
-            than two so the tabs cannot drift apart.
-          */}
-          <nav
-            className={cn(
-              "flex shrink-0 gap-0.5 overflow-x-auto border-b p-2",
-              "[scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
-              "sm:w-[150px] sm:flex-col sm:overflow-x-visible sm:border-b-0 sm:border-r sm:p-2.5",
-            )}
+function PageBody({ id }: { id: string }) {
+  switch (id) {
+    case "general":
+      return <GeneralPage />;
+    case "about-you":
+      return <AboutYou />;
+    case "bring-setup":
+      return <BringYourSetupPage />;
+    case "engines":
+      return <EnginesPanel />;
+    case "new-agents":
+      return <AgentDefaults />;
+    case "rules":
+      return (
+        <>
+          <WorkspaceApprovals />
+          <RulesPanel />
+        </>
+      );
+    case "security":
+      return <SecurityCheckup />;
+    case "voices":
+      return (
+        <SettingsGroup title="Keys">
+          <div className="flex flex-col gap-4 p-4">
+            <ApiKeyRow section="elevenlabs" label="ElevenLabs API key" placeholder="sk_…" />
+            <ApiKeyRow section="openaiSpeech" label="OpenAI API key (speech)" placeholder="sk-…" />
+            <OpenAIKeyHint />
+            <div className="text-[12px] text-muted-foreground">Either key works. The Mac's own voices need none.</div>
+          </div>
+        </SettingsGroup>
+      );
+    case "apps":
+      return (
+        <>
+          <SettingsGroup title="Keys">
+            <div className="flex flex-col gap-4 p-4">
+              <ApiKeyRow
+                section="composio"
+                label="Composio Connect key"
+                placeholder="ck_…"
+                info={{
+                  text: "Composio issues two different keys. This is the Connect key (starts with ck_), the one that links accounts like Slack and Gmail. The key is checked with Composio when you save it.",
+                  linkLabel: "Get a Connect key at composio.dev",
+                  linkHref: "https://composio.dev",
+                }}
+              />
+              <ApiKeyRow
+                section="composioApi"
+                label="Composio API key (optional)"
+                placeholder="ak_…  unlocks the full app catalog"
+                info={{
+                  text: "The other Composio key: a project API key (starts with ak_), separate from the Connect key above. Only used to browse the full app catalog; connections work without it.",
+                }}
+              />
+              <ApiKeyRow
+                section="box"
+                label="Boat API key"
+                placeholder="Paste your Boat API key"
+                info={{
+                  text: "Gives agents an isolated remote Linux computer with a desktop and a terminal. Boat (formerly Box) is a paid service after its trial, so usage can incur charges.",
+                  linkLabel: "Open the Boat API key guide",
+                  linkHref: "https://docs.boat.dev/api-keys",
+                }}
+              />
+              <BoxSleep />
+            </div>
+          </SettingsGroup>
+          <McpServersCard />
+          <UseFromOtherApps />
+        </>
+      );
+    case "devices":
+      return (
+        <>
+          <RemoteSection />
+          <DevicesSection />
+        </>
+      );
+    case "chat":
+      return (
+        <>
+          <TelegramSection />
+          <ChatSection />
+        </>
+      );
+    case "cloud":
+      return <CloudSection />;
+    case "computers":
+      return <LocalVmSection />;
+    case "record":
+      return <RecordPanel />;
+    case "backups":
+      return <BackupsSection />;
+    case "about":
+      return <AboutCard />;
+    default:
+      return null;
+  }
+}
+
+export function AppSettingsPanel() {
+  const { state, dispatch } = useStore();
+  const [query, setQuery] = useState("");
+  const scroller = useRef<HTMLDivElement>(null);
+  const pageId = ALL_PAGES.some((p) => p.id === state.settingsPage) ? state.settingsPage : "general";
+  const page = ALL_PAGES.find((p) => p.id === pageId)!;
+  const close = () => dispatch({ type: "toggleAppSettings", open: false });
+  const go = (id: string) => dispatch({ type: "toggleAppSettings", open: true, page: id });
+
+  // a new page starts at its top, not wherever the last one was left
+  useEffect(() => {
+    scroller.current?.scrollTo({ top: 0 });
+  }, [pageId]);
+
+  // Escape leaves, unless something opened on top of the page takes it first
+  useEscape(close);
+
+  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const matches = (p: SettingsPage) =>
+    words.every((w) => `${p.label} ${p.description} ${p.keywords}`.toLowerCase().includes(w));
+  const groups = SETTINGS_PAGES.map((g) => ({ ...g, pages: g.pages.filter(matches) })).filter((g) => g.pages.length);
+  // only what is risky earns a number in the list; worth a look waits on the page
+  const risky = riskyCount(useSecurityCheckup().report);
+
+  return (
+    <main className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background md:flex-row">
+      <nav
+        aria-label="Settings"
+        className="flex shrink-0 flex-col border-b bg-sidebar/60 md:w-[248px] md:border-b-0 md:border-r"
+      >
+        <div className="flex items-center gap-1.5 px-3 pb-2 pt-3.5">
+          <button
+            onClick={close}
+            aria-label="Back to your agents"
+            title="Back (Esc)"
+            className="flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-[background-color,color,scale] duration-150 ease-out hover:bg-accent hover:text-foreground active:scale-[0.96]"
           >
-            {SETTINGS_TABS.map(([key, label]) => (
-              <button
-                key={key}
-                onClick={() => setTab(key)}
-                className={cn(
-                  "shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[13px] transition-colors duration-150 sm:w-full sm:text-left",
-                  tab === key
-                    ? "bg-accent font-medium text-foreground"
-                    : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
-                )}
-              >
-                {label}
-              </button>
-            ))}
-          </nav>
-
-          <div className="min-w-0 flex-1 overflow-y-auto px-4 pb-6 sm:px-5">
-            {tab === "general" && (
-              <>
-                <div className="mt-4 rounded-2xl border bg-card p-4">
-                  <div className="text-[13.5px] font-semibold text-foreground">Appearance</div>
-                  <div className="mt-0.5 text-[12.5px] text-muted-foreground">
-                    How Bloks looks on {thisComputer()}
-                  </div>
-                  <div className="mt-3 flex gap-1 rounded-xl bg-muted p-1">
-                    {THEME_OPTIONS.map((option) => (
-                      <button
-                        key={option.value}
-                        onClick={() => setTheme(option.value)}
-                        className={cn(
-                          "flex flex-1 items-center justify-center gap-1.5 rounded-lg py-1.5 text-[12.5px] transition-colors duration-150",
-                          theme === option.value
-                            ? "bg-background font-medium text-foreground shadow-sm"
-                            : "text-muted-foreground hover:text-foreground",
-                        )}
-                      >
-                        {option.icon}
-                        {option.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <QuickAskShortcut />
-                <Compaction />
-                <ProposeSkills />
-                <AboutYou />
-                <AgentDefaults />
-                <Diagnostics />
-                <AboutCard />
-              </>
-            )}
-
-            {tab === "engines" && <EnginesPanel />}
-
-            {tab === "apps" && (
-              <>
-              <div className="mt-4 rounded-2xl border bg-card p-4">
-                <div className="text-[13.5px] font-semibold text-foreground">Apps and computers</div>
-                <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted-foreground">
-                  Shared by all agents. Keys stay on {thisComputer()}.
-                </div>
-                <div className="mt-4 flex flex-col gap-4">
-                  <ApiKeyRow
-                    section="composio"
-                    label="Composio Connect key"
-                    placeholder="ck_…"
-                    info={{
-                      text: "Composio issues two different keys. This is the Connect key (starts with ck_), the one that links accounts like Slack and Gmail. The key is checked with Composio when you save it.",
-                      linkLabel: "Get a Connect key at composio.dev",
-                      linkHref: "https://composio.dev",
-                    }}
-                  />
-                  <ApiKeyRow
-                    section="composioApi"
-                    label="Composio API key (optional)"
-                    placeholder="ak_…  unlocks the full app catalog"
-                    info={{
-                      text: "The other Composio key: a project API key (starts with ak_), separate from the Connect key above. Only used to browse the full app catalog; connections work without it.",
-                    }}
-                  />
-                  <ApiKeyRow
-                    section="box"
-                    label="Box API key"
-                    placeholder="Paste your Box API key"
-                    info={{
-                      text: "Gives agents an isolated remote Linux computer with a desktop and a terminal. Box is a paid service after its trial, so usage can incur charges.",
-                      linkLabel: "Open the Box API key guide",
-                      linkHref: "https://docs.ascii.dev/box/api-keys",
-                    }}
-                  />
-                  <BoxSleep />
-                </div>
-              </div>
-              <McpServersCard />
-              <UseFromOtherApps />
-              </>
-            )}
-
-            {tab === "localvm" && <LocalVmSection />}
-
-            {tab === "rules" && <RulesPanel />}
-
-            {tab === "record" && <RecordPanel />}
-
-            {tab === "devices" && (
-              <>
-                <RemoteSection />
-                <DevicesSection />
-                <TelegramSection />
-                <ChatSection />
-                <CloudSection />
-              </>
-            )}
-
-            {tab === "voices" && (
-              <div className="mt-4 rounded-2xl border bg-card p-4">
-                <div className="text-[13.5px] font-semibold text-foreground">Voices</div>
-                <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted-foreground">
-                  Give agents a voice and take calls with them. Either key works.
-                </div>
-                <div className="mt-4 flex flex-col gap-4">
-                  <ApiKeyRow section="elevenlabs" label="ElevenLabs API key" placeholder="sk_…" />
-                  <ApiKeyRow section="openaiSpeech" label="OpenAI API key (speech)" placeholder="sk-…" />
-                  <OpenAIKeyHint />
-                </div>
-              </div>
-            )}
+            <ArrowLeft size={17} />
+          </button>
+          <span className="text-[15px] font-semibold text-foreground">Settings</span>
+        </div>
+        <div className="px-3 pb-2">
+          <div className="flex items-center gap-2 rounded-xl bg-accent/70 px-3 py-[7px] transition-colors duration-150 focus-within:bg-accent">
+            <SearchIcon size={15} className="shrink-0 text-muted-foreground" />
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && query) {
+                  e.preventDefault();
+                  setQuery("");
+                } else if (e.key === "Enter" && groups[0]) {
+                  go(groups[0].pages[0].id);
+                  setQuery("");
+                }
+              }}
+              placeholder="Search settings"
+              aria-label="Search settings"
+              className="w-full bg-transparent text-[13.5px] text-foreground outline-none placeholder:text-muted-foreground"
+            />
           </div>
         </div>
-      </DialogContent>
-    </Dialog>
+        <div className="flex gap-0.5 overflow-x-auto px-2 pb-2 [scrollbar-width:none] md:flex-1 md:flex-col md:overflow-y-auto md:pb-4 [&::-webkit-scrollbar]:hidden">
+          {groups.map((g) => (
+            <div key={g.group} className="flex shrink-0 gap-0.5 md:flex-col">
+              <div className="hidden px-2.5 pb-1 pt-3 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground md:block">
+                {g.group}
+              </div>
+              {g.pages.map((p) => {
+                const Icon = p.icon;
+                const on = p.id === pageId;
+                return (
+                  <button
+                    key={p.id}
+                    onClick={() => go(p.id)}
+                    aria-current={on ? "page" : undefined}
+                    className={cn(
+                      "flex shrink-0 items-center gap-2.5 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-left text-[13px] transition-[background-color,color] duration-150",
+                      on
+                        ? "bg-background font-medium text-foreground shadow-[0_0_0_0.5px_var(--border)]"
+                        : "text-muted-foreground hover:bg-accent/70 hover:text-foreground",
+                    )}
+                  >
+                    <Icon size={16} className={on ? "text-foreground" : "text-muted-foreground"} />
+                    {p.label}
+                    {p.id === "security" && risky > 0 && (
+                      <span
+                        aria-label={`${risky} risky`}
+                        className="ml-auto rounded-md bg-destructive/10 px-1.5 py-0.5 text-[10.5px] font-medium tabular-nums text-destructive"
+                      >
+                        {risky}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+          {groups.length === 0 && (
+            <div className="px-3 py-6 text-[12.5px] text-muted-foreground">Nothing matches “{query.trim()}”.</div>
+          )}
+        </div>
+      </nav>
+      <div ref={scroller} className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto w-full max-w-[760px] px-5 pb-16 pt-8 md:px-10">
+          <SettingsPageHeader title={page.label} description={page.description} />
+          <div className="[&>div:first-child]:mt-0">
+            <PageBody id={pageId} />
+          </div>
+        </div>
+      </div>
+    </main>
   );
 }

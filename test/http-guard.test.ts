@@ -77,9 +77,32 @@ test("a request with no Host is rejected", () => {
   assert.equal(isLocalRequest(req({ host: "" })), false);
 });
 
-test("an opaque origin is allowed, since it cannot be a site", () => {
-  // sandboxed frames and file:// pages send "null"
-  assert.equal(isLocalRequest(req({ host: "127.0.0.1:8799", origin: "null" })), true);
+test("an opaque origin is not the owner", () => {
+  // Sandboxed frames send "null", and so does an agent's HTML artifact
+  // opened from its sandboxed response. Either is content an agent wrote,
+  // which must not be able to change settings or approve its own asks.
+  assert.equal(isLocalRequest(req({ host: "127.0.0.1:8799", origin: "null" })), false);
+});
+
+test("a page on another loopback port is not the app", () => {
+  // an agent's dev server, a notebook, a container's desktop, opened in a browser
+  assert.equal(isLocalRequest(req({ host: "127.0.0.1:8799", origin: "http://127.0.0.1:3000" })), false);
+  assert.equal(isLocalRequest(req({ host: "127.0.0.1:8799", origin: "http://localhost:8888" })), false);
+  // the server's own page is
+  assert.equal(isLocalRequest(req({ host: "127.0.0.1:8799", origin: "http://127.0.0.1:8799" })), true);
+});
+
+test("the dev UI's port counts only while this server is not serving its own page", () => {
+  const dev = req({ host: "127.0.0.1:8799", origin: "http://127.0.0.1:5199" });
+  assert.equal(isLocalRequest(dev), true);
+  const before = process.env.BLOKS_STATIC_DIR;
+  process.env.BLOKS_STATIC_DIR = "/Applications/Bloks.app/Contents/Resources/ui";
+  try {
+    assert.equal(isLocalRequest(dev), false);
+  } finally {
+    if (before === undefined) delete process.env.BLOKS_STATIC_DIR;
+    else process.env.BLOKS_STATIC_DIR = before;
+  }
 });
 
 test("a malformed Origin is rejected rather than ignored", () => {

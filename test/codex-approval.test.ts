@@ -63,8 +63,8 @@ async function setup(t: TestContext, fullAuto = false) {
     t.mock.restoreAll();
     syncBuiltinESMExports();
   });
-  async function start(threadId = "task-a") {
-    await instance.adapter.sendTurn({ threadId, text: "Test Drive" });
+  async function start(threadId = "task-a", extra: Record<string, unknown> = {}) {
+    await instance.adapter.sendTurn({ threadId, text: "Test Drive", ...extra });
     await setImmediate();
     return peers.at(-1)!;
   }
@@ -215,4 +215,46 @@ test("command, edit and question replies retain their own protocol formats", asy
   const ask = h.events.filter((e) => e.type === "request.opened").at(-1)!;
   await h.instance.adapter.respondToRequest("task-a", ask.requestId!, { behavior: "answer", message: "Friday" });
   assert.deepEqual(peer.reply("question").result, { answers: { date: { answers: ["Friday"] } } });
+});
+
+test("an agent in full access runs Codex unsandboxed and never asking", async (t) => {
+  const h = await setup(t);
+  const peer = await h.start("task-full", { fullAccess: true });
+  await setImmediate();
+  const thread = peer.frames.find((f) => f.method === "thread/start");
+  assert.equal(thread.params.sandbox, "danger-full-access");
+  assert.equal(thread.params.approvalPolicy, "never");
+  // anything that still asks is accepted, the same as an engine set to full auto
+  peer.send(elicitation(0));
+  assert.deepEqual(peer.reply(0).result, { action: "accept", content: {}, _meta: null });
+  assert.ok(!h.events.some((e) => e.type === "request.opened"));
+});
+
+test("without full access Codex keeps its sandbox, and a resumed thread is told which it is", async (t) => {
+  const h = await setup(t);
+  const peer = await h.start("task-kept", { resumeCursor: "codex-thread" });
+  await setImmediate();
+  const resume = peer.frames.find((f) => f.method === "thread/resume");
+  assert.equal(resume.params.sandbox, "workspace-write");
+  assert.equal(resume.params.approvalPolicy, "on-request");
+});
+
+// A rule about a command or a path needs the request to say which. Codex
+// did not, so only rules on the tool's name ever applied to it.
+test("an approval request says which command, and which files a change touches", async (t) => {
+  const h = await setup(t);
+  const peer = await h.start();
+  peer.send({ id: 7, method: "item/commandExecution/requestApproval", params: { threadId: "codex-thread", turnId: "codex-turn", itemId: "c1", command: "rm -rf build", cwd: "/w" } });
+  peer.send({ method: "item/started", params: { threadId: "codex-thread", item: { id: "f1", type: "fileChange", changes: [{ path: "/w/a.ts" }, { path: "/w/.env" }] } } });
+  peer.send({ id: 8, method: "item/fileChange/requestApproval", params: { threadId: "codex-thread", turnId: "codex-turn", itemId: "f1" } });
+  peer.send({ id: 9, method: "applyPatchApproval", params: { conversationId: "codex-thread", fileChanges: { "/w/b.ts": {}, "/w/c.ts": { update: { move_path: "/w/.env" } } } } });
+  peer.send({ id: 10, method: "execCommandApproval", params: { conversationId: "codex-thread", command: ["git", "push", "--force"] } });
+  await setImmediate();
+  const asks = h.events.filter((e): e is Extract<typeof e, { type: "request.opened" }> => e.type === "request.opened");
+  assert.deepEqual(asks.map((a) => a.input), [
+    { command: "rm -rf build" },
+    { path: "/w/a.ts", paths: ["/w/a.ts", "/w/.env"] },
+    { path: "/w/b.ts", paths: ["/w/b.ts", "/w/c.ts", "/w/.env"] },
+    { command: "git push --force" },
+  ]);
 });

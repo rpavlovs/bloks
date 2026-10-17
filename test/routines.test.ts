@@ -13,8 +13,10 @@ import {
   isDue,
   lastScheduledBefore,
   nextScheduledAfter,
+  MAX_ROUTINE_PROMPT,
   normalize,
   parseTime,
+  promptTooLong,
   type Routine,
 } from "../server/routines.ts";
 
@@ -137,12 +139,16 @@ test("normalize refuses what it cannot store and clamps the rest", () => {
   assert.equal(clean.enabled, false);
 });
 
-test("an over-long prompt is cut rather than rejected", () => {
-  // A long prompt is a user being thorough, not an attack. The cap exists
-  // because this text reaches a system prompt on every run.
-  const clean = normalize({ targetId: "b", prompt: "x".repeat(9_000), time: "09:00" });
-  assert.ok(clean);
-  assert.equal(clean.prompt.length, 2_000);
+test("an over-long prompt is refused, not cut (GitHub 163)", () => {
+  // The cap exists because this text reaches a system prompt on every run.
+  // Cutting it silently meant a routine ran half its instructions.
+  assert.equal(MAX_ROUTINE_PROMPT, 4_000);
+  const fits = normalize({ targetId: "b", prompt: "x".repeat(4_000), time: "09:00" });
+  assert.equal(fits?.prompt.length, 4_000);
+  assert.equal(normalize({ targetId: "b", prompt: "x".repeat(4_001), time: "09:00" }), null);
+  // measured after trimming, as it is stored
+  assert.equal(promptTooLong(`  ${"x".repeat(4_000)}\n`), null);
+  assert.equal(promptTooLong("x".repeat(4_019)), "routine prompt is too long: maximum 4000, received 4019");
 });
 
 test("the schedule reads like something a person would say", () => {
@@ -151,4 +157,114 @@ test("the schedule reads like something a person would say", () => {
   assert.equal(describe(routine({ days: [0, 6] })), "Weekends at 09:00");
   assert.equal(describe(routine({ days: [3] })), "Every Wednesday at 09:00");
   assert.equal(describe(routine({ days: [1, 4] })), "Mon, Thu at 09:00");
+});
+
+test("a routine made or retimed after its slot waits for the next one (GitHub 142)", () => {
+  // Made at 19:01 for 18:00: the 18:00 an hour ago was not missed, it was
+  // never this routine's. The grace is for slots the Mac slept through.
+  const made = at("2026-03-17T19:01:00").getTime();
+  const r = routine({ time: "18:00", createdAt: made, scheduledAt: made });
+  assert.equal(isDue(r, at("2026-03-17T19:01:30")), false);
+  assert.equal(isDue(r, at("2026-03-17T20:30:00")), false);
+  assert.equal(isDue(r, at("2026-03-18T18:00:10")), true, "tomorrow's slot runs as usual");
+
+  // a slot after the schedule was set, missed while asleep, still runs late within the grace
+  const set = at("2026-03-17T17:00:00").getTime();
+  assert.equal(isDue(routine({ time: "18:00", scheduledAt: set }), at("2026-03-17T19:30:00")), true);
+
+  // and a routine from before this field existed behaves as it always did
+  assert.equal(isDue(routine({ time: "18:00" }), at("2026-03-17T19:01:30")), true);
+});
+
+test("changing a routine's time, days or date, or switching it back on, restarts its slots", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  // RoutineStore writes under the real data folder, so it runs in a child with its own HOME
+  const home = mkdtempSync(join(tmpdir(), "bloks-routine-store-"));
+  try {
+    const script = `
+      import { RoutineStore } from ${JSON.stringify(new URL("../server/routines.ts", import.meta.url).href)};
+      const store = new RoutineStore();
+      const r = store.create({ targetId: "b", targetKind: "agent", prompt: "x", time: "21:00", days: [], enabled: true });
+      const made = r.scheduledAt;
+      await new Promise((ok) => setTimeout(ok, 20));
+      store.patch(r.id, { prompt: "y" });
+      const sameAfterPrompt = store.get(r.id).scheduledAt === made;
+      store.patch(r.id, { time: "18:00" });
+      const movedOnRetime = store.get(r.id).scheduledAt > made;
+      const retimed = store.get(r.id).scheduledAt;
+      await new Promise((ok) => setTimeout(ok, 20));
+      store.patch(r.id, { enabled: false });
+      const sameOnPause = store.get(r.id).scheduledAt === retimed;
+      store.patch(r.id, { enabled: true });
+      const movedOnResume = store.get(r.id).scheduledAt > retimed;
+      console.log(JSON.stringify({ made: typeof made === "number", sameAfterPrompt, movedOnRetime, sameOnPause, movedOnResume }));
+    `;
+    const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: "utf8" });
+    const result = JSON.parse(run.stdout.trim().split("\n").pop() ?? "{}");
+    assert.deepEqual(result, { made: true, sameAfterPrompt: true, movedOnRetime: true, sameOnPause: true, movedOnResume: true }, run.stderr);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("once routines that have run make room at the limit, and nothing else does", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  // RoutineStore writes under the real data folder, so it runs in a child with its own HOME
+  const home = mkdtempSync(join(tmpdir(), "bloks-routine-limit-"));
+  try {
+    const script = `
+      import { RoutineStore, MAX_ROUTINES } from ${JSON.stringify(new URL("../server/routines.ts", import.meta.url).href)};
+      const store = new RoutineStore();
+      const once = { targetId: "b", targetKind: "agent", prompt: "x", time: "09:00", days: [], repeat: "once", date: "2030-01-01", enabled: true };
+      const weekly = { targetId: "b", targetKind: "agent", prompt: "x", time: "09:00", days: [], enabled: true };
+      const made = [];
+      for (let i = 0; i < MAX_ROUTINES; i++) {
+        const r = store.create(once);
+        made.push(r.id);
+        store.markRan(r.id, 1_000 + i);
+      }
+      // every one of the fifty has run and is switched off (GitHub 276)
+      const next = store.create(weekly);
+      const afterOne = { made: Boolean(next), count: store.routines.length, oldestGone: !store.get(made[0]), secondKept: Boolean(store.get(made[1])) };
+      // the same from a store read back from disk
+      const reread = new RoutineStore();
+      const again = reread.create(weekly);
+      const afterReload = { made: Boolean(again), count: reread.routines.length, secondGone: !reread.get(made[1]) };
+
+      // what can still run is never dropped: fill the rest with weekly ones
+      while (reread.routines.some((r) => r.repeat === "once")) reread.create(weekly);
+      const full = { count: reread.routines.length, refused: reread.create(weekly) === null, stillFull: reread.routines.length };
+      // a once routine that has not run, one switched off by hand, and one whose run is still open all stay
+      const fresh = new RoutineStore();
+      fresh.routines.length = 0;
+      for (let i = 0; i < MAX_ROUTINES - 3; i++) fresh.create(weekly);
+      const waiting = fresh.create(once);
+      const off = fresh.create({ ...once, enabled: false });
+      const running = fresh.create(once);
+      fresh.markRan(running.id, 5);
+      fresh.beginRun(running.id);
+      const kept = { refused: fresh.create(weekly) === null, all: [waiting, off, running].every((r) => fresh.get(r.id)) };
+      console.log(JSON.stringify({ afterOne, afterReload, full, kept }));
+    `;
+    const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: "utf8" });
+    const result = JSON.parse(run.stdout.trim().split("\n").pop() ?? "{}");
+    assert.deepEqual(
+      result,
+      {
+        afterOne: { made: true, count: 50, oldestGone: true, secondKept: true },
+        afterReload: { made: true, count: 50, secondGone: true },
+        full: { count: 50, refused: true, stillFull: 50 },
+        kept: { refused: true, all: true },
+      },
+      run.stderr,
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

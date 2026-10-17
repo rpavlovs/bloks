@@ -12,6 +12,7 @@
 // System Settings at all.
 import {
   app,
+  autoUpdater as nativeUpdater,
   BrowserWindow,
   clipboard,
   desktopCapturer,
@@ -37,7 +38,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { normalizeBadgeCount, resolveWindowState } from "./window-state.mjs";
+import { appMenuTemplate } from "./app-menu.mjs";
+import { drainWait } from "./drain-wait.mjs";
+import { mayLookAgain, newestBeforeInstall, updateFrame } from "./update-check.mjs";
+import { markInstall, restartIntoUpdate, takeInstallMark, within } from "./update-restart.mjs";
 import { claimPairLink, startRemoteProxy } from "./remote.mjs";
+import { sameAppOrigin } from "./navigation.mjs";
+import { linkInArgv, teamLink } from "./links.mjs";
 import os from "node:os";
 
 // vendored by scripts/bundle-updater.mjs: the packaged app has no
@@ -46,6 +53,8 @@ import electronUpdater from "./vendor/electron-updater.cjs";
 
 import { startCua, stopCua, registerCuaIpc } from "./cua.mjs";
 import { nativeHelper } from "./native-helper.mjs";
+import { USUAL_PORTS, anyFreePort, failurePage, parseLsof, portFree, portOrder } from "./ports.mjs";
+import { keepServerUp, stopServer } from "./server-life.mjs";
 import { startMeeting, startSpeech, stopMeeting, stopSpeech } from "./speech.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -55,9 +64,9 @@ const APP_ICON = path.join(HERE, "resources/app-icon.png");
 // can resolve to ::1 first, which paints an empty window.
 const DEV_URL = process.env.ELECTRON_START_URL ?? "http://127.0.0.1:5199";
 
-/** Ports to try, in order. A stray process on the usual one should cost a
- * few seconds, not the whole app. */
-const CANDIDATE_PORTS = [8799, 18799, 28799];
+/** The usual ports; see electron/ports.mjs for the order they are tried
+ * in and what happens when none of them is free. */
+const CANDIDATE_PORTS = USUAL_PORTS;
 
 const DARK_BACKDROP = "#0e0e10";
 const LIGHT_BACKDROP = "#ffffff";
@@ -94,6 +103,12 @@ async function adoptLoginShellPath() {
 let serverProcess = null;
 let serverPort = CANDIDATE_PORTS[0];
 let serverStarted = true;
+/** What the running server has said on stderr lately, for the page shown
+ * if it dies and will not come back. */
+let serverLastWords = () => "";
+/** Set once Bloks starts quitting: the server going away is expected from
+ * then on, and is not brought back. */
+let quitting = false;
 
 // One Bloks per user. A second launch would fork a second harness onto a
 // fallback port and quietly split the workspace in two, so the loser
@@ -108,20 +123,10 @@ if (!app.requestSingleInstanceLock()) {
 // point the app at an arbitrary address, and what it opens is the same
 // review a person sees when importing by hand, so nothing is created
 // until they choose the seats. macOS hands links over with open-url, the
-// others as an argument to a second launch.
+// others as an argument, to a second launch or to the one the link
+// started (electron/links.mjs).
 app.setAsDefaultProtocolClient("bloks");
 let pendingLink = null;
-/** A link worth passing on, or null. */
-function teamLink(raw) {
-  try {
-    const url = new URL(String(raw));
-    if (url.protocol !== "bloks:" || url.hostname !== "team") return null;
-    const slug = url.pathname.replace(/^\/+|\/+$/g, "");
-    return /^[a-z0-9-]{1,60}$/.test(slug) ? { kind: "team", slug } : null;
-  } catch {
-    return null;
-  }
-}
 function deliverLink(raw) {
   const link = teamLink(raw);
   if (!link) return;
@@ -139,14 +144,38 @@ app.on("open-url", (event, url) => {
   event.preventDefault();
   deliverLink(url);
 });
-ipcMain.handle("link:pending", () => {
+handle("link:pending", () => {
   const link = pendingLink;
   pendingLink = null;
   return link;
 });
 
+// A choice from the macOS menu bar (electron/app-menu.mjs) that the
+// workspace window carries out, such as Settings. macOS keeps the app
+// running with every window closed, and the menu still works then, so a
+// window is opened for it and asks for the choice once it is listening,
+// the same way a link waits above.
+let pendingMenuCommand = null;
+function menuCommand(command) {
+  const main = BrowserWindow.getAllWindows().find((w) => w !== quickWin && !w.isDestroyed());
+  if (!main || main.webContents.isLoading()) {
+    pendingMenuCommand = command;
+    if (!main) createWindow();
+    return;
+  }
+  if (main.isMinimized()) main.restore();
+  main.show();
+  main.focus();
+  main.webContents.send("menu:command", command);
+}
+handle("menu:pending", () => {
+  const command = pendingMenuCommand;
+  pendingMenuCommand = null;
+  return command;
+});
+
 app.on("second-instance", (_event, argv = []) => {
-  const link = argv.find((arg) => typeof arg === "string" && arg.startsWith("bloks://"));
+  const link = linkInArgv(argv);
   if (link) deliverLink(link);
   const main = BrowserWindow.getAllWindows().find((w) => w !== quickWin && !w.isDestroyed());
   if (!main) return;
@@ -175,7 +204,31 @@ async function startServerOn(port) {
       BLOKS_STATIC_DIR: path.join(process.resourcesPath, "ui"),
       BLOKS_PORT: String(port),
     },
-    stdio: "inherit",
+    // stderr is read as well as passed on, so a server that dies while
+    // starting can say why on the page instead of "ports".
+    //
+    // stdout is piped too, never "inherit" next to a "pipe": on Windows,
+    // Electron fills an inherited slot with GetStdHandle(), which is NULL
+    // for an app opened from a shortcut (no console), and Chromium's
+    // LaunchProcess then dies on PCHECK(SetHandleInformation(NULL, ...))
+    // before the window exists. Two pipes are always valid handles.
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  // Pass the server's output on when there is somewhere to pass it; a
+  // Windows app opened from a shortcut has no console, and a write that
+  // fails there must not take the main process with it.
+  const passOn = (target, chunk) => {
+    try {
+      target.write(chunk);
+    } catch {
+      /* no console to write to */
+    }
+  };
+  child.stdout?.on("data", (chunk) => passOn(process.stdout, chunk));
+  let stderr = "";
+  child.stderr?.on("data", (chunk) => {
+    passOn(process.stderr, chunk);
+    stderr = (stderr + chunk.toString()).slice(-4000);
   });
 
   let exited = false;
@@ -185,13 +238,18 @@ async function startServerOn(port) {
 
   // First run on a fresh machine writes its data directories before it
   // listens, so this waits rather than assuming a fast start.
+  let why = "slow";
   for (let attempt = 0; attempt < 40; attempt++) {
-    if (exited) return null;
+    if (exited) {
+      // lost a race for the port after the check said it was free
+      return { child: null, why: /EADDRINUSE/.test(stderr) ? "busy" : "exited", stderr };
+    }
     try {
       const response = await fetch(`http://127.0.0.1:${port}/api/health`);
       if (response.ok) {
         const body = await response.json().catch(() => null);
-        if (body?.app === "bloks" && body.pid === child.pid && body.static) return child;
+        if (body?.app === "bloks" && body.pid === child.pid && body.static) return { child, lastWords: () => stderr };
+        why = "other-server";
         break; // someone else answers here; try the next port
       }
     } catch {
@@ -205,40 +263,128 @@ async function startServerOn(port) {
   } catch {
     /* already gone */
   }
-  return null;
+  return { child: null, why, stderr };
 }
 
-async function startServer() {
+/** Who is listening on a port, when the system will say. */
+function portHolder(port) {
+  if (process.platform === "win32") return Promise.resolve(null);
+  return new Promise((resolve) => {
+    execFile("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fcp"], { timeout: 3000 }, (_error, stdout) =>
+      resolve(parseLsof(stdout)),
+    );
+  });
+}
+
+const LAST_PORT_FILE = () => path.join(app.getPath("userData"), "server-port.json");
+
+function readLastPort() {
+  try {
+    return JSON.parse(fs.readFileSync(LAST_PORT_FILE(), "utf8")).port ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** A port chosen in ~/.bloks/config.json, the one place a Finder-opened
+ * app can be told one. */
+function readConfiguredPort() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(os.homedir(), ".bloks", "config.json"), "utf8")).port ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** The server that holds ~/.bloks, when ours refused to start beside it. */
+function dataFolderHolder(stderr) {
+  const found = /DATA_FOLDER_IN_USE pid=(\d+) port=(\d+)/.exec(stderr ?? "");
+  return found ? { pid: Number(found[1]), port: Number(found[2]) } : null;
+}
+
+/** What the window shows when no server came up. Set by startServer. */
+let startupFailure = null;
+
+/** Starts the server, trying each port in turn. `prefer` goes first, and
+ * `rounds` is how many sweeps of the ports it gets. */
+async function startServer({ prefer = null, rounds = 2 } = {}) {
+  const attempts = [];
+  let crash = "";
+  // Another Bloks server already using ~/.bloks, as the server reports it
+  // (server/data-lock.ts). Another port would not help: it is the data
+  // folder that is taken, and two servers on it undo each other's work.
+  let inUse = null;
   // Quit-and-reopen can race the previous instance's teardown, so the
-  // whole sweep is tried twice before giving up.
-  for (let round = 0; round < 2; round++) {
-    for (const port of CANDIDATE_PORTS) {
-      const child = await startServerOn(port);
-      if (child) {
-        serverProcess = child;
+  // whole sweep is tried twice before giving up; a folder still held is
+  // given a few more rounds, since that is most often the last instance
+  // on its way out.
+  for (let round = 0; round < (inUse ? 5 : rounds); round++) {
+    inUse = null;
+    const ports = portOrder({ prefer, env: process.env.BLOKS_PORT, configured: readConfiguredPort(), last: readLastPort() });
+    // every usual port busy is not the end: any free port will do
+    const spare = await anyFreePort();
+    if (spare) ports.push(spare);
+    for (const port of ports) {
+      if (!(await portFree(port))) {
+        if (round === rounds - 1) attempts.push({ port, why: "busy", holder: await portHolder(port) });
+        continue;
+      }
+      const started = await startServerOn(port);
+      if (started.child) {
+        serverProcess = started.child;
         serverPort = port;
+        serverLastWords = started.lastWords;
+        try {
+          fs.writeFileSync(LAST_PORT_FILE(), JSON.stringify({ port }));
+        } catch {
+          /* next launch simply starts from the usual ports */
+        }
         return true;
       }
+      if (started.why === "exited" && started.stderr) crash = started.stderr;
+      inUse = dataFolderHolder(started.stderr);
+      if (inUse) break;
+      if (round === rounds - 1) attempts.push({ port, why: started.why, holder: null });
     }
     await pause(2500);
   }
+  startupFailure = failurePage({
+    attempts,
+    crash,
+    inUse,
+    backdrop: DARK_BACKDROP,
+    machine: process.platform === "darwin" ? "Mac" : "computer",
+  });
   return false;
 }
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Shown when every port was taken. Inline rather than a file, because a
- * failure this early should not depend on anything else having loaded. */
-const STARTUP_FAILURE_PAGE =
-  "data:text/html;charset=utf-8," +
-  encodeURIComponent(
-    `<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:${DARK_BACKDROP};color:#ededf0;font:15px -apple-system,system-ui">` +
-      `<div style="text-align:center;max-width:380px">` +
-      `<div style="font-size:42px;color:#7c8aff">▦</div>` +
-      `<h2 style="font-weight:600;margin:12px 0 6px">Couldn't start the Bloks server</h2>` +
-      `<p style="color:#8f8f99;line-height:1.5">Something else is using its ports. Quit and reopen Bloks. If it keeps happening, restart your ${process.platform === "darwin" ? "Mac" : "computer"}.</p>` +
-      `</div></body>`,
-  );
+// A server that dies after it started is brought back, on the port it
+// had when that is free; see electron/server-life.mjs. Each try is one
+// sweep of the ports, and a server that keeps dying ends on the failure
+// page instead of a window calling a port nobody answers on.
+const keeper = keepServerUp({
+  quitting: () => quitting,
+  start: async () => {
+    startupFailure = null;
+    return (await startServer({ prefer: serverPort, rounds: 1 })) ? serverProcess : null;
+  },
+  onBack: () => pointWindows(),
+  onGaveUp: () => {
+    // the last try that failed to start already says why; otherwise the
+    // last one started and died like the rest
+    startupFailure ??= failurePage({
+      attempts: [],
+      crash: serverLastWords(),
+      stopped: true,
+      backdrop: DARK_BACKDROP,
+      machine: process.platform === "darwin" ? "Mac" : "computer",
+    });
+    serverStarted = false;
+    pointWindows();
+  },
+});
 
 // ── the window ─────────────────────────────────────────────────────────
 
@@ -251,14 +397,46 @@ const isHttpUrl = (url) => {
   }
 };
 
-const isOurOwnPage = (url) => {
-  try {
-    const { hostname } = new URL(url);
-    return hostname === "127.0.0.1" || hostname === "localhost";
-  } catch {
-    return false;
-  }
+// The app's own page is its exact origin, port included. Any page on
+// localhost used to count, and agents run dev servers, notebooks and
+// desktops on localhost: one of those loaded into the app window would
+// have had the preload's bridge (pairing a remote, Touch ID, the screen).
+const isOurOwnPage = (url) => sameAppOrigin(url, appUrl());
+
+/** Only the app's own page may use the bridge: the top frame of one of
+ * its windows, judged by the frame's real origin. A frame inside the page
+ * (an artifact, an app, an agent's desktop) has its own origin, and a
+ * sandboxed one says "null", so neither passes. */
+const fromOurPage = (event) => {
+  const frame = event?.senderFrame;
+  if (!frame || frame !== event.sender?.mainFrame) return false;
+  return isOurOwnPage(frame.origin ?? "");
 };
+
+/** ipcMain.handle, answering only the app's own page (fromOurPage). Every
+ * bridge goes through this, so a new one cannot forget the check. */
+function handle(channel, fn) {
+  ipcMain.handle(channel, (event, ...args) => {
+    if (!fromOurPage(event)) throw new Error("not from the app");
+    return fn(event, ...args);
+  });
+}
+
+/** The same rules for every window that loads the app: links go to the
+ * real browser, and the window itself never leaves the app's origin. */
+function guardNavigation(target) {
+  target.webContents.setWindowOpenHandler(({ url }) => {
+    if (isHttpUrl(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
+  target.webContents.on("will-navigate", (event, url) => {
+    if (isOurOwnPage(url)) return; // the app reloading itself
+    event.preventDefault();
+    if (isHttpUrl(url)) shell.openExternal(url);
+  });
+  // A compromised renderer must not be able to grow itself new surfaces.
+  target.webContents.on("will-attach-webview", (event) => event.preventDefault());
+}
 
 /**
  * Right-click, the way native apps mean it.
@@ -397,9 +575,22 @@ function appUrl(query = "") {
   const base = app.isPackaged
     ? serverStarted
       ? `http://127.0.0.1:${serverPort}`
-      : STARTUP_FAILURE_PAGE
+      : startupFailure
     : DEV_URL;
   return query ? `${base}${base.includes("?") ? "&" : "?"}${query}` : base;
+}
+
+/** Every window at the app again, after the server came back (perhaps on
+ * another port), or at the failure page once it will not. The app keeps
+ * nothing in its address, so loading it afresh loses nothing a reload
+ * would keep. */
+function pointWindows() {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
+    // a server that died again at once fails the load, and the next try
+    // or the failure page points the window again
+    win.loadURL(win === quickWin && serverStarted ? appUrl("quick=1") : appUrl()).catch(() => {});
+  }
 }
 
 function quickWindow() {
@@ -424,6 +615,8 @@ function quickWindow() {
     },
   });
   quickWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  // it loads the same page, with the same bridge, so the same guards
+  guardNavigation(quickWin);
   installContextMenu(quickWin);
   quickWin.loadURL(appUrl("quick=1"));
   // Clicking away is a dismissal. Anything else would leave a floating
@@ -550,22 +743,10 @@ function createWindow() {
   // so every URL is treated as hostile until proven to be plain http(s):
   // those open in the real browser, and everything else is dropped. The
   // app frame itself never navigates anywhere but its own origin.
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (isHttpUrl(url)) shell.openExternal(url);
-    return { action: "deny" };
-  });
-
-  win.webContents.on("will-navigate", (event, url) => {
-    if (isOurOwnPage(url)) return; // the app reloading itself
-    event.preventDefault();
-    if (isHttpUrl(url)) shell.openExternal(url);
-  });
-
-  // A compromised renderer must not be able to grow itself new surfaces.
-  win.webContents.on("will-attach-webview", (event) => event.preventDefault());
+  guardNavigation(win);
 
   if (app.isPackaged) {
-    win.loadURL(serverStarted ? `http://127.0.0.1:${serverPort}` : STARTUP_FAILURE_PAGE);
+    win.loadURL(serverStarted ? `http://127.0.0.1:${serverPort}` : startupFailure);
   } else {
     win.loadURL(DEV_URL);
   }
@@ -573,7 +754,7 @@ function createWindow() {
 
 // ── permissions the web layer cannot ask for ───────────────────────────
 
-ipcMain.handle("screen:frame", async () => {
+handle("screen:frame", async (event) => {
   const sources = await desktopCapturer.getSources({
     types: ["screen"],
     thumbnailSize: { width: 1280, height: 800 },
@@ -581,12 +762,12 @@ ipcMain.handle("screen:frame", async () => {
   return sources[0]?.thumbnail.toDataURL() ?? null;
 });
 
-ipcMain.handle("perm:status", () => ({
+handle("perm:status", () => ({
   mic: systemPreferences.getMediaAccessStatus?.("microphone") ?? "unknown",
   screen: systemPreferences.getMediaAccessStatus?.("screen") ?? "unknown",
 }));
 
-ipcMain.handle("perm:request-mic", async () => {
+handle("perm:request-mic", async () => {
   try {
     return await systemPreferences.askForMediaAccess("microphone");
   } catch {
@@ -602,7 +783,7 @@ ipcMain.handle("perm:request-mic", async () => {
  * directly. Being a child of this app, it inherits the app's identity, so
  * the prompt and the pane entry both say Bloks.
  */
-ipcMain.handle("perm:request-screen", async () => {
+handle("perm:request-screen", async () => {
   try {
     const helper = nativeHelper("perm-helper");
     await new Promise((resolve) => {
@@ -616,7 +797,7 @@ ipcMain.handle("perm:request-screen", async () => {
 });
 
 /** Once denied, macOS will not ask again. Deep-link to the exact pane. */
-ipcMain.handle("perm:open-settings", (_event, pane) => {
+handle("perm:open-settings", (_event, pane) => {
   const panes = {
     mic: "Privacy_Microphone",
     screen: "Privacy_ScreenCapture",
@@ -658,7 +839,7 @@ async function bannerIcon(avatar) {
   }
 }
 
-ipcMain.handle("notify:show", async (event, notice) => {
+handle("notify:show", async (event, notice) => {
   if (!Notification.isSupported()) return;
   const target = String(notice?.target ?? "");
   const icon = await bannerIcon(notice?.avatar);
@@ -693,7 +874,7 @@ ipcMain.handle("notify:show", async (event, notice) => {
  * Typing a path stays possible; this is for everyone who should not
  * have to know what an absolute path is. Answers null on cancel.
  */
-ipcMain.handle("dialog:pick-folder", async (event) => {
+handle("dialog:pick-folder", async (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win || win.isDestroyed()) return null;
   const { canceled, filePaths } = await dialog.showOpenDialog(win, {
@@ -711,7 +892,7 @@ ipcMain.handle("dialog:pick-folder", async (event) => {
  * icon instead.
  */
 let badgeOverlay = null;
-ipcMain.handle("badge:set", (event, value) => {
+handle("badge:set", (event, value) => {
   const count = normalizeBadgeCount(value);
   if (process.platform === "win32") {
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -766,41 +947,169 @@ function updaterLogger() {
   return { info: write("info"), warn: write("warn"), error: write("error"), debug: write("debug") };
 }
 
+/** How often a running app looks for a newer release. */
+const RECHECK_UPDATES_MS = 4 * 60 * 60 * 1000;
+
 /** The last thing the updater said, replayed to windows that ask. */
 let updaterState = { state: "idle" };
+/** The wait for a drain before an update installs, while there is one. */
+let drainWaiting = null;
+/** The updater's log, once there is an updater. A restart into an update
+ * writes its own steps there too, so one file tells the whole of it. */
+let updaterLog = null;
+/** Set at start when the last restart into an update came back on the
+ * version it left (electron/update-restart.mjs), until the card that
+ * says so is closed or the restart is tried again. */
+let notInstalled = null;
 
-ipcMain.handle("app:version", () => app.getVersion());
-ipcMain.handle("update:state", () => updaterState);
-ipcMain.handle("update:check", async () => {
+/** The note of the version a restart is leaving, read at the next start. */
+const INSTALL_MARK_FILE = () => path.join(app.getPath("userData"), "update-restart.json");
+
+/** What the windows are told: the updater's state, and the update that
+ * did not install while that is still to be said. */
+const updateToShow = () => (notInstalled ? { ...updaterState, notInstalled } : updaterState);
+
+function showUpdate(next) {
+  updaterState = next;
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send("update:state", updateToShow());
+  }
+}
+
+handle("app:version", () => app.getVersion());
+handle("update:state", () => updateToShow());
+handle("update:check", async () => {
   if (!app.isPackaged) return { state: "dev" };
   try {
     await electronUpdater.autoUpdater.checkForUpdates();
   } catch {
     // the error event has already told the windows
   }
-  return updaterState;
+  return updateToShow();
 });
-ipcMain.handle("update:install", () => {
+handle("update:not-installed-seen", () => {
+  notInstalled = null;
+  showUpdate(updaterState);
+});
+/** Before an update restarts Bloks, the harness finishes what is running
+ * and starts nothing new, and this waits until it has or until its
+ * deadline passes (server/drain.ts). Anything still running then is
+ * picked up after the restart, and anything that arrived meanwhile waits
+ * on disk. A harness that does not answer has nothing to wait for.
+ * While it waits, the update card says what for, and can restart now or
+ * call it off (electron/drain-wait.mjs). Answers how the wait ended. */
+async function drainBeforeRestart() {
+  // agents on another computer are that computer's to finish
+  if (remoteProfile || !serverStarted) return "done";
+  const ask = async (method) => {
+    try {
+      const response = await fetch(`http://127.0.0.1:${serverPort}/api/maintenance/drain`, {
+        method,
+        headers: { "content-type": "application/json" },
+        body: method === "POST" ? "{}" : undefined,
+        signal: AbortSignal.timeout(2000),
+      });
+      return response.ok ? await response.json() : null;
+    } catch {
+      return null;
+    }
+  };
+  drainWaiting = drainWait(ask, {
+    onProgress: (state) =>
+      showUpdate({ ...updaterState, draining: { running: state.running.length, deadline: state.deadline } }),
+  });
+  try {
+    return await drainWaiting.finished;
+  } finally {
+    // however it ended: a wait left standing would turn away every later
+    // press of the button
+    drainWaiting = null;
+    const { draining: _, ...rest } = updaterState;
+    showUpdate(rest);
+  }
+}
+
+/** On macOS the updater hands each download to the native installer,
+ * which fetches and unpacks it again before it can install it, a few
+ * seconds after the card already reads ready. A quit asked for in
+ * between installs nothing. So a restart waits for the installer to have
+ * what it was last handed, or to have said that it failed. */
+let staging = false;
+let stagingOver = () => {};
+const nativelyStaged = () =>
+  new Promise((resolve) => {
+    if (!staging) return resolve();
+    stagingOver = resolve;
+  });
+
+/** A restart asked for and on its way, so a second press joins it and
+ * does not start another. */
+let restart = null;
+
+/** A line of the restart's own in the updater's log. */
+const restartLog = (line) => updaterLog?.info(line);
+
+// Every step has a time limit and none can stop the next, and once the
+// drain is past the process ends: by an exit, if the quit does not get
+// there (electron/update-restart.mjs).
+handle("update:install", () => {
   if (!app.isPackaged) return;
-  // same teardown as a normal quit, then the installer takes over
-  electronUpdater.autoUpdater.quitAndInstall();
+  if (notInstalled) {
+    // trying again is the answer to it
+    notInstalled = null;
+    showUpdate(updaterState);
+  }
+  restart ??= restartIntoUpdate(
+    {
+      // a newer release than the one downloaded is the one to restart
+      // into (electron/update-check.mjs)
+      look: () => newestBeforeInstall(electronUpdater.autoUpdater, { waiting: updaterState.version }),
+      drain: drainBeforeRestart,
+      mark: () => markInstall(INSTALL_MARK_FILE(), { from: app.getVersion(), to: updaterState.version }),
+      staged: nativelyStaged,
+      // same teardown as a normal quit, then the installer takes over
+      quit: () => electronUpdater.autoUpdater.quitAndInstall(),
+      // destroyed, not asked: asking is what did not work
+      closeWindows: () => {
+        const open = BrowserWindow.getAllWindows().filter((win) => !win.isDestroyed());
+        for (const win of open) win.destroy();
+        return open.length;
+      },
+      // exit skips before-quit, so the server is stopped here, as it is
+      // where pairing restarts the app
+      teardown: () => {
+        quitting = true;
+        return stopServer(serverProcess);
+      },
+      // Not relaunched. The installer starts the new version when the
+      // quit got as far as telling it to, and a copy of this one started
+      // now would be running inside the app it is about to replace.
+      exit: () => app.exit(0),
+    },
+    { log: restartLog, from: app.getVersion(), to: updaterState.version },
+  ).finally(() => {
+    restart = null;
+  });
+  return restart;
 });
+handle("update:restart-now", () => drainWaiting?.stop("now"));
+handle("update:later", () => drainWaiting?.stop("cancel"));
 
 // Some settings only take effect at start, pairing above all: widening
 // what the server listens on is deliberately not a live change. This is
 // how the renderer offers to do the restart instead of asking somebody to
 // find Quit and then find the app again. relaunch() schedules the new
 // process; quit() then runs the normal teardown, daemon and all.
-ipcMain.handle("app:relaunch", () => {
+handle("app:relaunch", () => {
   app.relaunch();
   app.quit();
 });
 
-ipcMain.handle("shortcut:apply", (_event, accelerator) =>
+handle("shortcut:apply", (_event, accelerator) =>
   applyQuickShortcut(typeof accelerator === "string" && accelerator ? accelerator : null),
 );
-ipcMain.handle("quick:hide", () => quickWin?.hide());
-ipcMain.handle("quick:open-main", () => {
+handle("quick:hide", () => quickWin?.hide());
+handle("quick:open-main", () => {
   quickWin?.hide();
   const [main] = BrowserWindow.getAllWindows().filter((w) => w !== quickWin);
   if (!main || main.isDestroyed()) return;
@@ -835,26 +1144,26 @@ function askHelper(args) {
   });
 }
 
-ipcMain.handle("auth:status", () =>
+handle("auth:status", () =>
   process.platform === "darwin" ? askHelper(["check"]) : Promise.resolve("unavailable"),
 );
 
-ipcMain.handle("auth:confirm", (_event, reason) => {
+handle("auth:confirm", (_event, reason) => {
   if (process.platform !== "darwin") return "unavailable";
   const said = typeof reason === "string" ? reason.slice(0, 120) : "";
   return askHelper(["ask", said]);
 });
 
-ipcMain.handle("speech:start", (event) => {
+handle("speech:start", (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (win) startSpeech(win);
 });
-ipcMain.handle("speech:stop", () => stopSpeech());
-ipcMain.handle("meeting:start", (event, options) => {
+handle("speech:stop", () => stopSpeech());
+handle("meeting:start", (event, options) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (win) startMeeting(win, { system: Boolean(options?.system) });
 });
-ipcMain.handle("meeting:stop", () => stopMeeting());
+handle("meeting:stop", () => stopMeeting());
 
 // ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -879,9 +1188,16 @@ app.whenReady().then(async () => {
 
   // The stock File/Edit/View menu says nothing this app needs: it has its
   // own right-click menu for editing, and nothing else in the bar is
-  // reachable from the UI. macOS keeps its menu: the hidden-inset
-  // titlebar and the platform conventions expect one.
-  if (process.platform !== "darwin") Menu.setApplicationMenu(null);
+  // reachable from the UI. macOS keeps a menu: the hidden-inset titlebar
+  // and the platform conventions expect one, and it is the stock one with
+  // Settings added (electron/app-menu.mjs).
+  if (process.platform === "darwin") {
+    Menu.setApplicationMenu(
+      Menu.buildFromTemplate(appMenuTemplate({ name: app.name, packaged: app.isPackaged, command: menuCommand })),
+    );
+  } else {
+    Menu.setApplicationMenu(null);
+  }
 
   // getDisplayMedia in the renderer routed through here keeps the whole
   // capture inside the app's processes, which is the path macOS reliably
@@ -910,7 +1226,7 @@ app.whenReady().then(async () => {
   // Must precede every fork below, or the children keep launchd's PATH.
   await adoptLoginShellPath();
 
-  registerCuaIpc();
+  registerCuaIpc(handle);
   // Started before the window so the harness can read the connection
   // descriptor on its first turn. Failure is survivable: computer use
   // reports itself unavailable and everything else works.
@@ -919,8 +1235,14 @@ app.whenReady().then(async () => {
   if (app.isPackaged) {
     const remote = readRemoteProfile();
     serverStarted = remote ? await startRemote(remote) : await startServer();
+    if (!remote && serverStarted) keeper.watch(serverProcess);
   }
   createWindow();
+  // On Windows and Linux a link that opened Bloks is one of its own
+  // arguments, and only a second launch's were ever read. It waits for
+  // the window to ask, like any link that arrives while the page loads.
+  const opening = linkInArgv(process.argv);
+  if (opening) deliverLink(opening);
 
   // Update check, after the window exists so a prompt has somewhere to
   // land. Packaged builds only: a dev checkout updating itself from
@@ -934,22 +1256,49 @@ app.whenReady().then(async () => {
     // Every updater event folds into one state frame the renderer can
     // draw: the About card shows checking, downloading, ready or quiet,
     // and never has to know the updater's own event vocabulary.
-    const tellWindows = (state, detail = {}) => {
-      updaterState = { state, ...detail };
-      for (const win of BrowserWindow.getAllWindows()) {
-        if (!win.isDestroyed()) win.webContents.send("update:state", updaterState);
-      }
+    // One waiting to be installed goes on saying so through a look past
+    // it (electron/update-check.mjs).
+    const tellWindows = (event, detail) => {
+      const next = updateFrame(updaterState, event, detail);
+      if (next) showUpdate(next);
     };
     autoUpdater.on("checking-for-update", () => tellWindows("checking"));
-    autoUpdater.on("update-available", (info) => tellWindows("downloading", { version: info?.version }));
-    autoUpdater.on("update-not-available", () => tellWindows("current"));
+    autoUpdater.on("update-available", (info) => tellWindows("available", { version: info?.version }));
+    autoUpdater.on("update-not-available", () => tellWindows("not-available"));
     autoUpdater.on("download-progress", (progress) =>
-      tellWindows("downloading", { percent: Math.round(progress?.percent ?? 0) }),
+      tellWindows("progress", { percent: Math.round(progress?.percent ?? 0) }),
     );
-    autoUpdater.on("update-downloaded", (info) => tellWindows("ready", { version: info?.version }));
+    autoUpdater.on("update-downloaded", (info) => tellWindows("downloaded", { version: info?.version }));
+    if (process.platform === "darwin") {
+      // each download goes to the native installer the moment the updater
+      // has it (nativelyStaged, above)
+      autoUpdater.on("update-downloaded", () => {
+        staging = true;
+      });
+      for (const event of ["update-downloaded", "update-not-available", "error"]) {
+        nativeUpdater.on(event, () => {
+          staging = false;
+          stagingOver();
+        });
+      }
+      // Said when the quit is asked for, and again once every window has
+      // closed and the installer is told: a log with only the first is a
+      // window that would not close.
+      nativeUpdater.on("before-quit-for-update", () => restartLog("restart: the native updater is quitting to install"));
+    }
     // A Finder launch sends stdout to /dev/null, so the updater writes its
     // own log. Without it a failed update leaves nothing to read afterwards.
-    autoUpdater.logger = updaterLogger();
+    updaterLog = updaterLogger();
+    autoUpdater.logger = updaterLog;
+    // A restart into an update that came back on the version it left is
+    // said once, on the update card, with what to do about it.
+    notInstalled = takeInstallMark(INSTALL_MARK_FILE(), app.getVersion());
+    if (notInstalled) {
+      updaterLog.warn(
+        `restart: the install did not take, still on ${notInstalled.from}${notInstalled.to ? `, not ${notInstalled.to}` : ""}`,
+      );
+      showUpdate(updaterState);
+    }
     autoUpdater.on("error", (error) => {
       const message = String(error?.message ?? error);
       console.error("[updater]", message);
@@ -957,6 +1306,16 @@ app.whenReady().then(async () => {
       tellWindows("error", { reason: updateTrouble(message) });
     });
     autoUpdater.checkForUpdatesAndNotify().catch(() => {});
+    // Again every few hours. Most people leave Bloks open for days, and a
+    // check only at launch meant they never heard about a release until
+    // they happened to quit. Not while one is already downloading. One
+    // waiting to be installed is looked past: a release since it came
+    // down is the one to install (GitHub 247).
+    setInterval(() => {
+      // nor under a restart into one, which has its own look
+      if (!mayLookAgain(updaterState) || restart) return;
+      autoUpdater.checkForUpdates().catch(() => {});
+    }, RECHECK_UPDATES_MS).unref?.();
   }
 
   void restoreQuickShortcut();
@@ -1048,17 +1407,48 @@ function saveRemoteProfile(profile) {
   fs.writeFileSync(remoteFile(), safeStorage.encryptString(JSON.stringify(profile)), { mode: 0o600 });
 }
 
+/** The port the remote proxy had last time. The window's storage (folded
+ * sections, the sidebar's width, cards you closed) belongs to its origin,
+ * and the origin includes the port, so a fresh port every launch quietly
+ * forgot all of it. */
+const REMOTE_PORT_FILE = () => path.join(app.getPath("userData"), "remote-port.json");
+
+function readRemotePort() {
+  try {
+    const port = JSON.parse(fs.readFileSync(REMOTE_PORT_FILE(), "utf8")).port;
+    return Number.isInteger(port) && port > 0 && port < 65536 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
 async function startRemote(profile) {
   try {
-    const proxy = await startRemoteProxy(profile, {
+    const system = { darwin: "macOS", win32: "Windows", linux: "Linux" }[process.platform] ?? process.platform;
+    const options = {
       staticDir: path.join(process.resourcesPath, "ui"),
+      client: `${system} ${app.getVersion()}`,
       onState: (state) => {
         remoteState = state;
         for (const win of BrowserWindow.getAllWindows()) {
           if (!win.isDestroyed()) win.webContents.send("remote:state", { host: profile.host, ...state });
         }
       },
-    });
+    };
+    const remembered = readRemotePort();
+    let proxy;
+    try {
+      proxy = await startRemoteProxy(profile, { ...options, port: remembered ?? 0 });
+    } catch (error) {
+      // that port is someone else's now; any free one, remembered from here
+      if (!remembered) throw error;
+      proxy = await startRemoteProxy(profile, { ...options, port: 0 });
+    }
+    try {
+      fs.writeFileSync(REMOTE_PORT_FILE(), JSON.stringify({ port: proxy.port }));
+    } catch {
+      /* next launch picks another, as before */
+    }
     remoteProfile = profile;
     serverPort = proxy.port;
     return true;
@@ -1068,10 +1458,10 @@ async function startRemote(profile) {
   }
 }
 
-ipcMain.handle("remote:status", () =>
+handle("remote:status", () =>
   remoteProfile ? { mode: "remote", host: remoteProfile.host, ...remoteState } : { mode: "local" },
 );
-ipcMain.handle("remote:connect", async (_event, link) => {
+handle("remote:connect", async (event, link) => {
   if (!app.isPackaged) return { error: "Connecting to another computer works in the installed app." };
   try {
     const profile = await claimPairLink(String(link ?? ""), `${os.hostname().replace(/\.local$/, "")} (desktop)`);
@@ -1079,11 +1469,15 @@ ipcMain.handle("remote:connect", async (_event, link) => {
   } catch (error) {
     return { error: error?.message ?? String(error) };
   }
+  // exit skips before-quit, so the server is stopped here, or on Windows
+  // it would be ended outright and leave its lock behind
+  quitting = true;
+  await stopServer(serverProcess);
   app.relaunch();
   app.exit(0);
   return { ok: true };
 });
-ipcMain.handle("remote:disconnect", () => {
+handle("remote:disconnect", () => {
   saveRemoteProfile(null);
   app.relaunch();
   app.exit(0);
@@ -1092,6 +1486,7 @@ ipcMain.handle("remote:disconnect", () => {
 
 // The system keeps handing us these keys until we say otherwise.
 app.on("will-quit", () => {
+  if (restart) restartLog("restart: exiting");
   globalShortcut.unregisterAll();
   stopMeeting();
 });
@@ -1102,17 +1497,23 @@ app.on("window-all-closed", () => {
 
 // The embedded daemon cleans up asynchronously, and none of that can run
 // once the host process is gone. So the first quit is deferred until it
-// finishes, then allowed through.
+// finishes, then allowed through. The server is asked to stop before it
+// is killed, so it ends its engines and gives up the data folder itself
+// (electron/server-life.mjs).
+//
+// Deferred, never dropped. The daemon's stop had no time limit, and one
+// that never answers would mean the second quit never comes: the windows
+// are closed by then, and an update's installer is left waiting for
+// Bloks to go (GitHub 267). The daemon exits with this process anyway.
+const STOP_BEFORE_QUIT_MS = 5_000;
 let daemonStopped = false;
 app.on("before-quit", (event) => {
+  quitting = true;
   if (daemonStopped) return;
   event.preventDefault();
-  try {
-    serverProcess?.kill();
-  } catch {
-    /* already down */
-  }
-  stopCua().finally(() => {
+  if (restart) restartLog("restart: quit under way, stopping the server and the computer use helper");
+  within(() => Promise.allSettled([stopServer(serverProcess), stopCua()]), STOP_BEFORE_QUIT_MS).then((went) => {
+    if (restart) restartLog(`restart: ${went.outcome === "late" ? "they had not stopped in time" : "they stopped"}, quitting`);
     daemonStopped = true;
     app.quit();
   });

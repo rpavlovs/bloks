@@ -26,11 +26,21 @@ import { callMcpTool, listMcpTools, type McpAccess } from "../composio.ts";
 import { newEventId, newId } from "../contracts.ts";
 import type { ProviderSpec } from "../providers.ts";
 import { appendNative } from "./native.ts";
+import { BOAT_API } from "../boat.ts";
+import { callSignature } from "../repeats.ts";
 
 export interface CompatConfig {
   url: string;
   apiKeyEnv: string;
 }
+
+/** How long a streamed reply may go without a byte before it is treated
+ * as dead. Generous: some providers pause while a long tool call is
+ * planned, but none go quiet for this long and come back. Tests shorten
+ * it through the environment. */
+const STREAM_IDLE_MS = Number(process.env.BLOKS_STREAM_IDLE_MS) || 90_000;
+/** One round of the tool loop, which does not stream: a whole answer. */
+const ROUND_TIMEOUT_MS = 5 * 60_000;
 
 /** How long a fetched model list is trusted before we look again. */
 const CATALOG_TTL_MS = 10 * 60_000;
@@ -57,6 +67,8 @@ export function chooseModels(
   /** Ids the provider says can call tools, when it says. An agent needs
    * tools, so a free model that cannot use them is not worth offering. */
   toolCapable?: Set<string>,
+  /** When each model was added, in seconds, when the provider says. */
+  created?: Map<string, number>,
 ): ModelCatalog | null {
   const clean = [...new Set(ids.filter((id) => typeof id === "string" && id))]
     // embeddings, images and audio are not chat models
@@ -67,17 +79,20 @@ export function chooseModels(
   const usable = toolCapable ? clean.filter((id) => toolCapable.has(id)) : clean;
   if (!usable.length) return null;
   // With free slots, free models are listed together after the paid ones
-  // rather than scattered through the shortlist.
-  const pool = spec.freeSlots ? usable.filter((id) => !/:free$/i.test(id)) : usable;
+  // rather than scattered through the shortlist. A gateway's routing
+  // variant (OpenRouter's ":batch", ":nitro" and the rest) of a model that
+  // is listed anyway is the same model twice, and the plain one is the one
+  // an agent wants. Named suffixes only: Ollama's "qwen3:8b" is a size.
+  const listed = new Set(usable);
+  const variant = (id: string) => {
+    const m = /^(.+):(batch|nitro|floor|online|thinking|extended|exacto|beta)$/i.exec(id);
+    return Boolean(m && listed.has(m[1]));
+  };
+  const pool = usable.filter((id) => !variant(id) && !(spec.freeSlots && /:free$/i.test(id)));
 
-  const ranked = spec.prefer?.length
-    ? pool
-        .map((id) => ({ id, rank: spec.prefer!.findIndex((re) => re.test(id)) }))
-        .filter((e) => e.rank !== -1)
-        .sort((a, b) => a.rank - b.rank || a.id.localeCompare(b.id))
-        .map((e) => e.id)
-    : [...pool].sort();
-  const shortlist = (ranked.length ? ranked : [...pool].sort()).slice(0, spec.limit ?? 20);
+  const limit = spec.limit ?? 20;
+  const ranked = spec.prefer?.length ? byFamily(spec, pool, limit, created) : [];
+  const shortlist = ranked.length ? ranked : [...pool].sort().slice(0, limit);
 
   // keep the configured default if the provider still serves it, so a
   // refresh never silently moves an agent onto a different model
@@ -106,6 +121,44 @@ export function chooseModels(
   };
 }
 
+/**
+ * The shortlist for a provider that lists families: every family gets a
+ * turn before any family gets a second one. Ranked family by family and
+ * cut at the limit, the first family alone filled it: OpenRouter serves
+ * dozens of Google models that take tools, so a sign-in that reaches
+ * every lab offered Gemini and nothing else.
+ *
+ * Within a family the models this app names in its own catalog go first,
+ * then the newest, so a family's turn goes to its current flagship rather
+ * than to whatever sorts first by name. The result reads lab by lab, in
+ * the order the spec prefers them.
+ */
+function byFamily(spec: ProviderSpec, pool: string[], limit: number, created?: Map<string, number>): string[] {
+  const prefer = spec.prefer ?? [];
+  const named = new Set(spec.models.options.map((o) => o.id));
+  const families: string[][] = prefer.map(() => []);
+  for (const id of pool) {
+    const rank = prefer.findIndex((re) => re.test(id));
+    if (rank !== -1) families[rank].push(id);
+  }
+  for (const family of families) {
+    family.sort(
+      (a, b) =>
+        Number(named.has(b)) - Number(named.has(a)) ||
+        (created?.get(b) ?? 0) - (created?.get(a) ?? 0) ||
+        a.localeCompare(b),
+    );
+  }
+  const picked = new Set<string>();
+  for (let turn = 0; picked.size < limit && families.some((f) => f.length > turn); turn++) {
+    for (const family of families) {
+      if (picked.size >= limit) break;
+      if (turn < family.length) picked.add(family[turn]);
+    }
+  }
+  return families.flatMap((family) => family.filter((id) => picked.has(id)));
+}
+
 // ── the tool loop ──────────────────────────────────────────────────────
 // API models get tools the same way people do: a list of functions, and a
 // conversation that grows as they use them. Two are always offered; the
@@ -119,7 +172,6 @@ const ASK_TIMEOUT_MS = 15 * 60_000;
 const UNANSWERED =
   "Nobody answered in time. Use your best judgment and continue.";
 
-const BOX_API = "https://ascii.dev/api/box/v1";
 
 function toolSchemas(hasComputer: boolean, hasSandbox: boolean) {
   const tools: any[] = [
@@ -153,6 +205,19 @@ function toolSchemas(hasComputer: boolean, hasSandbox: boolean) {
           type: "object",
           properties: { query: { type: "string", description: "A few words to look for, in any order" } },
           required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_message",
+        description:
+          "Read in full one message that search_history found but cut short (it says which message id has the rest).",
+        parameters: {
+          type: "object",
+          properties: { message_id: { type: "string", description: "The message id search_history gave" } },
+          required: ["message_id"],
         },
       },
     },
@@ -260,10 +325,10 @@ async function boxExec(
   computer: { boxId: string; token: string },
   command: string,
 ): Promise<string> {
-  const res = await fetch(`${BOX_API}/boxes/${computer.boxId}/commands`, {
+  const res = await fetch(`${BOAT_API}/sandboxes/${computer.boxId}/commands`, {
     method: "POST",
     headers: { authorization: `Bearer ${computer.token}`, "content-type": "application/json" },
-    body: JSON.stringify({ command: command.slice(0, 4000) }),
+    body: JSON.stringify({ command: command.slice(0, 4000), timeoutSeconds: 120 }),
     signal: AbortSignal.timeout(120_000),
   });
   const body: any = await res.json().catch(() => null);
@@ -279,7 +344,7 @@ function sandboxExec(handle: { runtime: string; name: string }, command: string)
     execFile(
       handle.runtime,
       ["exec", handle.name, "sh", "-lc", command.slice(0, 4000)],
-      { timeout: 120_000, maxBuffer: 4_000_000 },
+      { timeout: 120_000, maxBuffer: 4_000_000, windowsHide: true },
       (error, stdout, stderr) => {
         const code = error ? ((error as any).code ?? 1) : 0;
         const tail = stderr ? `\n[stderr]\n${String(stderr).slice(-1500)}` : "";
@@ -322,7 +387,7 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
         {
           abort: AbortController;
           turnId: string;
-          asks: Map<string, (answer: string) => void>;
+          asks: Map<string, (answer: string, source?: string) => void>;
         }
       >();
 
@@ -376,10 +441,18 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
                     .map((r) => String(r.id)),
                 )
               : undefined;
+            // OpenRouter dates its models, which is how a family's newest
+            // gets its turn in the shortlist ahead of last year's
+            const created = new Map<string, number>(
+              rows
+                .filter((r) => typeof r?.created === "number" && r?.id)
+                .map((r) => [String(r.id), Number(r.created)] as [string, number]),
+            );
             const next = chooseModels(
               spec,
               rows.map((r) => String(r?.id ?? r?.name ?? "")),
               toolCapable,
+              created.size ? created : undefined,
             );
             if (next) {
               models.default = next.default;
@@ -425,10 +498,36 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
         const reader = res.body!.getReader();
         const decoder = new TextDecoder();
         let buf = "";
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
+        // A stream that stops sending is dead, not thinking: an API streams
+        // its keepalives and tokens as it goes. Without this, a turn with
+        // its own abort signal (every chat turn) had no deadline at all and
+        // sat on "working" until someone pressed stop.
+        const read = () =>
+          new Promise<{ done: boolean; value?: Uint8Array }>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              void reader.cancel().catch(() => {});
+              reject(new Error(`${spec.name} stopped sending for ${STREAM_IDLE_MS / 1000} seconds, so this reply was cut off. Send it again.`));
+            }, STREAM_IDLE_MS);
+            reader.read().then(
+              (r) => {
+                clearTimeout(timer);
+                resolve(r);
+              },
+              (e) => {
+                clearTimeout(timer);
+                reject(e);
+              },
+            );
+          });
+        for (let ended = false; !ended; ) {
+          const { done, value } = await read();
+          if (done) {
+            // the last event can arrive without its trailing newline
+            buf += decoder.decode() + "\n";
+            ended = true;
+          } else {
+            buf += decoder.decode(value, { stream: true });
+          }
           let nl;
           while ((nl = buf.indexOf("\n")) !== -1) {
             const line = buf.slice(0, nl).trim();
@@ -468,12 +567,23 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
         tools: any[],
         signal: AbortSignal,
       ): Promise<{ message: any; usage: { input: number; output: number } | null }> => {
-        const res = await fetch(`${config.url}/chat/completions`, {
-          method: "POST",
-          headers: headers(),
-          body: JSON.stringify({ model, messages, tools, stream: false }),
-          signal,
-        });
+        // The turn's own signal ends it on stop; the bound ends it when the
+        // provider simply never answers, which the turn signal never does.
+        const bounded = AbortSignal.any([signal, AbortSignal.timeout(ROUND_TIMEOUT_MS)]);
+        let res: Response;
+        try {
+          res = await fetch(`${config.url}/chat/completions`, {
+            method: "POST",
+            headers: headers(),
+            body: JSON.stringify({ model, messages, tools, stream: false }),
+            signal: bounded,
+          });
+        } catch (e) {
+          if ((e as Error).name === "TimeoutError") {
+            throw new Error(`${spec.name} took more than ${ROUND_TIMEOUT_MS / 60_000} minutes to answer, so this reply was stopped. Send it again.`);
+          }
+          throw e;
+        }
         if (!res.ok) {
           const body = await res.text().catch(() => "");
           throw new Error(`${spec.name} HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
@@ -541,6 +651,11 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
           const { message, usage } = await completeRaw(messages, model, tools, signal);
           if (usage) {
             usageTotal = { input: usageTotal.input + usage.input, output: usageTotal.output + usage.output };
+            // Each request has its own prompt, while accounting still
+            // receives the whole turn's sum below.
+            if (Number.isFinite(usage.input) && usage.input > 0) {
+              emit({ ...base(threadId, turnId), type: "context.reading", used: usage.input, window: null });
+            }
           }
           const calls: any[] = Array.isArray(message.tool_calls) ? message.tool_calls : [];
 
@@ -560,11 +675,13 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
           for (const call of calls) {
             const name = call.function?.name ?? "tool";
             let args: any = {};
+            let parsed = true;
             try {
               args = JSON.parse(call.function?.arguments || "{}");
             } catch {
               // a malformed call is the model's mistake to hear about, not
               // a crash for the person watching
+              parsed = false;
             }
 
             emit({
@@ -573,6 +690,8 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
               itemType: "tool",
               itemId: call.id,
               title: name === "ask_user" ? "ask_user" : `${name}: ${String(args.command ?? args.url ?? args.query ?? args.fact ?? "").slice(0, 60)}`,
+              // the same malformed text twice is the same call twice
+              signature: callSignature(name, parsed ? args : String(call.function?.arguments ?? "")),
             });
 
             let result: string;
@@ -583,7 +702,7 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
               result = await requestConnection(threadId, turnId, args);
             } else if (name === "request_secret") {
               result = await requestSecret(threadId, turnId, args);
-            } else if (name === "search_history" || name === "note_about_person") {
+            } else if (name === "search_history" || name === "read_message" || name === "note_about_person") {
               result = await askWorkspace(threadId, turnId, name, args ?? {});
             } else if (name === "sandbox_exec" && sandbox) {
               result = await sandboxExec(sandbox, String(args.command ?? ""));
@@ -649,7 +768,8 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
           }, ASK_TIMEOUT_MS);
           timer.unref?.();
 
-          entry.asks.set(requestId, (answer) => {
+          // the person's answer, unless the turn's end is what settled it
+          entry.asks.set(requestId, (answer, source = "user") => {
             clearTimeout(timer);
             entry.asks.delete(requestId);
             emit({
@@ -657,7 +777,7 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
               type: "request.resolved",
               requestId,
               behavior: "answer",
-              source: "user",
+              source,
             });
             resolve(answer);
           });
@@ -756,7 +876,7 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
         const abort = new AbortController();
-        const asks = new Map<string, (answer: string) => void>();
+        const asks = new Map<string, (answer: string, source?: string) => void>();
         active.set(threadId, { abort, turnId, asks });
 
         const messages = [
@@ -807,13 +927,15 @@ export function openAiCompatDriver(spec: ProviderSpec): ProviderDriver<CompatCon
               emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text });
             }
             if (usage) {
-              emit({ ...base(threadId, turnId), type: "thread.token-usage.updated", ...usage });
+              emit({ ...base(threadId, turnId), type: "thread.token-usage.updated", ...usage,
+                ...(Number.isFinite(usage.input) && usage.input > 0 ? { context: usage.input } : {}),
+              });
             }
             active.delete(threadId);
             emit({ ...base(threadId, turnId), type: "turn.completed", ok: true, stopReason: null, cost: null });
           } catch (e) {
             const entry = active.get(threadId);
-            for (const settle of entry?.asks.values() ?? []) settle("The turn ended before you answered.");
+            for (const settle of entry?.asks.values() ?? []) settle("The turn ended before you answered.", "turn-ended");
             active.delete(threadId);
             const aborted = (e as Error).name === "AbortError";
             if (!aborted) {

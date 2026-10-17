@@ -7,6 +7,7 @@
 // it should be testable without mounting anything. store.tsx owns the
 // transports and wires this up.
 import type { BlokColor, BlokExpression, BlokShape } from "@/lib/mascot";
+import type { LaneContext } from "@/lib/contextCard";
 
 export type { BlokColor, BlokShape } from "@/lib/mascot";
 
@@ -17,6 +18,11 @@ export interface OptionCardData {
   answered?: string;
   /** In a shared room, the collaborator who answered, when it was not you. */
   answeredBy?: string;
+  /** Asked by a turn that was cut off when Bloks stopped; it can no
+   * longer be answered. */
+  cutOff?: boolean;
+  /** Why it closed before anyone answered, in the server's words. */
+  closed?: string;
   dismissed?: boolean;
   /** Set when the agent is genuinely blocked on this card. Its absence
    * means a setup question, which is safe to ignore. */
@@ -39,19 +45,76 @@ export interface TeamPlan {
   members: Array<{ name: string; title: string; description: string; skills: string[] }>;
 }
 
+/** A message between two agents (see server/store.ts, AgentNote). */
+export interface AgentNote {
+  dir: "in" | "out" | "reply";
+  peerId: string;
+  peerName: string;
+  status?: "sent" | "queued" | "failed";
+}
+
+/** One note recall added to the turn a message started (server/store.ts). */
+export interface RecalledNote {
+  kind: "conversation" | "room" | "memory";
+  threadId?: string;
+  messageId?: string;
+  /** A memory file, by name, for a note from one. */
+  memory?: string;
+  /** A conversation's title, a room's name, or a memory file's name. */
+  where: string;
+  at: number;
+  who?: string;
+  text: string;
+}
+
 export interface Message {
+  /** Between two agents rather than with the person. */
+  agent?: AgentNote;
+  /** A record of taking back waiting words, not a send to the peer. */
+  takeBack?: { peerId: string; peerName: string; messages: Array<{ id: string; laneId: string; text: string }> };
+  /** Said in this agent's own chat in a turn another agent's message
+   * started: shown in full, with a link to the exchange. Not sent to it. */
+  afterAgent?: { peerId: string; peerName: string };
   /** The user's selection on a decision component. */
   decisionChoice?: number;
-  /** Sent while the lane was busy; drains into the next turn. */
+  /** Sent while the lane was busy; drains into the next turn. It waits
+   * above the composer, not in the conversation, and joins the end of
+   * it when it goes (a patch marked `moved`). */
   queued?: boolean;
+  /** When it was queued, and when it stopped waiting and went to the
+   * agent. Together they are how long it waited. */
+  queuedAt?: number;
+  /** The server says this message waits for a restart, rather than a turn. */
+  waitsFor?: "restart";
+  deliveredAt?: number;
+  /** Went into the turn already running rather than starting one, so a
+   * finished turn's work folds around it (src/lib/turnFold.ts). */
+  midTurn?: boolean;
+  /** Queued, but still waiting when Bloks restarted and too old to send
+   * on its own (server/index.ts, recoverQueued). */
+  unsent?: boolean;
+  /** A turn cut off too long ago to pick up on its own, which Continue
+   * picks up (server/index.ts, recoverCutOff). */
+  carryOn?: { laneId: string; done?: boolean };
   /** Emoji to whoever pressed it: "user", or an agent's id. */
   reactions?: Record<string, string[]>;
   /** When this message was last edited. Absent means never. */
   editedAt?: number;
+  /** What recall found elsewhere and added to the turn this started. */
+  recalled?: RecalledNote[];
   /** Taken back: the row stays, the words are gone. */
   deleted?: boolean;
-  /** Came in some other way than you typing it here. */
-  via?: "slack" | "discord" | "whatsapp" | "watcher" | "email";
+  /** Came in some other way than you typing it here. "goal" is Bloks
+   * starting the next turn toward the conversation's goal. */
+  via?: "slack" | "discord" | "whatsapp" | "watcher" | "email" | "webhook" | "routine" | "goal";
+  /** The routine's name and start mode when this message was written,
+   * and whether its agent was told it may answer QUIET. */
+  routine?: { name?: string; manual: boolean; quiet?: boolean };
+  /** Part of a quiet check-in: shown folded into one muted line with the
+   * rest of its run, and never news (server/store.ts). */
+  quiet?: boolean;
+  /** A notice about the conversation's goal: set, or where it ended up. */
+  goal?: "set" | "done" | "blocked" | "out" | "paused";
   /** Rewound: taken back with everything after it (see the rewind route). */
   rewound?: number;
   /** secret messages: a value asked for via a secure field */
@@ -81,6 +144,8 @@ export interface Message {
   author?: string;
   /** A room event (someone joined or left), not a warning. */
   event?: boolean;
+  /** Where the engine compacted its session: a line, not a warning. */
+  compaction?: { before: number | null; after: number | null; idle?: boolean };
   kind:
     | "text"
     | "options"
@@ -101,8 +166,14 @@ export interface Message {
       big?: boolean;
       added?: number;
       removed?: number;
+      /** Changed while another agent was working in the folder, and not
+       * one this turn said it edited: shown apart, left out of Undo. */
+      shared?: boolean;
     }>;
     total: number;
+    /** How many of the files are shared, and the agents who were working
+     * there at the same time. */
+    shared?: { total: number; alongside: string[] };
     reverted?: { at: number; restored: number; skipped: number };
     /** A rehearsal: changes made on a copy, waiting for a decision. */
     rehearsal?: { state: "pending" | "applied" | "discarded" };
@@ -114,7 +185,10 @@ export interface Message {
   /** activity messages: tool name + outcome */
   /** `stopped`: the turn ended before this call reported back, so it
    * will never say whether it worked. */
-  tool?: { name: string; ok?: boolean; stopped?: boolean };
+  tool?: { name: string; command?: string; ok?: boolean; stopped?: boolean };
+  /** activity messages: the turn had made this same call (same tool, same
+   * arguments) this many times, 5, 10 or 20, shown as a chip on its run. */
+  repeated?: number;
   /** screen messages: what the agent's desktop looked like, base64 */
   png?: string;
   mime?: string;
@@ -135,12 +209,40 @@ export interface TaskSummary {
   id: string;
   title: string;
   state: "working" | "needs-you" | "idle";
+  /** Something landed here that nobody has opened yet. */
+  unread?: boolean;
+  /** When anything last happened in this lane. */
+  lastAt?: number;
   createdAt: number;
   /** Lifetime tokens spent in this lane. */
   usage?: { input: number; output: number; turns: number };
   /** How full this lane's conversation is, and whether its earlier part
    * has been summarised. See server/context.ts. */
-  context?: { used: number; limit: number; fraction: number; summarised: boolean };
+  context?: LaneContext;
+  /** Where mail from senders the person has not listed is answered. The
+   * person's own words go to the first conversation instead (typedLane). */
+  guestMail?: boolean;
+  /** The room this lane's turn is speaking in, while it runs. */
+  room?: string;
+  /** What this lane keeps working toward, turn after turn (server/goals.ts). */
+  goal?: LaneGoal;
+  /** A lane that never takes a goal: a shared room's, a rehearsal, or
+   * the one that answers mail from people not listed. */
+  noGoals?: boolean;
+}
+
+/** A lane's goal as the server ships it (goalSummary in server/goals.ts). */
+export interface LaneGoal {
+  text: string;
+  check?: string;
+  budget: number;
+  /** Turns Bloks has started toward it, the first included. */
+  turns: number;
+  status: "active" | "paused" | "done" | "blocked" | "out";
+  startedAt: number;
+  lastReason?: string;
+  /** Between two turns, while Bloks checks whether it is done. */
+  judging?: boolean;
 }
 
 export interface Bot {
@@ -165,6 +267,9 @@ export interface Bot {
    * the pixel avatar. Doubles as the cache-buster. */
   avatarAt?: number | null;
   unread: boolean;
+  /** Messages older than the first one here, still on the server. Only
+   * set when the transcript arrived trimmed, through Bloks Cloud. */
+  olderMessages?: number;
   busy?: boolean;
   /** Somebody has taken this agent's computer. Null when nobody has;
    * absent only from a harness too old to say. */
@@ -172,6 +277,10 @@ export interface Bot {
   /** Retired. The row leaves the list and the agent stops working, but
    * everything about it is kept and it can be brought back. */
   archivedAt?: number | null;
+  /** The agent that archived it, when one did rather than you, and the
+   * note it left about the finished work. */
+  archivedBy?: string;
+  archiveNote?: string;
   tasks?: TaskSummary[];
   activeTaskId?: string;
   modelSelection: ModelSelection;
@@ -193,19 +302,31 @@ export interface Bot {
   voice?: { provider: "elevenlabs" | "openai" | "system"; id: string; name?: string } | null;
   /** Read replies aloud as they settle. */
   speakReplies?: boolean;
+  /** False: Claude Code runs this agent's turns without hooks. */
+  engineHooks?: boolean;
+  /** False: no notes from its other conversations before your turns. */
+  recallBeforeTurn?: boolean;
   /** The public half of this agent's key, hex. What its signatures in
    * the record are checked against. */
   fingerprint?: string;
   /** Components this agent may not answer with. */
   withoutComponents?: string[];
+  /** Held in place in the sidebar rather than sorted by activity. */
   pinned?: boolean;
+  /** Its place among the pins of its section, lowest first; null is a
+   * pin with no place yet, after the rest. See src/lib/sections.ts. */
+  pinOrder?: number | null;
+  /** When it last had something to do with the person (server/store.ts
+   * says what counts). The unpinned rows sort by it. */
+  activeWithYouAt?: number;
+  createdAt?: number;
   /** The sidebar heading this agent files under; unset means the plain
    * Agents list. Shares one namespace with rooms. */
   section?: string | null;
   /** How much this agent may do without asking: ask (default), edits
    * (file changes wave through), auto (everything does). Deny rules
    * outrank every mode. */
-  approvals?: "ask" | "edits" | "auto";
+  approvals?: "ask" | "edits" | "auto" | "full";
   hidden?: boolean;
   messages: Message[];
 }
@@ -229,9 +350,20 @@ export interface ConfigStatus {
   /** Shared context for every agent, not a secret, so it round-trips. */
   profile?: { about: string };
   /** How lanes are kept inside the model's window. */
-  compaction?: { micro: boolean };
+  /** `beforeTurn` is the size a native session is compacted at before a
+   * turn, in tokens; 0 is never. */
+  compaction?: { micro: boolean; idle?: boolean; beforeTurn?: number };
   /** Whether finished sessions are read back for something worth keeping. */
   skills?: { propose: boolean };
+  /** Whether agents are reminded of their other conversations before
+   * your turn. On unless turned off. */
+  recall?: { beforeTurn: boolean };
+  /** Agents' turn limit, 1 to 50 (server/agent-chain.ts). */
+  agents?: { turnLimit: number };
+  /** Count-only cards for overlapping turns with no own files. On by default. */
+  changes?: { showShared: boolean };
+  /** How long a silent tool call may hold a turn, in minutes; 0 is never. */
+  turns?: { stallMinutes: number };
   /** Where a new agent starts, applied before its first turn. Absent on
    * a server that does not know about it, and then Settings says nothing. */
   agentDefaults?: AgentDefaults;
@@ -240,9 +372,97 @@ export interface ConfigStatus {
 export interface AgentDefaults {
   cwd?: string;
   /** Ask when unset. An agent hiring another passes on no more than its own. */
-  approvals?: "edits" | "auto";
+  approvals?: "edits" | "auto" | "full";
   modelSelection?: ModelSelection;
   effort?: "low" | "medium" | "high";
+}
+
+type Lane = { id: string; unread?: boolean; lastAt?: number; createdAt: number; state?: string };
+type LanedBot = { activeTaskId?: string; threadId: string; unread?: boolean; tasks?: Lane[] };
+
+/** The conversation that pinged you: one stopped on you first, then the
+ * most recent unread lane, when it is not the one already open. Opening an
+ * agent goes there, because the dot on the agent was about it. */
+export function pingedLane(bot: LanedBot): string | null {
+  const open = bot.activeTaskId ?? bot.threadId;
+  // A lane stopped on a question or an approval comes first, read or not:
+  // going only to unread lanes meant an approval in a lane already looked
+  // at could not be found from the agent at all.
+  const stopped = (bot.tasks ?? []).find((t) => t.state === "needs-you" && t.id !== open);
+  if (stopped) return stopped.id;
+  const waiting = (bot.tasks ?? [])
+    .filter((t) => t.unread && t.id !== open)
+    .sort((a, b) => (b.lastAt ?? b.createdAt) - (a.lastAt ?? a.createdAt));
+  return waiting[0]?.id ?? null;
+}
+
+/** The same agent with its open lane read. Its own flag follows as "any
+ * lane still unread", which is what the server says too. */
+export function readOpenLane<T extends LanedBot>(bot: T): T {
+  const open = bot.activeTaskId ?? bot.threadId;
+  if (!bot.tasks) return { ...bot, unread: false };
+  const tasks = bot.tasks.map((t) => (t.id === open ? { ...t, unread: false } : t));
+  return { ...bot, tasks, unread: tasks.some((t) => t.unread) };
+}
+
+/** Whether the lane on screen is the unread one. An agent flagged unread
+ * with no lane to show for it (a turn in a room marks the agent, not a
+ * lane) counts as the open one, or that flag could never be cleared. */
+export function openLaneUnread(bot: LanedBot): boolean {
+  const open = bot.activeTaskId ?? bot.threadId;
+  const lane = bot.tasks?.find((t) => t.id === open);
+  if (bot.unread && !bot.tasks?.some((t) => t.unread)) return true;
+  return lane ? Boolean(lane.unread) : Boolean(bot.unread);
+}
+
+/** Whether the conversation on screen is the one working. An agent's
+ * conversations run on their own, so "busy" anywhere is not "busy here":
+ * reading it agent-wide put "working..." and typing dots on an idle
+ * conversation while another one ran. A harness too old to report lanes
+ * falls back to the agent's flag. */
+export function openLaneWorking(bot: LanedBot & { busy?: boolean }): boolean {
+  const open = bot.activeTaskId ?? bot.threadId;
+  const lane = bot.tasks?.find((t) => t.id === open);
+  return lane?.state ? lane.state === "working" : Boolean(bot.busy);
+}
+
+/** Whether this agent is taking a turn in this room right now. Its own
+ * busy flag is up while any of its lanes works, so a room reading it said
+ * a member was thinking there while it worked on something else. Each
+ * lane says which room its running turn speaks in; a harness too old to
+ * report lanes falls back to the agent's flag. */
+export function workingInRoom(bot: { busy?: boolean; tasks?: Array<{ room?: string }> }, roomId: string): boolean {
+  return bot.tasks ? bot.tasks.some((t) => t.room === roomId) : Boolean(bot.busy);
+}
+
+/** The conversation words typed to this agent are sent to: the one on
+ * screen, named, because left unnamed the server puts them in whichever
+ * lane it last heard was open, and another device may have opened a
+ * different one a moment ago. Undefined in the lane strangers' mail is
+ * answered in, which the server keeps the person's own words out of on
+ * purpose (activeLaneOf): those go to the first conversation, and the
+ * screen follows them there (store.tsx, "send"). */
+export function typedLane(bot: { activeTaskId?: string; threadId: string; tasks?: Array<{ id: string; guestMail?: boolean }> }): string | undefined {
+  const open = bot.activeTaskId ?? bot.threadId;
+  return bot.tasks?.some((t) => t.id === open && t.guestMail) ? undefined : open;
+}
+
+/** Whether closing this lane would delete anything. The server dates a
+ * lane by its last message, or by its making when it has none, so a later
+ * time means something was said. A lane that cannot say (a harness too
+ * old to send the time) counts as having messages: asking once too often
+ * costs a tap, and not asking costs a conversation. */
+export function laneHasMessages(lane: { lastAt?: number; createdAt: number; usage?: { turns: number } } | undefined): boolean {
+  if (!lane || lane.lastAt === undefined) return true;
+  return lane.lastAt > lane.createdAt || (lane.usage?.turns ?? 0) > 0;
+}
+
+/** A `config` frame is the whole status plus the stream's own fields.
+ * Picking fields out of it by name drops whatever was added later, and
+ * the card reading a dropped field vanishes until the next reload. */
+export function configFromFrame(frame: Record<string, unknown>): ConfigStatus {
+  const { kind: _kind, _seq, ...status } = frame;
+  return status as unknown as ConfigStatus;
 }
 
 /** One engine, as the model picker sees it. */
@@ -256,7 +476,14 @@ export interface InstanceInfo {
     authenticated?: boolean;
     version?: string | null;
   };
-  models: { default: string; options: Array<{ id: string; label: string }> };
+  models: {
+    default: string;
+    options: Array<{ id: string; label: string }>;
+    /** Where the list came from, when it is not the engine reporting it live. */
+    note?: string;
+    /** The engine takes any model id, so one typed in can be used. */
+    acceptsAnyId?: boolean;
+  };
 }
 
 /** The role a new agent is created with, sent with POST /api/bots so the
@@ -286,12 +513,21 @@ export interface Blok {
   /** The sidebar heading this room files under; unset means the plain
    * Rooms list. Shares one namespace with agents. */
   section?: string | null;
+  /** Held in place in the sidebar; rooms start that way. */
+  pinned?: boolean;
+  /** Its place among the pins of its section, as an agent's is. */
+  pinOrder?: number | null;
+  /** When it last had something to do with the person. */
+  activeWithYouAt?: number;
   createdAt: number;
   /** Present while the room is shared with other people. */
   sharing?: RoomSharing;
   /** Archived rooms are kept on the server and never listed here. */
   archived?: boolean;
   messages: Message[];
+  /** Messages older than the first one here, still on the server. Only
+   * set when the transcript arrived trimmed, through Bloks Cloud. */
+  olderMessages?: number;
 }
 
 /** How a shared room behaves, owner's choice. See server/bloks.ts. */
@@ -343,10 +579,16 @@ export interface Skill {
   source: "builtin" | "user";
 }
 
+/** The tabs of the Automations page (src/components/AutomationsPanel.tsx). */
+export type AutomationsTab = "schedules" | "watchers" | "workflows" | "webhooks" | "jobs";
+
 export interface AppState {
   bots: Bot[];
   bloks: Blok[];
   instances: InstanceInfo[];
+  /** Engines with a newer release than the one installed, by driver kind.
+   * Why a new model can be missing from the list. */
+  engineUpdates: Record<string, { installed: string; latest: string }>;
   providers: ProviderRow[];
   config: ConfigStatus | null;
   selectedId: string;
@@ -354,6 +596,8 @@ export interface AppState {
   pluginsOpen: boolean;
   computerOpen: boolean;
   appSettingsOpen: boolean;
+  /** Which Settings page is showing, so a link can open the right one. */
+  settingsPage: string;
   newAgentOpen: boolean;
   /** the new-agent screen is the last step of setup, not a normal visit */
   newAgentFirstRun: boolean;
@@ -367,6 +611,8 @@ export interface AppState {
   briefOpen: boolean;
   /** The agent taking meeting notes, while its panel is open. */
   meetingFor: string | null;
+  /** The conversation whose "Set a goal" dialog is open (GoalDialog). */
+  goalFor: { botId: string; taskId: string } | null;
   rehearsalsTick: number;
   /** Bumped when the server says a kind of thing changed (notes about
    * you, briefs, watchers, meetings), so whatever shows it re-reads. */
@@ -374,16 +620,31 @@ export interface AppState {
   /** A gallery team a bloks:// link asked to open, until the dialog takes it. */
   teamLink: string | null;
   routinesOpen: boolean;
+  /** The tab Automations opens on, when something linked to one. */
+  routinesTab: AutomationsTab | null;
   newRoomOpen: boolean;
   projectsOpen: boolean;
   /** The one place that says what is running and what wants you. */
   activityOpen: boolean;
+  /** The sheet of every keyboard shortcut (⌘/). */
+  shortcutsOpen: boolean;
   /** The project the app is looking through, or null for everything.
    * A lens: nothing is hidden from anywhere else, and leaving puts the
    * whole workspace back. */
   projectId: string | null;
+  /** The order the sidebar's section headings were dragged into, kept
+   * with the workspace so every device has the same one. */
+  sectionOrder: string[];
   /** in-flight assistant text per threadId (content.delta fold) */
   streaming: Record<string, string>;
+  /** Threads whose turn has ended and no new one begun. A delta for one
+   * of them is late (pushes through the relay can arrive out of order)
+   * and would reopen a finished reply beside its own message. */
+  settledTurns: Record<string, true>;
+  /** Agents whose open conversation changed with no transcript to show
+   * for it, as when a lane is opened on another device: the lane, by
+   * agent, whose messages the store is asking for. */
+  laneLoads: Record<string, string>;
   /** the most recent picture of each agent's screen */
   screens: Record<string, { png: string; mime: string; source?: "browser" }>;
   /** People in each shared room, by room id. */
@@ -394,12 +655,24 @@ export interface AppState {
   roomTyping: Record<string, { name: string; at: number }>;
   /** agents whose box is still being stood up, so the panel can say so */
   provisioning: Record<string, boolean>;
+  /** The agent list has arrived at least once. Until then an empty list
+   * means "not loaded yet", not "you have no agents". */
+  hydrated: boolean;
   connected: boolean;
   error: string | null;
+  /** Counts the errors shown. The timer that clears one names it, so an
+   * older error's timer cannot take a newer one off the screen early. */
+  errorAt: number;
 }
 
 export type Action =
   | { type: "hydrate"; bots: Bot[] }
+  /** A page of earlier messages for a transcript that arrived trimmed.
+   * `threadId` guards against a lane that changed while it was loading. */
+  | { type: "earlierLoaded"; id: string; threadId: string; messages: Message[]; olderMessages: number }
+  /** The transcript asked for after an agent's open conversation changed
+   * (see laneLoads). Taken only while that lane is still the one open. */
+  | { type: "laneLoaded"; id: string; threadId: string; messages: Message[]; olderMessages: number }
   | { type: "hydrateBloks"; bloks: Blok[] }
   | { type: "blokPatched"; blok: Omit<Blok, "messages"> }
   | { type: "roomPeople"; roomId: string; people: RoomPerson[] }
@@ -409,48 +682,84 @@ export type Action =
   | { type: "createRoom"; name: string; memberIds: string[] }
   | { type: "deleteRoom"; blokId: string }
   | { type: "patchRoom"; blokId: string; patch: { archived?: boolean; name?: string; section?: string | null } }
-  | { type: "sendToRoom"; blokId: string; text: string; replyTo?: Message["replyTo"] }
+  /** Where an agent or a room sits in the sidebar: its section, whether
+   * it is pinned, and its place among the pins (1 the top) when one was
+   * chosen. The store works out what that does to the neighbours. */
+  | { type: "placeRow"; kind: "agent" | "room"; id: string; section: string | null; pinned: boolean; position?: number }
+  /** What a placement changed, row by row, shown before the server says. */
+  | {
+      type: "placed";
+      rows: Array<{
+        kind: "agent" | "room";
+        id: string;
+        patch: { section?: string | null; pinned?: boolean; pinOrder?: number | null };
+      }>;
+    }
+  /** The section order the workspace keeps, as the server has it. */
+  | { type: "sectionOrder"; order: string[] }
+  /** The person dragged a heading: the new order, to show and to keep. */
+  | { type: "moveSections"; order: string[] }
+  /** `onFailed`: the send did not go, so the box can have it back. */
+  | { type: "sendToRoom"; blokId: string; text: string; replyTo?: Message["replyTo"]; onFailed?: () => void }
   | { type: "toggleNewRoom"; open?: boolean }
   | { type: "openTeamLink"; slug: string | null }
   | { type: "instances"; instances: InstanceInfo[] }
+  | { type: "engineUpdates"; updates: Record<string, { installed: string; latest: string }> }
   | { type: "providers"; providers: ProviderRow[] }
   | { type: "connectProvider"; kind: string; key?: string; url?: string }
   | { type: "disconnectProvider"; kind: string }
   | { type: "configStatus"; config: ConfigStatus }
-  | { type: "select"; id: string }
-  | { type: "send"; botId: string; text: string; replyTo?: Message["replyTo"] }
+  /** `lane` opens that conversation; without it, the one that pinged. */
+  | { type: "select"; id: string; lane?: string }
+  | { type: "send"; botId: string; text: string; replyTo?: Message["replyTo"]; stopFirst?: boolean; onFailed?: () => void }
   | { type: "answerCard"; botId: string; messageId: string; answer: string; roomId?: string }
   | { type: "dismissCard"; botId: string; messageId: string; roomId?: string }
+  /** An answer that did not go: the card can be answered again. */
+  | { type: "cardReopened"; botId: string; messageId: string; roomId?: string }
   | { type: "hireTeam"; botId: string; messageId: string }
   | { type: "newBot"; profile?: NewAgentProfile }
   | { type: "toggleNewAgent"; open?: boolean; firstRun?: boolean }
   | { type: "toggleSkills"; open?: boolean }
-  | { type: "toggleRoutines"; open?: boolean }
+  /** `tab` opens Automations on that tab, for a link from elsewhere. */
+  | { type: "toggleRoutines"; open?: boolean; tab?: AutomationsTab }
   | { type: "toggleActivity"; open?: boolean }
+  | { type: "toggleShortcuts"; open?: boolean }
   | { type: "newTask"; botId: string }
   | { type: "selectTask"; botId: string; taskId: string }
   | { type: "closeTask"; botId: string; taskId: string }
+  | { type: "clearTask"; botId: string; taskId: string }
   | { type: "renameTask"; botId: string; taskId: string; title: string }
   | { type: "botAdded"; bot: Bot }
   | { type: "deleteBot"; botId: string; forget?: boolean }
   | { type: "restoreBot"; botId: string }
   | { type: "duplicateBot"; botId: string }
-  | { type: "markUnread"; botId: string }
+  | { type: "markLaneUnread"; botId: string; taskId: string }
   | { type: "botPatched"; bot: Partial<Bot> & { id: string } }
   | { type: "messageAdded"; threadId: string; message: Message }
-  | { type: "messagePatched"; threadId: string; message: Message }
+  /** `moved`: a queued message that went, so it leaves its place and
+   * joins the end of the conversation, as it did on disk. */
+  | { type: "messagePatched"; threadId: string; message: Message; moved?: boolean }
   | { type: "streamDelta"; threadId: string; delta: string }
-  | { type: "streamClear"; threadId: string }
+  | { type: "streamClear"; threadId: string; onlyIfSettled?: boolean }
+  | { type: "turnStarted"; threadId: string }
+  | { type: "turnSettled"; threadId: string }
+  /** The event stream came back without the frames it missed (hello
+   * with resumed: false), so what it was in the middle of is stale. */
+  | { type: "streamRestarted" }
   | { type: "screenFrame"; botId: string; png: string; mime: string; source?: "browser" }
-  | { type: "provisioning"; botId: string; on: boolean }
+  /** A `computer` frame: an agent's cloud computer is provisioning,
+   * waking, ready, failed or asleep. */
+  | { type: "computerState"; botId: string; state: string }
   | { type: "setModel"; botId: string; selection: ModelSelection }
   | { type: "interrupt"; botId: string }
   | { type: "connected"; value: boolean }
-  | { type: "error"; message: string | null }
+  /** `at` on a clear: only the error shown as that one (see errorAt). */
+  | { type: "error"; message: string | null; at?: number }
   | { type: "toggleSettings"; open?: boolean }
   | { type: "togglePlugins"; open?: boolean }
   | { type: "toggleComputer"; open?: boolean }
-  | { type: "toggleAppSettings"; open?: boolean }
+  /** `page` opens Settings on that page (see SETTINGS_PAGES). */
+  | { type: "toggleAppSettings"; open?: boolean; page?: string }
   | { type: "toggleProjects"; open?: boolean }
   | { type: "toggleMemory"; open?: boolean; botId?: string | null }
   | { type: "toggleRehearsals"; open?: boolean }
@@ -458,6 +767,8 @@ export type Action =
   | { type: "tick"; key: string }
   | { type: "toggleBrief"; open?: boolean }
   | { type: "openMeeting"; botId: string | null }
+  | { type: "openGoal"; botId: string; taskId: string }
+  | { type: "closeGoal" }
   | { type: "openProject"; id: string | null }
   | {
       type: "updateBot";
@@ -490,6 +801,31 @@ export type Action =
 
 function updateBot(state: AppState, botId: string, fn: (b: Bot) => Bot): AppState {
   return { ...state, bots: state.bots.map((b) => (b.id === botId ? fn(b) : b)) };
+}
+
+/** An agent record from the server, minus the fields the person is still
+ * typing into. The echo of a save reports what was sent, which is older
+ * than what has been typed since, and adopting it would take those
+ * keystrokes back. */
+export function withoutEdits<T extends object>(bot: T, editing: ReadonlySet<string>): T {
+  if (!editing.size) return bot;
+  return Object.fromEntries(Object.entries(bot).filter(([key]) => !editing.has(key))) as T;
+}
+
+/** Drop this save's unanswered marks when it is still the latest for that
+ * field, and return the fields whose response is stale (a newer save is
+ * still in flight). The caller withholds those from the merge so an
+ * older HTTP response cannot overwrite newer text. */
+export function settleUnanswered(
+  unanswered: Map<string, number>,
+  saveGens: ReadonlyMap<string, number>,
+): Set<string> {
+  const stale = new Set<string>();
+  for (const [key, gen] of saveGens) {
+    if (unanswered.get(key) === gen) unanswered.delete(key);
+    else stale.add(key);
+  }
+  return stale;
 }
 
 /** The card a card action is about, in an agent's chat or in a room. */
@@ -537,7 +873,18 @@ export function reducer(state: AppState, action: Action): AppState {
         : wanted && !action.bots.some((b) => b.id === wanted)
           ? wanted
           : (action.bots.find((b) => !b.hidden)?.id ?? "");
-      return { ...state, bots: action.bots, selectedId };
+      return { ...state, bots: action.bots, selectedId, hydrated: true, laneLoads: {} };
+    }
+    case "earlierLoaded": {
+      const prepend = <T extends { messages: Message[]; olderMessages?: number }>(t: T): T => {
+        const have = new Set(t.messages.map((m) => m.id));
+        const fresh = action.messages.filter((m) => !have.has(m.id));
+        return { ...t, messages: [...fresh, ...t.messages], olderMessages: action.olderMessages };
+      };
+      if (state.bloks.some((b) => b.id === action.id)) {
+        return { ...state, bloks: state.bloks.map((b) => (b.id === action.id ? prepend(b) : b)) };
+      }
+      return updateBot(state, action.id, (b) => (b.threadId === action.threadId ? prepend(b) : b));
     }
     case "hydrateBloks": {
       // the server keeps archived rooms; the list only hides them, and a
@@ -593,6 +940,10 @@ export function reducer(state: AppState, action: Action): AppState {
       return { ...state, rehearsalsTick: state.rehearsalsTick + 1 };
     case "openMeeting":
       return { ...state, meetingFor: action.botId };
+    case "openGoal":
+      return { ...state, goalFor: { botId: action.botId, taskId: action.taskId } };
+    case "closeGoal":
+      return { ...state, goalFor: null };
     case "toggleBrief":
       return { ...state, briefOpen: action.open ?? !state.briefOpen };
     case "tick":
@@ -614,6 +965,8 @@ export function reducer(state: AppState, action: Action): AppState {
       }
       return { ...state, projectId: action.id };
     }
+    case "engineUpdates":
+      return { ...state, engineUpdates: action.updates };
     case "instances":
       return { ...state, instances: action.instances };
     case "providers":
@@ -622,20 +975,33 @@ export function reducer(state: AppState, action: Action): AppState {
       return { ...state, config: action.config };
     case "select":
       writeSelected(action.id);
-      return updateBot({ ...state, selectedId: action.id }, action.id, (b) => ({ ...b, unread: false }));
+      // choosing a conversation in the sidebar means looking at it, so a
+      // full page covering the chat steps aside
+      return updateBot({ ...state, selectedId: action.id, routinesOpen: false, appSettingsOpen: false }, action.id, (b) =>
+        action.lane && b.tasks
+          ? (() => {
+              const tasks = b.tasks.map((t) => (t.id === action.lane ? { ...t, unread: false } : t));
+              return { ...b, tasks, unread: tasks.some((t) => t.unread) };
+            })()
+          : readOpenLane(b),
+      );
     // settle the card locally now; the server's own patch arrives a
     // moment later saying the same thing
     case "answerCard":
       return patchCard(state, action.botId, action.messageId, { answered: action.answer }, action.roomId);
     case "dismissCard":
       return patchCard(state, action.botId, action.messageId, { dismissed: true }, action.roomId);
+    case "cardReopened":
+      return patchCard(state, action.botId, action.messageId, { answered: undefined }, action.roomId);
     case "hireTeam":
       return patchCard(state, action.botId, action.messageId, { answered: "Hire the team" });
     case "botAdded":
       writeSelected(action.bot.id);
       return {
         ...state,
-        bots: [action.bot, ...state.bots],
+        // the server announces a new agent to every window, and that can
+        // arrive before the reply to the request that made it
+        bots: [action.bot, ...state.bots.filter((b) => b.id !== action.bot.id)],
         selectedId: action.bot.id,
         newAgentOpen: false,
         newAgentFirstRun: false,
@@ -651,12 +1017,23 @@ export function reducer(state: AppState, action: Action): AppState {
     case "toggleSkills":
       return { ...state, skillsOpen: action.open ?? !state.skillsOpen };
     case "toggleRoutines":
-      return { ...state, routinesOpen: action.open ?? !state.routinesOpen };
+      {
+        const open = action.open ?? !state.routinesOpen;
+        return {
+          ...state,
+          routinesOpen: open,
+          routinesTab: open ? (action.tab ?? null) : null,
+          appSettingsOpen: open ? false : state.appSettingsOpen,
+        };
+      }
     case "toggleActivity":
       return { ...state, activityOpen: action.open ?? !state.activityOpen };
+    case "toggleShortcuts":
+      return { ...state, shortcutsOpen: action.open ?? !state.shortcutsOpen };
     case "newTask":
     case "selectTask":
     case "closeTask":
+    case "clearTask":
       return state;
     case "renameTask":
       // shown at once; the server's answer (one line, 40 characters)
@@ -695,8 +1072,12 @@ export function reducer(state: AppState, action: Action): AppState {
       // for the round trip leaves the row in the drawer for a beat after
       // the press, which reads as the button not working.
       return updateBot(state, action.botId, (b) => ({ ...b, hidden: false, archivedAt: null }));
-    case "markUnread":
-      return updateBot(state, action.botId, (b) => ({ ...b, unread: true }));
+    case "markLaneUnread":
+      return updateBot(state, action.botId, (b) => ({
+        ...b,
+        unread: true,
+        tasks: b.tasks?.map((t) => (t.id === action.taskId ? { ...t, unread: true } : t)),
+      }));
     case "botPatched": {
       // A whole record for an agent we have never seen is a new agent, not
       // a patch: an agent a lead just hired shows up this way.
@@ -706,11 +1087,49 @@ export function reducer(state: AppState, action: Action): AppState {
         if (!arrival.threadId) return state;
         return { ...state, bots: [{ messages: [], ...arrival } as Bot, ...state.bots] };
       }
-      return updateBot(state, action.bot.id, (b) => ({
+      const incoming = action.bot as Partial<Bot>;
+      const shown = state.bots.find((b) => b.id === action.bot.id)!;
+      // Another conversation is open now, and what says so brings no
+      // transcript: a bot frame never does. Keeping the messages put the
+      // last lane's words under the new lane's name, so they go, and the
+      // store asks for the new lane's own.
+      if (incoming.threadId && incoming.threadId !== shown.threadId && !incoming.messages) {
+        return {
+          ...updateBot(state, action.bot.id, (b) => ({ ...b, ...action.bot, messages: [], olderMessages: undefined })),
+          laneLoads: { ...state.laneLoads, [action.bot.id]: incoming.threadId },
+        };
+      }
+      const next = updateBot(state, action.bot.id, (b) => ({
         ...b,
         ...action.bot,
-        messages: (action.bot as Partial<Bot>).messages ?? b.messages,
+        messages: incoming.messages ?? b.messages,
       }));
+      // a transcript for the open lane is what was being asked for
+      if (!incoming.messages || !(action.bot.id in state.laneLoads)) return next;
+      const { [action.bot.id]: _, ...laneLoads } = state.laneLoads;
+      return { ...next, laneLoads };
+    }
+    case "laneLoaded": {
+      if (state.laneLoads[action.id] !== action.threadId) return state;
+      const { [action.id]: _, ...laneLoads } = state.laneLoads;
+      return {
+        ...updateBot(state, action.id, (b) => {
+          // What the stream brought while this loaded is as new as the
+          // page or newer, so it wins where both have a message, and the
+          // rest of it follows the page.
+          const streamed = new Map(b.messages.map((m) => [m.id, m]));
+          const paged = new Set(action.messages.map((m) => m.id));
+          return {
+            ...b,
+            messages: [
+              ...action.messages.map((m) => streamed.get(m.id) ?? m),
+              ...b.messages.filter((m) => !paged.has(m.id)),
+            ],
+            olderMessages: action.olderMessages,
+          };
+        }),
+        laneLoads,
+      };
     }
     case "messageAdded": {
       const room = state.bloks.find((b) => b.id === action.threadId);
@@ -724,41 +1143,42 @@ export function reducer(state: AppState, action: Action): AppState {
           ),
         };
       }
+      // the reply has landed as a real message, so the streaming preview
+      // for that thread has done its job. That holds for a lane in the
+      // background too, whose messages are not kept here: its preview
+      // kept growing, and opening the lane while it worked said again
+      // what it had already said.
+      let landed = state;
+      if (action.message.role === "bot" && action.message.kind === "text" && action.threadId in state.streaming) {
+        const { [action.threadId]: _, ...rest } = state.streaming;
+        landed = { ...state, streaming: rest };
+      }
       const bot = state.bots.find((b) => b.threadId === action.threadId);
-      if (!bot) return state;
-      const next = updateBot(state, bot.id, (b) =>
+      if (!bot) return landed;
+      return updateBot(landed, bot.id, (b) =>
         b.messages.some((m) => m.id === action.message.id)
           ? b
           : { ...b, messages: [...b.messages, action.message] },
       );
-      // the reply has landed as a real message, so the streaming preview
-    // for that thread has done its job
-      if (action.message.role === "bot" && action.message.kind === "text") {
-        const { [action.threadId]: _, ...rest } = next.streaming;
-        return { ...next, streaming: rest };
-      }
-      return next;
     }
     case "messagePatched": {
+      const patched = (messages: Message[]) =>
+        action.moved
+          ? [...messages.filter((m) => m.id !== action.message.id), action.message]
+          : messages.map((m) => (m.id === action.message.id ? action.message : m));
       const room = state.bloks.find((b) => b.id === action.threadId);
       if (room) {
         return {
           ...state,
-          bloks: state.bloks.map((b) =>
-            b.id === room.id
-              ? { ...b, messages: b.messages.map((m) => (m.id === action.message.id ? action.message : m)) }
-              : b,
-          ),
+          bloks: state.bloks.map((b) => (b.id === room.id ? { ...b, messages: patched(b.messages) } : b)),
         };
       }
       const bot = state.bots.find((b) => b.threadId === action.threadId);
       if (!bot) return state;
-      return updateBot(state, bot.id, (b) => ({
-        ...b,
-        messages: b.messages.map((m) => (m.id === action.message.id ? action.message : m)),
-      }));
+      return updateBot(state, bot.id, (b) => ({ ...b, messages: patched(b.messages) }));
     }
     case "streamDelta":
+      if (state.settledTurns[action.threadId]) return state;
       return {
         ...state,
         streaming: {
@@ -767,9 +1187,26 @@ export function reducer(state: AppState, action: Action): AppState {
         },
       };
     case "streamClear": {
+      if (action.onlyIfSettled && !state.settledTurns[action.threadId]) return state;
+      if (!(action.threadId in state.streaming)) return state;
       const { [action.threadId]: _, ...rest } = state.streaming;
       return { ...state, streaming: rest };
     }
+    case "turnStarted": {
+      if (!state.settledTurns[action.threadId]) return state;
+      const { [action.threadId]: _, ...rest } = state.settledTurns;
+      return { ...state, settledTurns: rest };
+    }
+    case "turnSettled":
+      return { ...state, settledTurns: { ...state.settledTurns, [action.threadId]: true } };
+    case "streamRestarted":
+      // Whatever was streaming when the line dropped finished or moved on
+      // unseen, and the messages that say so are coming in the reload. A
+      // partial kept from before showed under the finished reply, and the
+      // next turn's words were added to the end of it. A computer being
+      // set up may have finished unseen too. Cleared here rather than in
+      // hydrate, which also follows an archive, mid-turn for everyone else.
+      return { ...state, streaming: {}, settledTurns: {}, provisioning: {} };
     case "screenFrame":
       return {
         ...state,
@@ -779,14 +1216,24 @@ export function reducer(state: AppState, action: Action): AppState {
         },
         provisioning: { ...state.provisioning, [action.botId]: false },
       };
-    case "provisioning":
-      return { ...state, provisioning: { ...state.provisioning, [action.botId]: action.on } };
+    case "computerState":
+      // Only setting one up shows in the chat. Every other word ends that,
+      // and the server always sends one after it, ready or failed, so a
+      // box that never came up cannot leave the line spinning.
+      return { ...state, provisioning: { ...state.provisioning, [action.botId]: action.state === "provisioning" } };
     case "setModel":
       return updateBot(state, action.botId, (b) => ({ ...b, modelSelection: action.selection }));
     case "connected":
       return { ...state, connected: action.value };
     case "error":
-      return { ...state, error: action.message };
+      // A clear meant for an error that has since been replaced leaves the
+      // newer one up: it is owed its own six seconds.
+      if (action.message === null && action.at !== undefined && action.at !== state.errorAt) return state;
+      return {
+        ...state,
+        error: action.message,
+        errorAt: action.message === null ? state.errorAt : state.errorAt + 1,
+      };
     // the right-hand slot holds one thing at a time, so opening any of
     // these closes the rest
     case "toggleSettings": {
@@ -814,6 +1261,9 @@ export function reducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         appSettingsOpen: open,
+        settingsPage: action.page ?? (open && !state.appSettingsOpen ? "general" : state.settingsPage),
+        // a full page, like Automations: one of them at a time
+        routinesOpen: open ? false : state.routinesOpen,
         settingsOpen: open ? false : state.settingsOpen,
         computerOpen: open ? false : state.computerOpen,
         pluginsOpen: open ? false : state.pluginsOpen,
@@ -821,6 +1271,23 @@ export function reducer(state: AppState, action: Action): AppState {
     }
     case "updateBot":
       return updateBot(state, action.botId, (b) => ({ ...b, ...action.patch }));
+    case "placeRow":
+      // worked out in the store, which knows every row, and applied as "placed"
+      return state;
+    case "placed": {
+      const patches = (kind: "agent" | "room") =>
+        new Map(action.rows.filter((row) => row.kind === kind).map((row) => [row.id, row.patch]));
+      const agents = patches("agent");
+      const rooms = patches("room");
+      return {
+        ...state,
+        bots: state.bots.map((b) => (agents.has(b.id) ? { ...b, ...agents.get(b.id) } : b)),
+        bloks: state.bloks.map((b) => (rooms.has(b.id) ? { ...b, ...rooms.get(b.id) } : b)),
+      };
+    }
+    case "sectionOrder":
+    case "moveSections":
+      return { ...state, sectionOrder: action.order };
     case "patchRoom": {
       // archived rooms leave the list the moment the choice is made; the
       // server confirms on its own broadcast
@@ -868,6 +1335,7 @@ export const initialState: AppState = {
   bots: [],
   bloks: [],
   instances: [],
+  engineUpdates: {},
   providers: [],
   config: null,
   selectedId: readSelected(),
@@ -875,6 +1343,7 @@ export const initialState: AppState = {
   pluginsOpen: false,
   computerOpen: false,
   appSettingsOpen: false,
+  settingsPage: "general",
   newAgentOpen: false,
   newAgentFirstRun: false,
   skillsOpen: false,
@@ -883,13 +1352,16 @@ export const initialState: AppState = {
   rehearsalsOpen: false,
   briefOpen: false,
   meetingFor: null,
+  goalFor: null,
   rehearsalsTick: 0,
   ticks: {},
   teamLink: null,
   routinesOpen: false,
+  routinesTab: null,
   newRoomOpen: false,
   projectsOpen: false,
   activityOpen: false,
+  shortcutsOpen: false,
   projectId: (() => {
     try {
       return localStorage.getItem("bloks-project");
@@ -897,12 +1369,17 @@ export const initialState: AppState = {
       return null;
     }
   })(),
+  sectionOrder: [],
   streaming: {},
+  settledTurns: {},
+  laneLoads: {},
   screens: {},
   roomPeople: {},
   joinRequests: {},
   roomTyping: {},
   provisioning: {},
+  hydrated: false,
   connected: false,
   error: null,
+  errorAt: 0,
 };

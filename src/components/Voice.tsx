@@ -144,7 +144,7 @@ export function VoiceCard({ bot }: { bot: Bot }) {
           <div className="text-[13.5px] font-semibold text-foreground">Voice</div>
           <div className="mt-0.5 text-[12.5px] text-muted-foreground">
             {!configured
-              ? "Add an ElevenLabs or OpenAI key in Settings → Voices first."
+              ? "Add an ElevenLabs or OpenAI key in Settings, Voices first."
               : bot.voice
                 ? `Speaks as ${bot.voice.name ?? bot.voice.id} · calls enabled`
                 : "Pick a voice to enable calls with this agent."}
@@ -174,7 +174,7 @@ export function VoiceCard({ bot }: { bot: Bot }) {
                       body: JSON.stringify({ speakReplies: e.target.checked }),
                     }).catch(() => {})
                   }
-                  className="accent-[--brand]"
+                  className="accent-(--brand)"
                 />
                 Read replies aloud
               </label>
@@ -186,7 +186,7 @@ export function VoiceCard({ bot }: { bot: Bot }) {
             )}
             {voices?.length === 0 && (
               <div className="py-3 text-[12.5px] text-muted-foreground">
-                No voices available. Check your keys in Settings → Voices.
+                No voices available. Check your keys in Settings, Voices.
               </div>
             )}
             {(voices ?? []).map((voice) => {
@@ -673,7 +673,7 @@ export function GroupCallOverlay({
               <div
                 key={member.id}
                 className={cn(
-                  "flex flex-col items-center gap-1.5 transition-all duration-300",
+                  "flex flex-col items-center gap-1.5 transition-[scale,opacity] duration-300 ease-out",
                   focused ? "scale-110" : "opacity-70",
                 )}
               >

@@ -28,6 +28,8 @@ import { Button } from "@/components/ui/button";
 import { BrowseFolderButton } from "@/components/ui/browse-folder";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/cn";
+import { useEscape } from "@/lib/useEscape";
+import { plural } from "@/lib/plural";
 
 const MAX_MEMBERS = 8;
 
@@ -52,6 +54,7 @@ export function NewRoomDialog() {
 
   const agents = state.bots.filter((b) => !b.hidden);
   const close = () => dispatch({ type: "toggleNewRoom", open: false });
+  useEscape(close);
 
   // rooms someone banked earlier, shown above the premade shelf
   useEffect(() => {
@@ -169,7 +172,7 @@ export function NewRoomDialog() {
       onClick={close}
     >
       <div
-        className="flex max-h-[80%] w-[520px] max-w-[92vw] animate-pop-in flex-col rounded-2xl border bg-popover p-4 shadow-2xl shadow-[--shadow-color] sm:p-5"
+        className="flex max-h-[80%] w-[520px] max-w-[92vw] animate-pop-in flex-col rounded-2xl border bg-popover p-4 shadow-2xl shadow-(color:--shadow-color) sm:p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between">
@@ -235,7 +238,7 @@ export function NewRoomDialog() {
                       <div key={team.id} className="flex flex-col rounded-xl border bg-card p-3">
                         <div className="text-[13.5px] font-semibold text-foreground">{team.name}</div>
                         <div className="mt-0.5 flex-1 text-[11.5px] text-muted-foreground">
-                          {(team.members as any[]).length} agents, saved from your own room
+                          {plural((team.members as any[]).length, "agent")}, saved from your own room
                         </div>
                         <div className="mt-2.5 flex gap-1.5">
                           <Button
@@ -445,7 +448,7 @@ function TeamCard({
             <BlokAvatar color={member.color} shape={member.shape} size={22} />
           </span>
         ))}
-        <span className="ml-2 text-[11px] text-muted-foreground">{members.length} agents</span>
+        <span className="ml-2 text-[11px] text-muted-foreground">{plural(members.length, "agent")}</span>
       </div>
       <div className="mt-1 truncate text-[10.5px] text-muted-foreground">
         Lead: {lead?.title}

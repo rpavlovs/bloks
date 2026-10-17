@@ -12,12 +12,18 @@
 // claude.ts), which turns it into a card in the transcript and waits for a
 // human to press something.
 //
-// Two tools are published:
+// Two kinds of tool are published:
 //
 //   approve    the CLI's own permission checkpoint. The reply has to match
 //              the shape `--permission-prompt-tool` expects.
 //   ask_user   the agent choosing to ask. Whatever the person typed comes
-//              back as the tool result, unedited.
+//              back as the tool result, unedited. request_secret and
+//              request_connection are asks of the same kind.
+//
+// On full access there is no checkpoint, but the agent can still ask, so
+// the harness names the tools to publish in BLOKS_PUBLISH and leaves
+// approve out. Nothing else is answered then: a call to a tool that was
+// not published is refused, never read as a permission request.
 //
 // It is its own entry file rather than a mode of the main server because
 // the CLI spawns it with `process.execPath`, and a shared entry point that
@@ -79,7 +85,7 @@ function askHuman(request: object): Promise<any> {
 
 const writeFrame = (frame: unknown) => process.stdout.write(JSON.stringify(frame) + "\n");
 
-const PUBLISHED_TOOLS = [
+const ALL_TOOLS = [
   {
     name: "approve",
     description: "Ask the Bloks user whether a tool use is allowed",
@@ -145,6 +151,9 @@ const PUBLISHED_TOOLS = [
   },
 ];
 
+const only = process.env.BLOKS_PUBLISH?.split(",").filter(Boolean);
+const PUBLISHED_TOOLS = only ? ALL_TOOLS.filter((tool) => only.includes(tool.name)) : ALL_TOOLS;
+
 /** The CLI sometimes proposes permission rules of its own alongside a
  * request. On an "always allow" they are echoed back untouched so it can
  * stop asking at its own layer. Echoing beats inventing: the rule syntax
@@ -155,9 +164,41 @@ function proposedRules(args: any): unknown[] | null {
   return null;
 }
 
+/** What a question is told when the person gave it no words. */
+const NO_ANSWER = "No answer was given. Use your best judgment.";
+
+/** For the questions a card did not show. The wording is aimed at the
+ * model, which can put each one to the person by itself. */
+const NOT_SHOWN = "Not shown to the person: Bloks puts one question on a card. Ask this one on its own.";
+
+/** The CLI's own question tool reads the person's reply from `answers`
+ * in its input, each against the question it answers. The card shows the
+ * first question and its choices, so the reply is that one's. Any others
+ * are told they were not asked, where the same words against all of them
+ * would answer questions the person never saw. */
+function withAnswers(input: any, said: string) {
+  const answers: Record<string, string> = {};
+  input.questions.forEach((asked: any, i: number) => {
+    if (typeof asked?.question === "string") answers[asked.question] = i === 0 ? said : NOT_SHOWN;
+  });
+  return { ...input, answers };
+}
+
 /** The `--permission-prompt-tool` reply, as a string, because the contract
  * is a JSON document inside a text content block. */
 function permissionVerdict(reply: any, args: any): string {
+  // A question that came through the checkpoint, answered. Allowing it
+  // with the answers in its input is how the CLI's own tool is told. A
+  // tool with nowhere to put them is refused with the reply as the
+  // reason, the one way left for the words to reach the model.
+  if (reply.behavior === "answer") {
+    const said = reply.message || NO_ANSWER;
+    return JSON.stringify(
+      Array.isArray(args.input?.questions)
+        ? { behavior: "allow", updatedInput: withAnswers(args.input, said) }
+        : { behavior: "deny", message: `Answered in Bloks instead: ${said}` },
+    );
+  }
   if (reply.behavior !== "allow") {
     return JSON.stringify({
       behavior: "deny",
@@ -195,6 +236,24 @@ async function dispatch(message: any) {
       const isConnection = name === "request_connection";
       const isSecret = name === "request_secret";
 
+      if (!PUBLISHED_TOOLS.some((tool) => tool.name === name)) {
+        return writeFrame({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: { isError: true, content: [{ type: "text", text: `Bloks: there is no ${String(name)} tool here` }] },
+        });
+      }
+
+      // The schema describes a required question, but a tool call can
+      // still omit it. Refuse before opening a card or waiting on it.
+      if (isQuestion && (typeof args.question !== "string" || !args.question.trim())) {
+        return writeFrame({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: { isError: true, content: [{ type: "text", text: "Bloks: ask_user requires a non-empty question" }] },
+        });
+      }
+
       const reply = await askHuman(
         isSecret
           ? {
@@ -222,7 +281,7 @@ async function dispatch(message: any) {
 
       const text =
         isQuestion || isConnection || isSecret
-          ? reply.message || "No answer was given. Use your best judgment."
+          ? reply.message || NO_ANSWER
           : permissionVerdict(reply, args);
 
       return writeFrame({

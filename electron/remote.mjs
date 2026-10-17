@@ -116,6 +116,9 @@ export async function claimPairLink(link, name) {
   }
   const outer = await res.json().catch(() => ({}));
   if (res.status === 503 || res.status === 504) throw new Error("The other computer is not connected to Bloks Cloud right now.");
+  // the relay refusing the link's own token is not a used link: the space
+  // it named is gone, usually because Cloud was activated again
+  if (res.status === 401) throw new Error("Bloks Cloud does not recognise the other computer any more. Cloud was probably activated again; make a fresh link there once it shows Connected.");
   const reply = outer.payload ? open(keys.open, outer.payload) : null;
   if (!reply || reply.status !== 200 || !reply.body?.deviceId) {
     throw new Error(reply?.body?.error ?? "That pairing link was already used or has expired. Run bloks-server pair again.");
@@ -135,6 +138,54 @@ const TYPES = {
   ".json": "application/json",
   ".ico": "image/x-icon",
 };
+
+// The same rules the server holds its own page to (server/index.ts,
+// SECURITY_HEADERS and http-guard.ts). This proxy stands in for that
+// server, so the window should get the same page, and loopback is no
+// more a boundary here than there: any site open in a browser can send
+// requests to 127.0.0.1, and this proxy signs every one it forwards as
+// this device.
+const PAGE_HEADERS = {
+  "content-security-policy": [
+    "default-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+  ].join("; "),
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+};
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+function hostnameOf(value) {
+  try {
+    return new URL(`http://${value}`).hostname;
+  } catch {
+    return "";
+  }
+}
+
+/** Only the window on this computer: a Host that names loopback (a
+ * hostile name that resolves to 127.0.0.1 still carries its own), and no
+ * Origin, or this proxy's own. A page on another loopback port (an
+ * agent's dev server, say) is not the window. */
+export function fromThisComputer(req) {
+  const host = req.headers.host ?? "";
+  if (!LOOPBACK_HOSTS.has(hostnameOf(host))) return false;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const from = new URL(origin);
+    return LOOPBACK_HOSTS.has(from.hostname) && from.host === host;
+  } catch {
+    return false;
+  }
+}
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -158,15 +209,39 @@ function readBody(req) {
  * workspace. Resolves with the port and a stop function. `onState` hears
  * whether the other computer is reachable.
  */
-export async function startRemoteProxy(profile, { staticDir, port = 0, onState = () => {} } = {}) {
+export async function startRemoteProxy(profile, { staticDir, port = 0, onState = () => {}, client } = {}) {
   const keys = deviceKeys(profile.deviceToken);
   const streams = new Set();
   let stopped = false;
+  // The relay has no resume sequence. Give this proxy's live stream its
+  // own watermark, including hello, rather than disabling renderer freshness.
+  // Keep notification identities across relay and renderer reconnects: a
+  // replay keeps its original sequence and cannot become fresh attention.
+  let frameSeq = 0;
+  const noticeSequences = new Map();
+  const sequenced = (frame) => {
+    const message = frame.message;
+    const identity = frame.kind === "reply.settled"
+      ? `reply:${frame.threadId}:${frame.botId}:${frame.turnId}`
+      : frame.kind === "message" && message?.kind === "options" && (message.card?.requestId || message.card?.runId)
+        ? `request:${frame.threadId}:${message.card.requestId ?? message.card.runId}` : null;
+    let seq = identity ? noticeSequences.get(identity) : undefined;
+    if (seq === undefined) {
+      seq = ++frameSeq;
+      if (identity) {
+        noticeSequences.set(identity, seq);
+        if (noticeSequences.size > 512) noticeSequences.delete(noticeSequences.keys().next().value);
+      }
+    }
+    return { ...frame, _seq: seq };
+  };
 
   const ask = async (request) => {
     const payload = seal(keys.seal, profile.deviceId, {
       ...request,
       raw: true,
+      // the other computer lists this app by the build it names here
+      ...(client ? { client } : {}),
       ...(request.method !== "GET" && request.method !== "HEAD" ? { ts: Date.now(), nonce: randomUUID() } : {}),
     });
     const res = await fetch(`${profile.relayUrl}/space/client/ask`, {
@@ -195,7 +270,7 @@ export async function startRemoteProxy(profile, { staticDir, port = 0, onState =
     let path = normalize(decodeURIComponent(url.pathname)).replace(/^([/\\])+/, "");
     let file = join(staticDir, path);
     if (!file.startsWith(staticDir) || !existsSync(file) || statSync(file).isDirectory()) file = join(staticDir, "index.html");
-    res.writeHead(200, { "content-type": TYPES[extname(file)] ?? "application/octet-stream" });
+    res.writeHead(200, { "content-type": TYPES[extname(file)] ?? "application/octet-stream", ...PAGE_HEADERS });
     res.end(readFileSync(file));
   };
 
@@ -213,7 +288,6 @@ export async function startRemoteProxy(profile, { staticDir, port = 0, onState =
           return;
         }
         if (res.status !== 200 || !res.body) throw new Error(String(res.status));
-        delay = 1_000;
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buffer = "";
@@ -233,20 +307,29 @@ export async function startRemoteProxy(profile, { staticDir, port = 0, onState =
               continue;
             }
             if (outer.kind === "hello") {
+              // The wait between tries starts over only once the relay has
+              // said hello, as server/relay-link.ts does: a relay that
+              // answers and drops the line at once would otherwise be
+              // dialled every second, forever.
+              delay = 1_000;
               onState({ connected: outer.online !== false });
               // the window starts over rather than resuming: frames the
               // relay did not carry cannot be replayed from here
-              for (const s of streams) s.write(`data: ${JSON.stringify({ kind: "hello", resumed: false })}\n\n`);
+              for (const s of streams) s.write(`data: ${JSON.stringify({ kind: "hello", resumed: false, _seq: frameSeq })}\n\n`);
               continue;
             }
             if (outer.kind !== "frame" || typeof outer.payload !== "string") continue;
             if (peek(outer.payload)?.d !== profile.deviceId) continue;
             const frame = open(keys.open, outer.payload);
             if (!frame) continue;
-            const text = `data: ${JSON.stringify(frame)}\n\n`;
+            const text = `data: ${JSON.stringify(sequenced(frame))}\n\n`;
             for (const s of streams) s.write(text);
           }
         }
+        if (stopped) return;
+        // a line the relay ended cleanly is gone all the same, and the
+        // window should not say connected while this dials it again
+        throw new Error("the relay closed the line");
       } catch {
         onState({ connected: false });
       }
@@ -257,11 +340,16 @@ export async function startRemoteProxy(profile, { staticDir, port = 0, onState =
   };
 
   const server = createServer(async (req, res) => {
+    if (!fromThisComputer(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not from this computer" }));
+      return;
+    }
     const url = new URL(req.url, "http://x");
     if (!url.pathname.startsWith("/api/")) return serveStatic(req, res);
     if (url.pathname === "/api/events") {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-      res.write(`data: ${JSON.stringify({ kind: "hello", resumed: false })}\n\n`);
+      res.write(`data: ${JSON.stringify({ kind: "hello", resumed: false, _seq: frameSeq })}\n\n`);
       const stream = { write: (t) => { try { res.write(t); } catch {} } };
       streams.add(stream);
       const keepalive = setInterval(() => stream.write(": keepalive\n\n"), 25_000);
@@ -278,7 +366,16 @@ export async function startRemoteProxy(profile, { staticDir, port = 0, onState =
         path: url.pathname + url.search,
         ...(body && body.length ? { bodyB64: body.toString("base64"), type: req.headers["content-type"] ?? "application/json" } : {}),
       });
-      res.writeHead(answer.status, { "content-type": answer.type ?? "application/octet-stream" });
+      const type = answer.type ?? "application/octet-stream";
+      res.writeHead(answer.status, {
+        "content-type": type,
+        "x-content-type-options": "nosniff",
+        // A file the API returns as itself (an agent's HTML artifact, an
+        // app's page) is sandboxed by the server so it cannot run as this
+        // origin; that header does not survive the trip, so it is put
+        // back for anything that is not the API's own JSON.
+        ...(/^application\/json\b/i.test(type) ? {} : { "content-security-policy": "sandbox allow-scripts" }),
+      });
       res.end(answer.bytes);
     } catch (e) {
       const status = e?.status ?? 502;
@@ -286,7 +383,14 @@ export async function startRemoteProxy(profile, { staticDir, port = 0, onState =
       res.end(JSON.stringify({ error: status === 413 ? e.message : "the other computer could not be reached" }));
     }
   });
-  await new Promise((resolve) => server.listen(port, "127.0.0.1", resolve));
+  // a port that is taken says so, rather than leaving this waiting forever
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
   void listen();
   return {
     port: server.address().port,

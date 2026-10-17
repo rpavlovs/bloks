@@ -39,6 +39,8 @@ const LABEL: Record<string, string> = {
   genesis: "Record started",
   approval: "Approval",
   "agent.created": "Agent made",
+  "approvals.changed": "Approvals changed",
+  "engine.installed": "Engine installed",
   "agent.imported": "Agent brought in",
   "agent.exported": "Agent exported",
   "agent.archived": "Agent archived",
@@ -53,6 +55,7 @@ const LABEL: Record<string, string> = {
   "control.taken": "You took over",
   "control.released": "You handed back",
   "conversation.rewound": "Rewound",
+  "setup.imported": "Setup brought over",
 };
 
 function when(at: number): string {

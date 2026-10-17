@@ -18,8 +18,7 @@
 //     PNG came back with a corrupted length. Screenshots therefore go to a
 //     file on the box and come back through the files API.
 import type { AppConfig } from "./config.ts";
-
-const BOX_API = "https://ascii.dev/api/box/v1";
+import { BOAT_API, listSandboxes } from "./boat.ts";
 
 /** States in which a box will actually answer a command. */
 const AWAKE = new Set(["idle", "ready", "running"]);
@@ -29,7 +28,7 @@ const BOX_PREFIX = "/opt/bloks";
 const SHOT_PATH = "/tmp/bloks-shot.png";
 
 function request(cfg: AppConfig, path: string, init: RequestInit = {}) {
-  return fetch(`${BOX_API}${path}`, {
+  return fetch(`${BOAT_API}${path}`, {
     ...init,
     headers: {
       authorization: `Bearer ${cfg.box?.token}`,
@@ -75,8 +74,7 @@ async function candidateNames(botId: string) {
 
 export async function findBox(cfg: AppConfig, botId: string) {
   const names = await candidateNames(botId);
-  const { body } = await call(cfg, "/boxes");
-  const boxes: any[] = body?.boxes ?? [];
+  const boxes = await listSandboxes(cfg.box?.token ?? "");
   return boxes.find((box) => names.includes(box.name) && box.state !== "error") ?? null;
 }
 
@@ -93,13 +91,13 @@ async function waitUntilAwake(cfg: AppConfig, boxId: string, budgetMs = 90_000) 
   const deadline = Date.now() + budgetMs;
 
   while (Date.now() < deadline) {
-    const { body } = await call(cfg, `/boxes/${boxId}`);
-    const state = body?.box?.state;
+    const { body } = await call(cfg, `/sandboxes/${boxId}`);
+    const state = body?.sandbox?.state;
 
-    if (AWAKE.has(state)) return body.box;
+    if (AWAKE.has(state)) return body.sandbox;
     if (state === "error") return null;
     if (state === "archived") {
-      await call(cfg, `/boxes/${boxId}/resume`, { method: "POST" });
+      await call(cfg, `/sandboxes/${boxId}/resume`, { method: "POST" });
     }
     await sleep(2500);
   }
@@ -124,14 +122,14 @@ async function mintDesktopUrl(cfg: AppConfig, boxId: string, budgetMs = 60_000) 
   const deadline = Date.now() + budgetMs;
 
   while (Date.now() < deadline) {
-    const { body } = await call(cfg, `/boxes/${boxId}/desktop?vnc=1`, { method: "POST" });
+    const { body } = await call(cfg, `/sandboxes/${boxId}/desktop?vnc=1`, { method: "POST" });
     const url = body?.desktopUrl ?? body?.url;
     if (url) return url;
     if (!body?.provisioning) break;
     await sleep(3000);
   }
 
-  const { body } = await call(cfg, `/boxes/${boxId}/desktop`, { method: "POST" });
+  const { body } = await call(cfg, `/sandboxes/${boxId}/desktop`, { method: "POST" });
   return body?.desktopUrl ?? body?.url ?? null;
 }
 
@@ -143,9 +141,11 @@ export async function runCommand(
   command: string,
   { timeoutMs = 120_000 } = {},
 ) {
-  const response = await request(cfg, `/boxes/${boxId}/commands`, {
+  const response = await request(cfg, `/sandboxes/${boxId}/commands`, {
     method: "POST",
-    body: JSON.stringify({ command }),
+    // the service holds a command to its own timeout (60s unless told),
+    // so it is told the same budget this side waits
+    body: JSON.stringify({ command, timeoutSeconds: Math.min(600, Math.max(1, Math.ceil(timeoutMs / 1000))) }),
     signal: AbortSignal.timeout(timeoutMs),
   });
   const body: any = await response.json().catch(() => null);
@@ -221,7 +221,7 @@ export async function boxStatus(cfg: AppConfig, botId: string) {
  * fresh desktop URL. */
 export async function provisionBox(cfg: AppConfig, botId: string, botName: string) {
   if (!boxConfigured(cfg)) {
-    throw new Error('box provider not enabled. Add {"box":{"token":"…"}} to ~/.bloks/config.json');
+    throw new Error("Cloud computers need a Boat API key. Add one in Settings, Apps and keys.");
   }
 
   const name = await nameFor(botId, "bloks");
@@ -229,17 +229,21 @@ export async function provisionBox(cfg: AppConfig, botId: string, botName: strin
   const existed = Boolean(box);
 
   if (!box) {
-    const created = await call(cfg, "/boxes", {
+    const created = await call(cfg, "/sandboxes", {
       method: "POST",
       // A backstop on the substrate's side: if every path that should put
       // this box to sleep fails, it archives itself and stops billing.
       body: JSON.stringify({ ttlSeconds: 8 * 60 * 60 }),
     });
-    if (!created.ok || !created.body?.box?.id) {
-      throw new Error(`box create failed (${created.status})`);
+    if (!created.ok || !created.body?.sandbox?.id) {
+      throw new Error(
+        created.body?.message
+          ? `Boat could not create the computer: ${created.body.message}`
+          : `Boat could not create the computer (${created.status})`,
+      );
     }
-    box = created.body.box;
-    await call(cfg, `/boxes/${box.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
+    box = created.body.sandbox;
+    await call(cfg, `/sandboxes/${box.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
   }
 
   const awake = await waitUntilAwake(cfg, box.id);
@@ -292,7 +296,7 @@ export async function sleepBox(cfg: AppConfig, botId: string) {
   const box = await findBox(cfg, botId);
   if (!box) throw new Error("no computer for this agent");
 
-  await call(cfg, `/boxes/${box.id}/stop`, { method: "POST" }).catch(() => {});
+  await call(cfg, `/sandboxes/${box.id}/stop`, { method: "POST" }).catch(() => {});
   return { ok: true };
 }
 
@@ -335,7 +339,7 @@ export async function screenshotBox(cfg: AppConfig, botId: string) {
 
   const { ok, body } = await call(
     cfg,
-    `/boxes/${box.id}/files?path=${encodeURIComponent(SHOT_PATH)}&encoding=base64`,
+    `/sandboxes/${box.id}/files?path=${encodeURIComponent(SHOT_PATH)}&encoding=base64`,
   );
   const png = body?.content;
   if (!ok || typeof png !== "string" || !png) {

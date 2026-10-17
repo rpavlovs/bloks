@@ -91,3 +91,18 @@ describe("splitBlocks", () => {
     assert.deepEqual(blocks[0], { kind: "lines", lines: ["hello", "world"], offset: 0 });
   });
 });
+
+test("a code fence is one code block, and nothing inside it is a table", () => {
+  const text = ["Here:", "```ts", "| a | b |", "| --- | --- |", "const x = `y`;", "```", "Done."].join("\n");
+  const blocks = splitBlocks(text);
+  assert.deepEqual(blocks.map((b) => b.kind), ["lines", "code", "lines"]);
+  const code = blocks[1] as { kind: "code"; lang: string; code: string };
+  assert.equal(code.lang, "ts");
+  assert.equal(code.code, "| a | b |\n| --- | --- |\nconst x = `y`;");
+});
+
+test("a fence still open, as while a reply streams, is code to the end", () => {
+  const blocks = splitBlocks("Start\n```\nline one\nline two");
+  assert.deepEqual(blocks.map((b) => b.kind), ["lines", "code"]);
+  assert.equal((blocks[1] as { code: string }).code, "line one\nline two");
+});

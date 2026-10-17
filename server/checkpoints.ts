@@ -19,11 +19,31 @@
 // it since, it is left alone and named, because quietly throwing away
 // work done after the fact is the one thing an undo must never do.
 //
+// A folder can be shared, by several agents or by two conversations of
+// one, and a turn that ran beside another one there cannot tell from two
+// photographs whose writes were whose (GitHub 153). So a turn knows which
+// other turns overlapped it in the same folder, or one inside the other,
+// and keeps as its own only the files its engine said it edited. Its card
+// lists those, and Undo leaves the rest alone: undoing another agent's
+// work is the same harm as undoing a later turn's. A turn with none of its
+// own posts no card, unless it ran something that writes without saying
+// which files (a shell command, or an engine that never names them): then
+// the files changed while it worked are counted on a card without Undo,
+// the only sign the folder moved. A turn that ran alone claims everything,
+// as it always did.
+//
 // Limits, all of them deliberate: folders too big to photograph in a
 // moment are not tracked (the card says so rather than pretending), files
 // over MAX_FILE are noted as changed but not kept, and a handful of
 // directories that are regenerated rather than written (node_modules and
 // friends) are skipped.
+//
+// What a repository ignores is skipped too: logs and build output are not
+// the turn's work, and an undo that deletes fresh logs and puts old build
+// output back helps nobody. Git is only asked when it is really there
+// (never the macOS stub), and matching .gitignore ourselves is a trap, so
+// without Git the folder is photographed whole, as before.
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
@@ -40,10 +60,11 @@ import {
 } from "node:fs";
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { realpathSync } from "node:fs";
 
 import { newId } from "./contracts.ts";
+import { readSaved } from "./atomic-write.ts";
 
 /** Bigger than this is noted as changed and never kept. */
 export const MAX_FILE = 2 * 1024 * 1024;
@@ -53,6 +74,10 @@ export const MAX_FILES = 20_000;
 const MAX_NEW_BYTES = 256 * 1024 * 1024;
 /** Records kept; older ones lose their undo, never their card. */
 const MAX_RECORDS = 300;
+/** How far past MAX_RECORDS the records go before the oldest are let go
+ * together and the store swept once. A sweep reads every photograph and
+ * lists every kept version, which is too much to do after every turn. */
+const SWEEP_EVERY = 50;
 /** A text diff past this many lines on either side is summarised. */
 const MAX_DIFF_LINES = 4_000;
 
@@ -93,6 +118,13 @@ export interface FileChange {
   after?: string;
   /** Too big to keep, so shown but not undoable. */
   big?: boolean;
+  /** Changed while another turn was working in the folder, and not a file
+   * this turn's engine said it edited: possibly the other turn's, so it is
+   * not on this turn's card and Undo leaves it alone. */
+  shared?: boolean;
+  /** For a big file, its size and time before the turn, which is all a
+   * rehearsal's Apply has to tell whether it was changed since. */
+  beforeStat?: { size: number; mtimeMs: number };
   added?: number;
   removed?: number;
 }
@@ -107,6 +139,12 @@ export interface CheckpointRecord {
   revertedAt?: number;
   /** Where its card sits, so an undo can update it. */
   card?: { threadId: string; messageId: string };
+  /** The agents whose turns overlapped this one in the folder. */
+  alongside?: string[];
+  /** It overlapped others and ran something that may write files without
+   * naming them, so its card counts the shared ones when it has none of
+   * its own. */
+  unnamedWrites?: boolean;
   /** A rehearsal: the changes are in a clone, not yet in `dir`. They
    * reach `dir` only through apply, and only then can they be undone. */
   rehearsal?: { copy: string };
@@ -117,7 +155,13 @@ export interface CheckpointRecord {
 /** What goes on the card: small, and nothing the diff call cannot fetch. */
 export interface ChangesSummary {
   checkpointId: string;
-  files: Array<Pick<FileChange, "path" | "status" | "big" | "added" | "removed">>;
+  /** This turn's own files; or, for a turn with none that may have
+   * written some without naming them, the files changed while others
+   * worked here, each marked shared. */
+  files: Array<Pick<FileChange, "path" | "status" | "big" | "added" | "removed" | "shared">>;
+  /** On that second kind of card: how many changed while other agents
+   * were working here, and who they were. */
+  shared?: { total: number; alongside: string[] };
   /** How many files changed in all, when more than the card lists. */
   total: number;
   reverted?: { at: number; restored: number; skipped: number };
@@ -142,6 +186,14 @@ export interface FileDiff {
 export interface RevertResult {
   restored: string[];
   skipped: Array<{ path: string; why: string }>;
+}
+
+/** Two folders where a write in one can land in the other: the same
+ * folder, or one inside the other. */
+export function overlapping(a: string, b: string): boolean {
+  const x = resolve(a);
+  const y = resolve(b);
+  return x === y || x.startsWith(y + sep) || y.startsWith(x + sep);
 }
 
 /** A folder worth photographing: never a home directory or anything above
@@ -262,6 +314,36 @@ export function insideReally(folder: string, target: string): boolean {
   return real === root || real.startsWith(root + sep);
 }
 
+/** A git that runs without asking to install anything, or null. On a Mac
+ * without the developer tools /usr/bin/git is a stub that opens an
+ * installer dialog, so it only counts when the tools behind it exist. */
+function realGit(): string | null {
+  if (process.platform !== "darwin") return "git";
+  for (const dir of (process.env.PATH ?? "").split(":")) {
+    if (!dir || dir === "/usr/bin") continue;
+    if (existsSync(join(dir, "git"))) return join(dir, "git");
+  }
+  const tools = ["/Library/Developer/CommandLineTools/usr/bin/git", "/Applications/Xcode.app/Contents/Developer/usr/bin/git"];
+  return tools.some((t) => existsSync(t)) ? "/usr/bin/git" : null;
+}
+
+/** What the repository around `dir` ignores and does not track, as paths
+ * relative to `dir` (a folder ends in /). Null when there is no Git, no
+ * repository, or Git took too long: the folder is then photographed
+ * whole, as it always was. */
+export function gitIgnored(dir: string): Promise<Set<string> | null> {
+  const git = realGit();
+  if (!git) return Promise.resolve(null);
+  return new Promise((done) => {
+    execFile(
+      git,
+      ["-C", dir, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
+      { timeout: 5_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } },
+      (error, stdout) => done(error ? null : new Set(String(stdout).split("\0").filter(Boolean))),
+    );
+  });
+}
+
 function looksBinary(data: Buffer): boolean {
   const n = Math.min(data.length, 8000);
   for (let k = 0; k < n; k++) if (data[k] === 0) return true;
@@ -278,18 +360,27 @@ export class Checkpoints {
   private pending = new Map<string, { botId: string; dir: string; photo: Photo; ignore: string[]; afterDir?: string }>();
   /** One photograph of a folder at a time, so two lanes do not race. */
   private queues = new Map<string, Promise<unknown>>();
+  /** Every turn working in a folder right now, from the moment it starts
+   * being photographed, and the other turns that overlapped it there. */
+  private active = new Map<string, { botId: string; dir: string; real: string; alongside: Map<string, string> }>();
+  /** The files each running turn's engine said it edited, relative to the
+   * turn's folder. */
+  private edited = new Map<string, Set<string>>();
+  /** Running turns that did something which may write files it does not
+   * name (noteUnnamedWrites). */
+  private unnamed = new Set<string>();
+  /** Photographs, comparisons, applies and undos under way. Until one is
+   * done, the versions it just kept, or is about to read, may be named by
+   * no record and no photograph on disk, so a sweep waits until none is. */
+  private busy = 0;
+  private sweepDue = false;
 
   constructor(root: string) {
     this.root = root;
     this.blobs = join(root, "blobs");
     this.photos = join(root, "photos");
     this.indexFile = join(root, "index.json");
-    try {
-      this.records = JSON.parse(readFileSync(this.indexFile, "utf8"));
-      if (!Array.isArray(this.records)) this.records = [];
-    } catch {
-      this.records = [];
-    }
+    this.records = readSaved<CheckpointRecord[]>(this.indexFile, [], Array.isArray);
   }
 
   /** Photographs the folder before a turn. Never throws: a turn does not
@@ -300,14 +391,57 @@ export class Checkpoints {
     dir: string | null | undefined,
     ignore: string[] = [],
     /** A rehearsal: the turn works in this clone of `dir`, and the
-     * difference is taken between `dir` now and the clone after. */
+     * difference is taken between `dir` as the clone was made from it
+     * (baseline) and the clone after. */
     afterDir?: string,
   ): Promise<boolean> {
     this.pending.delete(threadId);
+    this.active.delete(threadId);
+    this.edited.delete(threadId);
     if (!trackable(dir)) return false;
-    const photo = await this.serial(dir, () => this.photograph(dir, ignore));
-    if (photo) this.pending.set(threadId, { botId, dir, photo, ignore, ...(afterDir ? { afterDir } : {}) });
-    return Boolean(photo);
+    // A rehearsal writes into its own copy, so it neither touches the
+    // folder nor sees what others write there.
+    if (!afterDir) this.arrive(threadId, botId, dir);
+    return this.working(async () => {
+      let photo: Photo | null;
+      if (afterDir) {
+        // Every turn in a copy starts from the folder as the copy was made,
+        // never as it is now: whatever you changed there since would read
+        // as the agent changing it back, and Apply would undo your work. A
+        // rehearsal begun before baselines were kept starts its own here.
+        photo = this.readBaseline(afterDir);
+        if (!photo) {
+          photo = await this.serial(dir, () => this.photograph(dir, ignore));
+          if (photo) this.keepBaseline(afterDir, photo);
+        }
+      } else {
+        photo = await this.serial(dir, () => this.photograph(dir, ignore));
+      }
+      if (photo) this.pending.set(threadId, { botId, dir, photo, ignore, ...(afterDir ? { afterDir } : {}) });
+      return Boolean(photo);
+    });
+  }
+
+  /**
+   * A rehearsal's starting point: `dir` photographed before it is cloned
+   * into `copy`, and kept as the before of every turn in that copy until
+   * forgetBaseline. Taken first, never after the clone: a file written in
+   * between is then newer in the copy than in the photograph, and Apply
+   * finds it changed since and leaves it alone, where the other order
+   * would put the older version back over it.
+   */
+  async baseline(dir: string, copy: string, ignore: string[] = []): Promise<boolean> {
+    if (!trackable(dir)) return false;
+    return this.working(async () => {
+      const photo = await this.serial(dir, () => this.photograph(dir, ignore));
+      if (photo) this.keepBaseline(copy, photo);
+      return Boolean(photo);
+    });
+  }
+
+  /** A settled rehearsal's starting point, of no use once its copy is gone. */
+  forgetBaseline(copy: string) {
+    rmSync(this.baselineFile(copy), { force: true });
   }
 
   /** Photographs again after the turn, and keeps the difference. Null
@@ -315,34 +449,102 @@ export class Checkpoints {
   async finish(threadId: string): Promise<CheckpointRecord | null> {
     const before = this.pending.get(threadId);
     this.pending.delete(threadId);
+    const turn = this.active.get(threadId);
+    this.active.delete(threadId);
+    const edited = this.edited.get(threadId) ?? new Set<string>();
+    this.edited.delete(threadId);
+    const unnamed = this.unnamed.delete(threadId);
     if (!before) return null;
-    const where = before.afterDir ?? before.dir;
-    const after = await this.serial(where, () => this.photograph(where, before.ignore, before.afterDir ? before.photo : undefined));
-    if (before.afterDir) this.forgetPhoto(before.afterDir);
-    if (!after) return null;
-    const files = this.compare(before.photo, after);
-    if (files.length === 0) return null;
-    const record: CheckpointRecord = {
-      id: newId(),
-      threadId,
-      botId: before.botId,
-      dir: before.dir,
-      at: Date.now(),
-      files,
-      ...(before.afterDir ? { rehearsal: { copy: before.afterDir } } : {}),
-    };
-    this.records.push(record);
-    if (this.records.length > MAX_RECORDS) {
-      this.records.splice(0, this.records.length - MAX_RECORDS);
-      this.sweep();
-    }
-    this.save();
-    return record;
+    return this.working(async () => {
+      const where = before.afterDir ?? before.dir;
+      const after = await this.serial(where, () => this.photograph(where, before.ignore, before.afterDir ? before.photo : undefined));
+      if (before.afterDir) this.forgetPhoto(before.afterDir);
+      if (!after) return null;
+      const compared = this.compare(before.photo, after);
+      if (compared.length === 0) return null;
+      const alongside = turn ? [...new Set(turn.alongside.values())] : [];
+      if (alongside.length) for (const change of compared) if (!edited.has(change.path)) change.shared = true;
+      // this turn's own first, so the card leads with what it is sure of
+      const files = [...compared.filter((f) => !f.shared), ...compared.filter((f) => f.shared)];
+      const record: CheckpointRecord = {
+        id: newId(),
+        threadId,
+        botId: before.botId,
+        dir: before.dir,
+        at: Date.now(),
+        files,
+        ...(alongside.length ? { alongside } : {}),
+        ...(alongside.length && unnamed ? { unnamedWrites: true } : {}),
+        ...(before.afterDir ? { rehearsal: { copy: before.afterDir } } : {}),
+      };
+      this.records.push(record);
+      if (this.records.length > MAX_RECORDS + SWEEP_EVERY) {
+        this.records.splice(0, this.records.length - MAX_RECORDS);
+        this.sweepDue = true;
+      }
+      this.save();
+      return record;
+    });
   }
 
   /** Forgets a turn that never ran. */
   cancel(threadId: string) {
     this.pending.delete(threadId);
+    this.active.delete(threadId);
+    this.edited.delete(threadId);
+    this.unnamed.delete(threadId);
+  }
+
+  /** A running turn did something that may write files without naming
+   * them (FileChange.shared, unnamedWrites). */
+  noteUnnamedWrites(threadId: string) {
+    if (this.active.has(threadId)) this.unnamed.add(threadId);
+  }
+
+  /** Files a running turn's engine says it is editing, as it says them:
+   * absolute, or relative to the turn's folder. Anything outside the
+   * folder is not this card's business and is dropped. */
+  noteEdits(threadId: string, paths: readonly string[]) {
+    const turn = this.active.get(threadId);
+    if (!turn) return;
+    const mine = this.edited.get(threadId) ?? new Set<string>();
+    const within = (base: string, path: string) => {
+      const rel = relative(base, resolve(base, path));
+      return !rel || rel.startsWith("..") || isAbsolute(rel) ? null : rel;
+    };
+    for (const path of paths) {
+      if (typeof path !== "string" || !path) continue;
+      // An engine may name the folder by where it really is: a process
+      // that asks for its working directory is given the path with every
+      // link followed, so a folder reached through one (any temporary
+      // folder on a Mac) comes back under another name, and the turn's
+      // own edits would read as somebody else's.
+      const rel = within(turn.dir, path) ?? within(turn.real, path);
+      if (!rel) continue;
+      mine.add(rel.split(sep).join("/"));
+    }
+    this.edited.set(threadId, mine);
+  }
+
+  /** A turn starting in a folder: every other turn already working in it,
+   * or in a folder inside or around it, overlaps this one and is overlapped
+   * by it. Kept for as long as both are running, so a turn that came and
+   * went in the middle of a long one still counts. */
+  private arrive(threadId: string, botId: string, dir: string) {
+    const here = resolve(dir);
+    // compared by where it really is, so a link to a shared folder is
+    // still that folder; edits are read against the path the engine uses
+    let real = here;
+    try {
+      real = realpathSync(here);
+    } catch {}
+    const mine = { botId, dir: here, real, alongside: new Map<string, string>() };
+    for (const [other, turn] of this.active) {
+      if (other === threadId || !overlapping(turn.real, real)) continue;
+      turn.alongside.set(threadId, botId);
+      mine.alongside.set(other, turn.botId);
+    }
+    this.active.set(threadId, mine);
   }
 
   attachCard(id: string, threadId: string, messageId: string) {
@@ -373,20 +575,66 @@ export class Checkpoints {
       .sort((a, b) => b.at - a.at);
   }
 
+  /**
+   * The files that reverting these records, in this order, would put
+   * back, with nothing touched: what a Redo says it will do before it is
+   * pressed (GitHub 258). Each file is judged the way revert judges it,
+   * against what the record before it in the list would have left there,
+   * so the count is the one the rewind then reports unless the folder
+   * moves in between.
+   */
+  wouldRestore(records: readonly CheckpointRecord[]): string[] {
+    /** What an earlier record in the list would leave at a path. */
+    const left = new Map<string, string | null>();
+    const restored = new Set<string>();
+    for (const record of records) {
+      if (record.rehearsal && !record.appliedAt) continue;
+      for (const change of record.files) {
+        if (change.shared || change.big) continue;
+        const target = join(record.dir, change.path);
+        if (relative(record.dir, target).startsWith("..") || !insideReally(record.dir, target)) continue;
+        const now = left.has(target) ? left.get(target)! : this.hashOf(target);
+        if (now !== (change.after ?? null)) continue;
+        if (change.status !== "added" && !(change.before && existsSync(this.blobPath(change.before)))) continue;
+        left.set(target, change.status === "added" ? null : change.before!);
+        restored.add(change.path);
+      }
+    }
+    return [...restored];
+  }
+
   summary(record: CheckpointRecord, listed = 50): ChangesSummary {
+    const own = record.files.filter((f) => !f.shared);
+    // none of its own, but it may have written some without saying which:
+    // what changed while it worked, counted, listed apart, without Undo
+    if (!own.length && record.unnamedWrites && record.files.length && !record.rehearsal) {
+      return {
+        checkpointId: record.id,
+        files: record.files.slice(0, listed).map(({ path, status, big, added, removed }) => ({
+          path,
+          status,
+          ...(big ? { big } : {}),
+          ...(added !== undefined ? { added } : {}),
+          ...(removed !== undefined ? { removed } : {}),
+          shared: true,
+        })),
+        total: record.files.length,
+        shared: { total: record.files.length, alongside: record.alongside ?? [] },
+      };
+    }
     return {
       ...(record.rehearsal
         ? { rehearsal: { state: record.discardedAt ? ("discarded" as const) : record.appliedAt ? ("applied" as const) : ("pending" as const) } }
         : {}),
       checkpointId: record.id,
-      files: record.files.slice(0, listed).map(({ path, status, big, added, removed }) => ({
+      files: own.slice(0, listed).map(({ path, status, big, added, removed }) => ({
         path,
         status,
         ...(big ? { big } : {}),
         ...(added !== undefined ? { added } : {}),
         ...(removed !== undefined ? { removed } : {}),
       })),
-      total: record.files.length,
+      total: own.length,
     };
   }
 
@@ -417,7 +665,7 @@ export class Checkpoints {
   async apply(id: string): Promise<RevertResult | null> {
     const record = this.get(id);
     if (!record?.rehearsal || record.appliedAt || record.discardedAt) return null;
-    return this.serial(record.dir, async () => {
+    return this.working(() => this.serial(record.dir, async () => {
       const result: RevertResult = { restored: [], skipped: [] };
       for (const change of record.files) {
         const target = join(record.dir, change.path);
@@ -426,7 +674,13 @@ export class Checkpoints {
           continue;
         }
         if (change.big) {
-          // too big to have been kept, but still sitting in the clone
+          // too big to have been kept, but still sitting in the clone. No
+          // hash to compare, so its size and time stand in: a file changed
+          // since the rehearsal began is left alone, as a small one is.
+          if (!this.unmovedSince(target, change.beforeStat)) {
+            result.skipped.push({ path: change.path, why: "changed since the rehearsal began" });
+            continue;
+          }
           const source = join(record.rehearsal!.copy, change.path);
           if (change.status === "deleted") {
             unlinkSync(target);
@@ -461,7 +715,7 @@ export class Checkpoints {
       record.appliedAt = Date.now();
       this.save();
       return result;
-    });
+    }));
   }
 
   /** A rehearsal left unapplied: its card says so, and it cannot be undone. */
@@ -478,9 +732,10 @@ export class Checkpoints {
     if (!record) return null;
     // a rehearsal that never reached the folder has nothing there to undo
     if (record.rehearsal && !record.appliedAt) return null;
-    return this.serial(record.dir, async () => {
+    return this.working(() => this.serial(record.dir, async () => {
       const result: RevertResult = { restored: [], skipped: [] };
       for (const change of record.files) {
+        if (change.shared) continue;
         const target = join(record.dir, change.path);
         // never outside the folder, whatever a record on disk says, and
         // not through a link: a folder the agent swapped for a symlink
@@ -514,10 +769,24 @@ export class Checkpoints {
       record.revertedAt = Date.now();
       this.save();
       return result;
-    });
+    }));
   }
 
   // ── the photographs ────────────────────────────────────────────────
+
+  /** Counts `work` as under way (busy), and sweeps once nothing is, if a
+   * sweep came due meanwhile. */
+  private async working<T>(work: () => Promise<T>): Promise<T> {
+    this.busy++;
+    try {
+      return await work();
+    } finally {
+      if (--this.busy === 0 && this.sweepDue) {
+        this.sweepDue = false;
+        this.sweep();
+      }
+    }
+  }
 
   private serial<T>(dir: string, work: () => Promise<T> | T): Promise<T> {
     const prior = this.queues.get(dir) ?? Promise.resolve();
@@ -538,6 +807,27 @@ export class Checkpoints {
     return join(this.photos, `${createHash("sha256").update(resolve(dir)).digest("hex").slice(0, 32)}.json`);
   }
 
+  /** Beside the photographs, so the sweep keeps what a baseline names
+   * for as long as it does any folder's latest photograph. */
+  private baselineFile(copy: string) {
+    return join(this.photos, `${createHash("sha256").update(resolve(copy)).digest("hex").slice(0, 32)}.before.json`);
+  }
+
+  private keepBaseline(copy: string, photo: Photo) {
+    mkdirSync(this.photos, { recursive: true });
+    const file = this.baselineFile(copy);
+    writeFileSync(`${file}.tmp`, JSON.stringify(Object.fromEntries(photo)));
+    renameSync(`${file}.tmp`, file);
+  }
+
+  private readBaseline(copy: string): Photo | null {
+    try {
+      return new Map(Object.entries(JSON.parse(readFileSync(this.baselineFile(copy), "utf8")) as Record<string, Entry>));
+    } catch {
+      return null;
+    }
+  }
+
   /** The folder as it is now, or null if it is too big to track. */
   /** `ignore` names paths (a file, or a folder ending in /) that are
    * someone else's to track, like an agent's own memory. */
@@ -553,6 +843,7 @@ export class Checkpoints {
       }
     }
     const photo: Photo = new Map();
+    const ignored = await gitIgnored(dir);
     let added = 0;
     const stack = [""];
     while (stack.length) {
@@ -574,10 +865,10 @@ export class Checkpoints {
         }
         if (info.isSymbolicLink()) continue;
         if (info.isDirectory()) {
-          if (!SKIP_DIRS.has(name)) stack.push(path);
+          if (!SKIP_DIRS.has(name) && !ignored?.has(`${path}/`)) stack.push(path);
           continue;
         }
-        if (!info.isFile() || SKIP_FILES.has(name)) continue;
+        if (!info.isFile() || SKIP_FILES.has(name) || ignored?.has(path)) continue;
         if (photo.size >= MAX_FILES) return null;
         const seen = last.get(path);
         if (seen && seen.size === info.size && seen.mtimeMs === info.mtimeMs) {
@@ -619,7 +910,10 @@ export class Checkpoints {
       const status: ChangeStatus = !a ? "added" : !b ? "deleted" : "modified";
       const big = Boolean((a && !a.hash) || (b && !b.hash));
       const change: FileChange = { path, status, ...(a?.hash ? { before: a.hash } : {}), ...(b?.hash ? { after: b.hash } : {}) };
-      if (big) change.big = true;
+      if (big) {
+        change.big = true;
+        if (a) change.beforeStat = { size: a.size, mtimeMs: a.mtimeMs };
+      }
       else this.count(change);
       out.push(change);
     }
@@ -662,6 +956,18 @@ export class Checkpoints {
     }
   }
 
+  /** Whether a file is still what a big change found before the turn:
+   * the same size and time, or still absent when there was none. */
+  private unmovedSince(path: string, before: { size: number; mtimeMs: number } | undefined): boolean {
+    let info;
+    try {
+      info = lstatSync(path);
+    } catch {
+      return !before;
+    }
+    return Boolean(before) && info.isFile() && info.size === before!.size && info.mtimeMs === before!.mtimeMs;
+  }
+
   private hashOf(path: string): string | null {
     try {
       const info = lstatSync(path);
@@ -679,15 +985,20 @@ export class Checkpoints {
     renameSync(temp, this.indexFile);
   }
 
-  /** Drops kept versions nothing points at any more: not a record, and
-   * not the latest photograph of any folder (which the next turn's
-   * comparison and undo both lean on). */
+  /** Drops kept versions nothing points at any more: not a record, not
+   * the latest photograph of any folder (which the next turn's
+   * comparison and undo both lean on), and not a rehearsal's baseline,
+   * which sit among them. */
   private sweep() {
     const wanted = new Set<string>();
     for (const r of this.records) for (const f of r.files) {
       if (f.before) wanted.add(f.before);
       if (f.after) wanted.add(f.after);
     }
+    // A running turn's before is held here until it finishes. A later
+    // photograph of the same folder replaces the one on disk, so what it
+    // names may be nowhere else, and its Undo needs every bit of it.
+    for (const { photo } of this.pending.values()) for (const entry of photo.values()) if (entry.hash) wanted.add(entry.hash);
     try {
       for (const name of readdirSync(this.photos)) {
         const photo = JSON.parse(readFileSync(join(this.photos, name), "utf8")) as Record<string, Entry>;

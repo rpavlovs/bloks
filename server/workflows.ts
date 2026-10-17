@@ -31,9 +31,10 @@
 //   is nothing that can run away. A regex is the single operator that
 //   would have brought that problem back, and "contains" covers what
 //   people actually write.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { readSaved, writeFileAtomic } from "./atomic-write.ts";
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
 
@@ -161,7 +162,8 @@ export const MAX_STEPS = 12;
 export const MAX_STEP_TEXT = 2_000;
 export const MAX_NAME = 80;
 /** How many runs a workflow remembers. Enough to see a pattern, not
- * enough to turn a settings file into a log store. */
+ * enough to turn a settings file into a log store. Runs not yet finished
+ * are kept past it (WorkflowStore.begin). */
 export const MAX_RUNS = 20;
 /** The longest a run may sit on an approval, and the default. A day is
  * what a person away from their desk needs; a week is a run nobody is
@@ -531,20 +533,13 @@ export class WorkflowStore {
   workflows: Workflow[] = [];
 
   constructor() {
-    try {
-      const parsed = JSON.parse(readFileSync(WORKFLOWS_FILE, "utf8"));
-      if (Array.isArray(parsed)) {
-        this.workflows = parsed.filter((w) => w?.id && typeof w.name === "string" && Array.isArray(w.steps));
-      }
-    } catch {
-      /* none yet */
-    }
+    this.workflows = readSaved<Workflow[]>(WORKFLOWS_FILE, [], Array.isArray).filter((w) => w?.id && typeof w.name === "string" && Array.isArray(w.steps));
   }
 
   private save() {
     try {
       mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-      writeFileSync(WORKFLOWS_FILE, JSON.stringify(this.workflows, null, 2), { mode: 0o600 });
+      writeFileAtomic(WORKFLOWS_FILE, JSON.stringify(this.workflows, null, 2), 0o600);
     } catch {
       /* still a workflow for this session */
     }
@@ -603,7 +598,13 @@ export class WorkflowStore {
       values: {},
       steps: [],
     };
-    workflow.runs = [run, ...(workflow.runs ?? [])].slice(0, MAX_RUNS);
+    // Only finished runs make room. One still running has a turn coming
+    // back to it, and one waiting has a card out; dropped from the list,
+    // neither could be found again, and the card would answer nothing.
+    const runs = [run, ...(workflow.runs ?? [])];
+    const live = (r: WorkflowRun) => r.state === "running" || r.state === "waiting";
+    let room = MAX_RUNS - runs.filter(live).length;
+    workflow.runs = runs.filter((r) => live(r) || room-- > 0);
     workflow.lastRunAt = now;
     this.save();
     return run;

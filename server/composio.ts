@@ -77,7 +77,14 @@ async function mcpRequest(access: McpAccess, method: string, params: unknown): P
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
     signal: AbortSignal.timeout(30_000),
   });
-  if (!response.ok) throw new Error(`connector service: HTTP ${response.status}`);
+  if (!response.ok) {
+    // said the way someone can act on: a refused key is fixed in Settings,
+    // anything else is Composio's side and worth a retry
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("Composio refused the connector key. Check it in Settings, Apps and keys.");
+    }
+    throw new Error(`Composio did not answer (HTTP ${response.status}). Try again in a moment.`);
+  }
   return response.text();
 }
 
@@ -128,7 +135,7 @@ export async function callMcpTool(access: McpAccess, name: string, args: unknown
 async function callMcp(cfg: AppConfig, tool: string, args: unknown) {
   const key = cfg.composio?.key;
   if (!key) {
-    throw new Error('no connector key configured. Add {"composio":{"key":"ck_…"}} to ~/.bloks/config.json');
+    throw new Error("Connecting apps needs a Composio key. Add one in Settings, Apps and keys.");
   }
   const body = await mcpRequest({ key, url: cfg.composio?.url }, "tools/call", {
     name: tool,
@@ -288,15 +295,16 @@ export interface ConnectorCard {
 
 /** What the plugin grid shows when the REST catalog is unavailable, which
  * is the common case since most people paste a consumer key. Ordered by
- * how likely someone is to want it, not alphabetically. */
+ * how likely someone is to want it, not alphabetically. Google's products
+ * carry their own artwork, since every one of their favicons is the same G. */
 const SHIPPED: ConnectorCard[] = [
   { slug: "slack", label: "Slack", blurb: "Read channels, post updates", domain: "slack.com", logo: null },
   { slug: "github", label: "GitHub", blurb: "Issues, pull requests, code", domain: "github.com", logo: null },
-  { slug: "gmail", label: "Gmail", blurb: "Send and read mail", domain: "gmail.com", logo: null },
-  { slug: "googlecalendar", label: "Google Calendar", blurb: "Check and book time", domain: "calendar.google.com", logo: null },
-  { slug: "googlesheets", label: "Google Sheets", blurb: "Read and update sheets", domain: "sheets.google.com", logo: null },
-  { slug: "googledocs", label: "Google Docs", blurb: "Draft and revise documents", domain: "docs.google.com", logo: null },
-  { slug: "googledrive", label: "Google Drive", blurb: "Find and organise files", domain: "drive.google.com", logo: null },
+  { slug: "gmail", label: "Gmail", blurb: "Send and read mail", domain: "gmail.com", logo: "https://ssl.gstatic.com/images/branding/product/1x/gmail_2020q4_32dp.png" },
+  { slug: "googlecalendar", label: "Google Calendar", blurb: "Check and book time", domain: "calendar.google.com", logo: "https://ssl.gstatic.com/images/branding/product/1x/calendar_2020q4_32dp.png" },
+  { slug: "googlesheets", label: "Google Sheets", blurb: "Read and update sheets", domain: "sheets.google.com", logo: "https://ssl.gstatic.com/images/branding/product/1x/sheets_2020q4_32dp.png" },
+  { slug: "googledocs", label: "Google Docs", blurb: "Draft and revise documents", domain: "docs.google.com", logo: "https://ssl.gstatic.com/images/branding/product/1x/docs_2020q4_32dp.png" },
+  { slug: "googledrive", label: "Google Drive", blurb: "Find and organise files", domain: "drive.google.com", logo: "https://ssl.gstatic.com/images/branding/product/1x/drive_2020q4_32dp.png" },
   { slug: "outlook", label: "Outlook", blurb: "Mail and calendar, Microsoft side", domain: "outlook.com", logo: null },
   { slug: "microsoft_teams", label: "Microsoft Teams", blurb: "Chats, channels, meetings", domain: "teams.microsoft.com", logo: null },
   { slug: "excel", label: "Excel", blurb: "Read and update workbooks", domain: "microsoft.com", logo: null },
@@ -331,7 +339,9 @@ export function connectorCatalogFallback(): ConnectorCard[] {
 }
 
 const CATALOG_TTL_MS = 10 * 60_000;
-let cachedCatalog: { fetchedAt: number; cards: ConnectorCard[] } | null = null;
+/** Keyed by the key that fetched it: a list fetched with one key must not
+ * outlive a change to another, or to none. */
+let cachedCatalog: { fetchedAt: number; key: string; cards: ConnectorCard[] } | null = null;
 
 /** Normalises one REST catalog row. Field names differ across versions of
  * the API, so each one is read from the first place it might be. */
@@ -356,13 +366,12 @@ function cardFromApi(row: any): ConnectorCard {
 export async function connectorCatalog(
   cfg: AppConfig,
 ): Promise<{ cards: ConnectorCard[]; source: "api" | "curated" }> {
-  if (cachedCatalog && Date.now() - cachedCatalog.fetchedAt < CATALOG_TTL_MS) {
-    return { cards: cachedCatalog.cards, source: "api" };
-  }
-
   // a project key when there is one, otherwise try the consumer key and
   // let it fail, which costs one request and occasionally works
   const key = cfg.composio?.apiKey ?? cfg.composio?.key;
+  if (key && cachedCatalog?.key === key && Date.now() - cachedCatalog.fetchedAt < CATALOG_TTL_MS) {
+    return { cards: cachedCatalog.cards, source: "api" };
+  }
   if (key) {
     try {
       const response = await fetch(`${CATALOG_ENDPOINT}/toolkits?limit=500&sort_by=usage`, {
@@ -373,8 +382,9 @@ export async function connectorCatalog(
         const body: any = await response.json();
         const rows = body.items ?? body.data ?? [];
         if (Array.isArray(rows) && rows.length) {
-          const cards = rows.map(cardFromApi);
-          cachedCatalog = { fetchedAt: Date.now(), cards };
+          // a row with no usable slug cannot be connected, so it is not shown
+          const cards = rows.map(cardFromApi).filter((card) => /^[\w-]+$/.test(card.slug));
+          cachedCatalog = { fetchedAt: Date.now(), key, cards };
           return { cards, source: "api" };
         }
       }

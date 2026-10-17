@@ -2,13 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import BellDot from "lucide-react/dist/esm/icons/bell-dot.mjs";
 import ClipboardCopy from "lucide-react/dist/esm/icons/clipboard-copy.mjs";
 import Copy from "lucide-react/dist/esm/icons/copy.mjs";
-import Moon from "lucide-react/dist/esm/icons/moon.mjs";
+import Eraser from "lucide-react/dist/esm/icons/eraser.mjs";
 import Pencil from "lucide-react/dist/esm/icons/pencil.mjs";
 import PanelLeftClose from "lucide-react/dist/esm/icons/panel-left-close.mjs";
 import PanelLeftOpen from "lucide-react/dist/esm/icons/panel-left-open.mjs";
 import Pin from "lucide-react/dist/esm/icons/pin.mjs";
 import PinOff from "lucide-react/dist/esm/icons/pin-off.mjs";
 import Plus from "lucide-react/dist/esm/icons/plus.mjs";
+import Loader2 from "lucide-react/dist/esm/icons/loader-2.mjs";
 import Archive from "lucide-react/dist/esm/icons/archive.mjs";
 import Puzzle from "lucide-react/dist/esm/icons/puzzle.mjs";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right.mjs";
@@ -23,19 +24,41 @@ import Search from "lucide-react/dist/esm/icons/search.mjs";
 import SettingsIcon from "lucide-react/dist/esm/icons/settings-2.mjs";
 import Sparkles from "lucide-react/dist/esm/icons/sparkles.mjs";
 import Users from "lucide-react/dist/esm/icons/users.mjs";
-import Sun from "lucide-react/dist/esm/icons/sun.mjs";
 import Trash2 from "lucide-react/dist/esm/icons/trash-2.mjs";
-import { api, useStore, formatWhen, type Blok, type Bot } from "@/state/store";
+import Target from "lucide-react/dist/esm/icons/target.mjs";
+import { api, sidebarRows, useStore, formatWhen, workingInRoom, type Action, type Blok, type Bot } from "@/state/store";
 import { Button } from "@/components/ui/button";
-import { useTheme } from "@/lib/theme";
 import { AgentAvatar } from "./Avatar";
 import { BloksLogo, BloksMark } from "./Brand";
 import { cn } from "@/lib/cn";
 import { usePageVisible } from "@/lib/pageVisible";
-import { previewLine } from "@/lib/preview";
-import { inSection, sectionNames, shownInSection } from "@/lib/sections";
+import { agentPreview, lastHeardAt, lastSaid, previewLine } from "@/lib/preview";
+import {
+  acceptsRow,
+  landingOver,
+  layoutRows,
+  moveSection,
+  movesRow,
+  orderSections,
+  pinPosition,
+  placeOfRow,
+  ROW_TYPE,
+  SECTION_TYPE,
+  sectionNames,
+  shownInSection,
+  sidebarLayout,
+  sidebarOrder,
+  type Landing,
+  type Listed,
+  type Place,
+} from "@/lib/sections";
 import { useProfileNotes } from "./AboutYou";
+import { refreshCheckup, riskyCount, useSecurityCheckup } from "@/lib/securityCheckup";
 import { useBriefs } from "./BriefPanel";
+import { ConversationRows, LaneRing, SidebarFooter, WaitingRow } from "./SidebarParts";
+import { UpdateCard } from "./UpdateCard";
+import { setLanesInSidebar, useConversationsView } from "@/lib/conversationsView";
+import ListTree from "lucide-react/dist/esm/icons/list-tree.mjs";
 import Sunrise from "lucide-react/dist/esm/icons/sunrise.mjs";
 import {
   DropdownMenu,
@@ -43,29 +66,83 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { plural } from "@/lib/plural";
 
 const isElectron = navigator.userAgent.includes("Electron");
 
-function preview(bot: Bot): string {
-  // a lane waiting on a human outranks everything: that is the row the
-  // user should open next
-  if (bot.tasks?.some((t) => t.state === "needs-you")) return "Waiting for you…";
-  if (bot.busy) return "Working…";
-  return previewLine(bot.messages[bot.messages.length - 1]);
-}
 
 interface MenuState {
-  botId: string;
+  kind: "agent" | "room";
+  id: string;
   x: number;
   y: number;
 }
 
-/** What is being filed under a section right now, if anything. */
+/** A row being moved right now, by the picker or by hand. */
 interface FilingState {
-  kind: "bot" | "room";
+  kind: "agent" | "room";
   id: string;
   name: string;
   current: string | null;
+  pinned: boolean;
+}
+
+/** Puts a row somewhere: a section, held or not, and a place among the
+ * pins. The picker, a drop and Pin in the menu all end here, so the ways
+ * of moving a row can never come to mean different things. */
+function placeIn(dispatch: React.Dispatch<Action>, row: FilingState, to: Place) {
+  dispatch({ type: "placeRow", kind: row.kind, id: row.id, section: to.section, pinned: to.pinned, position: to.position });
+}
+
+/** Files a row under a section, or takes it out of one with null. A
+ * pinned row stays pinned, after the pins already there. */
+function fileUnder(dispatch: React.Dispatch<Action>, row: FilingState, section: string | null) {
+  placeIn(dispatch, row, { section, pinned: row.pinned });
+}
+
+/** What a row in the full list is drawn from: the agent or room itself,
+ * and what its place is decided by, with activity held still while the
+ * pointer is over the list (see Sidebar). */
+type Row = (Listed & { kind: "agent"; bot: Bot }) | (Listed & { kind: "room"; room: Blok });
+
+/** Where a row in hand would land if let go now. */
+interface RowDrop extends Place {
+  line?: Landing["line"];
+  /** Into another section than its own, which lights the section up. */
+  filing?: boolean;
+}
+
+/** The line a drop would land on, drawn in the gap above or below a row. */
+function DropLine({ edge }: { edge: "top" | "bottom" }) {
+  return (
+    <span
+      className={cn(
+        "pointer-events-none absolute inset-x-2 z-10 h-0.5 rounded-full bg-brand",
+        edge === "top" ? "-top-px" : "-bottom-px",
+      )}
+    />
+  );
+}
+
+/** What lets a row be dragged into another section, or to another place
+ * among the pins of its own. The browser holds off until the pointer has
+ * travelled a few pixels, so a click that does not move is still a click
+ * and opens the row as it always has. */
+function rowDrag(row: FilingState, onDrag?: (row: FilingState | null) => void) {
+  if (!onDrag) return {};
+  return {
+    draggable: true,
+    onDragStart: (e: React.DragEvent<HTMLElement>) => {
+      e.dataTransfer.setData(ROW_TYPE, row.id);
+      e.dataTransfer.effectAllowed = "move";
+      onDrag(row);
+      // Heard on the row itself rather than through React: a drop that
+      // files the row redraws it in another part of the list, and the
+      // old row, which is the one the drag ends on, is out of the page
+      // by then and passes nothing up.
+      e.currentTarget.addEventListener("dragend", () => onDrag(null), { once: true });
+    },
+  };
 }
 
 /**
@@ -76,17 +153,17 @@ interface FilingState {
 function SectionPicker({ filing, onClose }: { filing: FilingState; onClose: () => void }) {
   const { state, dispatch } = useStore();
   const [draft, setDraft] = useState("");
-  const names = sectionNames(
-    state.bots.filter((b) => !b.hidden),
-    state.bloks,
+  // listed in the same order as the sidebar's headings
+  const names = orderSections(
+    sectionNames(
+      state.bots.filter((b) => !b.hidden),
+      state.bloks,
+    ),
+    state.sectionOrder,
   );
 
   const fileTo = (section: string | null) => {
-    if (filing.kind === "bot") {
-      dispatch({ type: "updateBot", botId: filing.id, patch: { section } });
-    } else {
-      dispatch({ type: "patchRoom", blokId: filing.id, patch: { section } });
-    }
+    fileUnder(dispatch, filing, section);
     onClose();
   };
 
@@ -152,7 +229,16 @@ function SectionPicker({ filing, onClose }: { filing: FilingState; onClose: () =
   );
 }
 
-function BotContextMenu({
+/** A row as it is moved: its name, its section and whether it is pinned. */
+function filingOf(kind: "agent", row: Bot): FilingState;
+function filingOf(kind: "room", row: Blok): FilingState;
+function filingOf(kind: "agent" | "room", row: Bot | Blok): FilingState {
+  return { kind, id: row.id, name: row.name, current: row.section ?? null, pinned: Boolean(row.pinned) };
+}
+
+/** Right-click on a row. A room's menu is the part of an agent's that
+ * applies to a room: where it sits in the sidebar. */
+function RowMenu({
   menu,
   onClose,
   onFile,
@@ -162,7 +248,8 @@ function BotContextMenu({
   onFile: (filing: FilingState) => void;
 }) {
   const { state, dispatch } = useStore();
-  const bot = state.bots.find((b) => b.id === menu.botId);
+  const bot = menu.kind === "agent" ? state.bots.find((b) => b.id === menu.id) : undefined;
+  const room = menu.kind === "room" ? state.bloks.find((b) => b.id === menu.id) : undefined;
 
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
@@ -179,9 +266,13 @@ function BotContextMenu({
     };
   }, [onClose]);
 
-  if (!bot) return null;
+  const filing = bot ? filingOf("agent", bot) : room ? filingOf("room", room) : null;
+  if (!filing) return null;
+
+  const general = bot?.tasks?.[0];
+
   // keep the menu on-screen near the click
-  const top = Math.min(menu.y, window.innerHeight - 300);
+  const top = Math.min(menu.y, window.innerHeight - (bot ? 372 : 100));
   const left = Math.min(menu.x, window.innerWidth - 220);
 
   const item = (
@@ -208,29 +299,34 @@ function BotContextMenu({
     </button>
   );
   const divider = (key: string) => <div key={key} className="mx-2 my-1 h-px bg-border" />;
+  // Pinning from here holds it after the pins already in its section;
+  // dragging is how it gets a particular place.
+  const pin = item(
+    filing.pinned ? (
+      <PinOff size={15} className="text-muted-foreground" />
+    ) : (
+      <Pin size={15} className="text-muted-foreground" />
+    ),
+    filing.pinned ? "Unpin" : "Pin",
+    () => placeIn(dispatch, filing, { section: filing.current, pinned: !filing.pinned }),
+  );
+  const move = item(<Folder size={15} className="text-muted-foreground" />, "Move to section…", () => onFile(filing));
 
   return (
     <div
       data-bot-menu
       style={{ top, left }}
-      className="fixed z-40 w-[208px] animate-pop-in rounded-xl border bg-popover p-1 shadow-lg shadow-[--shadow-color]"
+      className="fixed z-40 w-[208px] animate-pop-in rounded-xl border bg-popover p-1 shadow-lg shadow-(color:--shadow-color)"
     >
-      {[
+      {!bot ? [pin, move] : [
+        pin,
+        // the agent stands for General, so that is the conversation it marks
         item(
-          bot.pinned ? (
-            <PinOff size={15} className="text-muted-foreground" />
-          ) : (
-            <Pin size={15} className="text-muted-foreground" />
-          ),
-          bot.pinned ? "Unpin" : "Pin",
-          () => dispatch({ type: "updateBot", botId: bot.id, patch: { pinned: !bot.pinned } }),
+          <BellDot size={15} className="text-muted-foreground" />,
+          "Mark as unread",
+          () => general && dispatch({ type: "markLaneUnread", botId: bot.id, taskId: general.id }),
         ),
-        item(<BellDot size={15} className="text-muted-foreground" />, "Mark as unread", () =>
-          dispatch({ type: "markUnread", botId: bot.id }),
-        ),
-        item(<Folder size={15} className="text-muted-foreground" />, "Move to section…", () =>
-          onFile({ kind: "bot", id: bot.id, name: bot.name, current: bot.section ?? null }),
-        ),
+        move,
         divider("d1"),
         item(<Pencil size={15} className="text-muted-foreground" />, "Edit profile", () => {
           dispatch({ type: "select", id: bot.id });
@@ -243,8 +339,35 @@ function BotContextMenu({
           void navigator.clipboard?.writeText(bot.threadId);
         }),
         divider("d2"),
-        // One reversible action here, and the irreversible one behind the
-        // drawer where the confirm can name what goes. Archiving takes
+        // The chat shows no tabs while an agent has one conversation
+        // (GitHub 237), so a second one starts here as well as from the +
+        // the conversations view puts on the row.
+        item(<Plus size={15} className="text-muted-foreground" />, "New conversation", () => {
+          dispatch({ type: "select", id: bot.id });
+          dispatch({ type: "newTask", botId: bot.id });
+        }),
+        // a goal for General, which is the conversation this row stands for
+        general &&
+          !general.noGoals &&
+          item(<Target size={15} className="text-muted-foreground" />, general.goal ? "Set a new goal" : "Set a goal", () => {
+            dispatch({ type: "select", id: bot.id, lane: general.id });
+            dispatch({ type: "openGoal", botId: bot.id, taskId: general.id });
+          }),
+        // General is cleared, never closed; not while it is working
+        general &&
+          general.state !== "working" &&
+          item(
+            <Eraser size={15} />,
+            "Clear conversation",
+            () => {
+              if (window.confirm("Clear this conversation? Its messages are deleted.")) {
+                dispatch({ type: "clearTask", botId: bot.id, taskId: general.id });
+              }
+            },
+            { danger: true },
+          ),
+        // Archiving is reversible, so it lives here; deleting the agent is
+        // behind the drawer where the confirm can name what goes. Archiving takes
         // the agent out of the list and stops it working; it keeps the
         // conversations, the rules, the rooms and the key.
         item(<Archive size={15} className="text-muted-foreground" />, "Archive", () =>
@@ -258,24 +381,36 @@ function BotContextMenu({
 function BotListItem({
   bot,
   onMenu,
+  onDrag,
   rail,
+  compact,
 }: {
   bot: Bot;
   onMenu: (menu: MenuState) => void;
+  /** Given in the full list, where a row can be dragged to a place. */
+  onDrag?: (row: FilingState | null) => void;
   rail?: boolean;
+  /** The conversations view: one line per agent, with its other
+   * conversations listed underneath instead of one conversation's preview. */
+  compact?: boolean;
 }) {
   const { state, dispatch } = useStore();
   const selected = state.selectedId === bot.id;
-  const last = bot.messages[bot.messages.length - 1];
+  const heardAt = lastHeardAt(bot);
+  const drag = rowDrag(filingOf("agent", bot), onDrag);
   if (rail) {
     // the collapsed sidebar: just the face, with the unread dot riding
     // the avatar the way the phone app does it
     return (
       <button
+        // what ⌥↑ and ⌥↓ step through (Shortcuts.tsx): which row this
+        // is, and whether it is unread or waiting on you
+        data-sidebar-row={bot.id}
+        data-sidebar-waiting={Boolean(bot.unread || bot.tasks?.some((t) => t.state === "needs-you"))}
         onClick={() => dispatch({ type: "select", id: bot.id })}
         onContextMenu={(e) => {
           e.preventDefault();
-          onMenu({ botId: bot.id, x: e.clientX, y: e.clientY });
+          onMenu({ kind: "agent", id: bot.id, x: e.clientX, y: e.clientY });
         }}
         title={bot.name}
         className={cn(
@@ -290,13 +425,79 @@ function BotListItem({
       </button>
     );
   }
+  if (compact) {
+    // the agent's row is General; the others are listed beneath it
+    const general = bot.tasks?.[0];
+    const generalOpen = selected && (bot.activeTaskId ?? bot.threadId) === general?.id;
+    const timestamp = general ? (general.lastAt ?? general.createdAt) : 0;
+
+    return (
+      <div
+        className="group/agent relative"
+        data-sidebar-row={bot.id}
+        data-sidebar-waiting={Boolean(bot.unread || bot.tasks?.some((t) => t.state === "needs-you"))}
+      >
+        <button
+          onClick={() => dispatch({ type: "select", id: bot.id, lane: general?.id })}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            onMenu({ kind: "agent", id: bot.id, x: e.clientX, y: e.clientY });
+          }}
+          {...drag}
+          className={cn(
+            "flex h-[38px] w-full items-center gap-2.5 rounded-xl px-2.5 text-left transition-[background-color,scale] duration-150 ease-out active:scale-[0.99]",
+            generalOpen ? "bg-accent" : "hover:bg-accent/60",
+          )}
+        >
+          <AgentAvatar bot={bot} size={24} />
+          {/* No pin on the row: the line under a list's last pin says what
+              is held, and every name starts on the same edge. */}
+          <span className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-foreground">{bot.name}</span>
+          {/* the trailing state steps aside for the + on hover, all of it,
+              so the two never sit on top of each other */}
+          <span className="flex shrink-0 items-center gap-1.5 transition-opacity duration-150 group-hover/agent:opacity-0">
+            {general && <LaneRing lane={general} />}
+            {general?.state === "needs-you" ? (
+              <span className="text-[11px] text-warning">waiting</span>
+            ) : general?.state === "working" ? (
+              <Loader2
+                size={12}
+                className="animate-spin text-brand motion-reduce:animate-none"
+                aria-label="working"
+              />
+            ) : (
+              timestamp > 0 && (
+                <span className="text-[11px] tabular-nums text-muted-foreground/80">{formatWhen(timestamp)}</span>
+              )
+            )}
+            {general?.unread && <span className="size-1.5 rounded-full bg-brand" />}
+          </span>
+        </button>
+        {/* a new conversation, from the agent it is with */}
+        <button
+          onClick={() => {
+            dispatch({ type: "select", id: bot.id });
+            dispatch({ type: "newTask", botId: bot.id });
+          }}
+          title={`New conversation with ${bot.name}`}
+          aria-label={`New conversation with ${bot.name}`}
+          className="absolute right-1.5 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-[opacity,background-color,color] duration-150 hover:bg-background hover:text-foreground focus-visible:opacity-100 group-hover/agent:opacity-100"
+        >
+          <Plus size={14} />
+        </button>
+      </div>
+    );
+  }
   return (
     <button
+      data-sidebar-row={bot.id}
+      data-sidebar-waiting={Boolean(bot.unread || bot.tasks?.some((t) => t.state === "needs-you"))}
       onClick={() => dispatch({ type: "select", id: bot.id })}
       onContextMenu={(e) => {
         e.preventDefault();
-        onMenu({ botId: bot.id, x: e.clientX, y: e.clientY });
+        onMenu({ kind: "agent", id: bot.id, x: e.clientX, y: e.clientY });
       }}
+      {...drag}
       className={cn(
         "flex w-full items-center gap-3 rounded-xl px-2.5 py-2 text-left transition-[background-color,transform] duration-150 active:scale-[0.99]",
         selected ? "bg-accent" : "hover:bg-accent/60",
@@ -305,13 +506,10 @@ function BotListItem({
       <AgentAvatar bot={bot} size={42} />
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline justify-between gap-2">
-          <span className="flex min-w-0 items-center gap-1.5 truncate text-[14px] font-semibold text-foreground">
-            {bot.pinned && <Pin size={11} className="shrink-0 text-muted-foreground" />}
-            <span className="truncate">{bot.name}</span>
-          </span>
-          {last && (
+          <span className="min-w-0 truncate text-[14px] font-semibold text-foreground">{bot.name}</span>
+          {heardAt !== undefined && (
             <span className="shrink-0 text-[11.5px] tabular-nums text-muted-foreground">
-              {formatWhen(last.at)}
+              {formatWhen(heardAt)}
             </span>
           )}
         </div>
@@ -322,9 +520,13 @@ function BotListItem({
               bot.unread ? "font-medium text-foreground" : "text-muted-foreground",
             )}
           >
-            {preview(bot)}
+            {agentPreview(bot)}
           </span>
-          {bot.unread && <span className="size-2 shrink-0 rounded-full bg-brand" />}
+          {bot.busy && !bot.tasks?.some((t) => t.state === "needs-you") ? (
+            <Loader2 size={13} className="shrink-0 animate-spin text-brand motion-reduce:animate-none" aria-label="working" />
+          ) : (
+            bot.unread && <span className="size-2 shrink-0 rounded-full bg-brand" />
+          )}
         </div>
       </div>
     </button>
@@ -334,23 +536,28 @@ function BotListItem({
 function RoomListItem({
   blok,
   rail,
-  onFile,
+  onMenu,
+  onDrag,
 }: {
   blok: Blok;
   rail?: boolean;
-  onFile?: (filing: FilingState) => void;
+  onMenu?: (menu: MenuState) => void;
+  /** Given in the full list, where a row can be dragged to a place. */
+  onDrag?: (row: FilingState | null) => void;
 }) {
   const { state, dispatch } = useStore();
   const selected = state.selectedId === blok.id;
   const members = blok.memberIds
     .map((id) => state.bots.find((b) => b.id === id))
     .filter(Boolean) as Bot[];
-  const last = blok.messages[blok.messages.length - 1];
-  const working = members.filter((m) => m.busy);
+  const last = lastSaid(blok.messages);
+  // working in this room, as the room itself shows it (workingInRoom)
+  const working = members.filter((m) => workingInRoom(m, blok.id));
 
   if (rail) {
     return (
       <button
+        data-sidebar-row={blok.id}
         onClick={() => dispatch({ type: "select", id: blok.id })}
         title={blok.name}
         className={cn(
@@ -370,12 +577,14 @@ function RoomListItem({
   }
   return (
     <button
+      data-sidebar-row={blok.id}
       onClick={() => dispatch({ type: "select", id: blok.id })}
       onContextMenu={(e) => {
-        if (!onFile) return;
+        if (!onMenu) return;
         e.preventDefault();
-        onFile({ kind: "room", id: blok.id, name: blok.name, current: blok.section ?? null });
+        onMenu({ kind: "room", id: blok.id, x: e.clientX, y: e.clientY });
       }}
+      {...rowDrag(filingOf("room", blok), onDrag)}
       className={cn(
         "flex w-full items-center gap-3 rounded-xl px-2.5 py-2 text-left transition-[background-color,transform] duration-150 active:scale-[0.99]",
         selected ? "bg-accent" : "hover:bg-accent/60",
@@ -410,7 +619,7 @@ function RoomListItem({
             ? `${working.map((m) => m.name).join(", ")} working…`
             : last
               ? previewLine(last)
-              : `${members.length} agents`}
+              : plural(members.length, "agent")}
         </div>
       </div>
     </button>
@@ -471,14 +680,44 @@ function useActivityCount(): { running: number; waiting: number; suggested: numb
   return count;
 }
 
+/**
+ * How many security checkup findings are risky, for the dot on Settings.
+ * Asked again every ten minutes while the window shows, when Settings
+ * closes (where most fixes are made), and when an agent goes into or out
+ * of full access from its own settings, the commonest risky finding.
+ */
+function useSecurityRisky(): number {
+  const { state } = useStore();
+  const { report } = useSecurityCheckup();
+  const visible = usePageVisible();
+  useEffect(() => {
+    if (!visible) return;
+    const timer = setInterval(() => void refreshCheckup(), 10 * 60_000);
+    return () => clearInterval(timer);
+  }, [visible]);
+  const settingsOpen = state.appSettingsOpen;
+  const fullAccess = state.bots
+    .filter((b) => b.approvals === "full")
+    .map((b) => b.id)
+    .join(",");
+  const seen = useRef({ settingsOpen, fullAccess });
+  useEffect(() => {
+    const before = seen.current;
+    seen.current = { settingsOpen, fullAccess };
+    if ((before.settingsOpen && !settingsOpen) || before.fullAccess !== fullAccess) void refreshCheckup();
+  }, [settingsOpen, fullAccess]);
+  return riskyCount(report);
+}
+
 export function Sidebar() {
   const { state, dispatch } = useStore();
-  const { resolvedTheme, setTheme } = useTheme();
+  const [conversations, setConversations] = useConversationsView();
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [filing, setFiling] = useState<FilingState | null>(null);
   const activity = useActivityCount();
   const rehearsalsReady = useRehearsalsReady();
   const notesWaiting = (useProfileNotes().notes ?? []).filter((n) => n.state === "suggested").length;
+  const securityRisky = useSecurityRisky();
   const latestBrief = useBriefs().data?.briefs[0];
   const briefNew = Boolean(latestBrief && !latestBrief.readAt && !latestBrief.quiet);
   const [showArchived, setShowArchived] = useState(false);
@@ -512,6 +751,9 @@ export function Sidebar() {
     };
   }, []);
   const rail = choice ?? narrow;
+  useEffect(() => {
+    setLanesInSidebar(conversations && !rail && !mobile);
+  }, [conversations, rail, mobile]);
   const [logoHover, setLogoHover] = useState(false);
   const toggleCollapsed = () => {
     const next = !rail;
@@ -535,17 +777,137 @@ export function Sidebar() {
     localStorage.setItem("bloks-folded-sections", JSON.stringify(next));
   };
 
-  // ⌘N new agent, ⌘K focus search, the two things you do most
+  // The order sections are dragged into, by name. Kept with the workspace,
+  // unlike folding, so the Mac and the phone list them the same way;
+  // until someone drags one, they stay alphabetical.
+  const saveSectionOrder = (next: string[]) => dispatch({ type: "moveSections", order: next });
+  // which heading a dragged section would land against, and on which side
+  const [sectionDrop, setSectionDrop] = useState<{ name: string; place: "before" | "after" } | null>(null);
+
+  // What is not pinned sorts by the last time it had something to do with
+  // you, which moves while you are looking. While the pointer is over the
+  // list that part holds still, as it stood when the pointer arrived, so a
+  // row cannot slide away just as it is clicked; the list catches up when
+  // the pointer leaves. Pins, sections and drops are your own doing and
+  // show at once.
+  const [heldActivity, setHeldActivity] = useState<Map<string, number> | null>(null);
+  const holdActivity = () =>
+    setHeldActivity(
+      new Map([...state.bots, ...state.bloks].map((row) => [row.id, row.activeWithYouAt ?? 0] as const)),
+    );
+
+  // Moving by drag, which files exactly as Move to section does and also
+  // places: dropped among a list's pins, a row takes that place and is
+  // pinned; dropped below them, it sorts by activity. Three pieces: the
+  // row in hand, read by each list as it passes over; the same row for
+  // drawing, which catches up a moment later (see below); and where it
+  // would land if let go now.
+  const draggedRow = useRef<FilingState | null>(null);
+  const [dragging, setDragging] = useState<FilingState | null>(null);
+  const [rowDrop, setRowDrop] = useState<RowDrop | null>(null);
+  const onRowDrag = (row: FilingState | null) => {
+    draggedRow.current = row;
+    if (row) {
+      // Redrawing the list inside dragstart can make the browser give up
+      // on the drag, and would shift the row before its picture is
+      // taken, so the list only hears about it once the drag is under way.
+      setTimeout(() => setDragging(draggedRow.current));
+    } else {
+      setDragging(null);
+      setRowDrop(null);
+    }
+  };
+  /**
+   * Where the row in hand lands if let go over this list now, or null
+   * when that would leave it exactly where it is. `drawn` is the list as
+   * it is on screen for this row: a section's rows, or in the unfiled
+   * list only the Rooms or the Agents, since a room let go among the
+   * agents still stands with the rooms. A row under the pointer sets the
+   * place (landingOver); anywhere else in the list, the heading of a
+   * folded section included, files it and keeps whatever pin it has.
+   */
+  const planDrop = (
+    row: FilingState,
+    section: string | null,
+    drawn: readonly Listed[],
+    e: React.DragEvent<HTMLElement>,
+  ): RowDrop | null => {
+    const over = (e.target as HTMLElement).closest<HTMLElement>("[data-row]");
+    const overId = over?.dataset.row;
+    let landing: Landing = { pinned: row.pinned };
+    if (over && overId && drawn.some((r) => r.id === overId)) {
+      const box = over.getBoundingClientRect();
+      landing = landingOver(drawn, row.id, overId, e.clientY < box.top + box.height / 2 ? "top" : "bottom");
+    }
+    // The place is counted among every pin in the section, not only the
+    // ones a search or a project is showing, so a hidden pin keeps its own.
+    const everything = sidebarRows(state);
+    const pins = sidebarOrder(everything.filter((r) => r.id !== row.id && r.pinned && (r.section ?? null) === section));
+    const to: Place = {
+      section,
+      pinned: landing.pinned,
+      ...(landing.pinned && landing.line ? { position: pinPosition(pins, landing.line) } : {}),
+    };
+    const from = placeOfRow(everything, row.id);
+    if (!from || !movesRow(from, to)) return null;
+    return landing.line ? { ...to, line: landing.line } : to;
+  };
+  // Each section, and the unfiled list, answers only to a row, and only
+  // where letting go would change something: another section, or another
+  // place among the pins of its own. A heading being dragged passes over
+  // them untouched.
+  const fileZone = (section: string | null, drawn: (kind: FilingState["kind"]) => readonly Listed[]) => ({
+    onDragOver: (e: React.DragEvent<HTMLElement>) => {
+      const row = draggedRow.current;
+      if (!row || !e.dataTransfer.types.includes(ROW_TYPE)) return;
+      const plan = planDrop(row, section, drawn(row.kind), e);
+      if (!plan) {
+        setRowDrop((d) => (d?.section === section ? null : d));
+        return;
+      }
+      e.preventDefault();
+      // the list lights up only for a row coming in from elsewhere; inside
+      // its own, the line alone says where it goes
+      const filing = acceptsRow(e.dataTransfer.types, row.current, section);
+      setRowDrop((d) =>
+        d &&
+        d.section === plan.section &&
+        d.filing === filing &&
+        d.pinned === plan.pinned &&
+        d.position === plan.position &&
+        d.line?.id === plan.line?.id &&
+        d.line?.edge === plan.line?.edge
+          ? d
+          : { ...plan, filing },
+      );
+    },
+    onDragLeave: (e: React.DragEvent<HTMLElement>) => {
+      // Crossing from one row to the next fires a leave as well; the
+      // pointer has only left once it is outside the whole box.
+      const box = e.currentTarget.getBoundingClientRect();
+      if (e.clientX > box.left && e.clientX < box.right && e.clientY > box.top && e.clientY < box.bottom) return;
+      setRowDrop((d) => (d?.section === section ? null : d));
+    },
+    onDrop: (e: React.DragEvent<HTMLElement>) => {
+      const row = draggedRow.current;
+      if (!row || !e.dataTransfer.types.includes(ROW_TYPE)) return;
+      const plan = planDrop(row, section, drawn(row.kind), e);
+      if (!plan) return;
+      e.preventDefault();
+      onRowDrag(null);
+      placeIn(dispatch, row, plan);
+    },
+  });
+
+  // ⌘N for a new agent. ⌘K is the command palette's (CommandPalette.tsx),
+  // which searches everything this box does and more; both answering it
+  // meant two things grabbing focus at once.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!e.metaKey && !e.ctrlKey) return;
       if (e.key === "n") {
         e.preventDefault();
         dispatch({ type: "toggleNewAgent", open: true });
-      } else if (e.key === "k") {
-        e.preventDefault();
-        searchRef.current?.focus();
-        searchRef.current?.select();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -588,25 +950,57 @@ export function Sidebar() {
           (b) =>
             !query.trim() ||
             `${b.name} ${b.title}`.toLowerCase().includes(query.trim().toLowerCase()),
-        )
-        .sort((a, b) => Number(b.pinned ?? false) - Number(a.pinned ?? false)),
+        ),
     [state.bots, query, projectMembers],
   );
+
+  // The whole list in the one order every surface follows (sidebarLayout
+  // in src/lib/sections.ts), with activity held still under the pointer.
+  const layout = useMemo(() => {
+    const rows: Row[] = [
+      ...state.bloks.map((room) => ({
+        kind: "room" as const,
+        id: room.id,
+        section: room.section ?? null,
+        pinned: room.pinned,
+        pinOrder: room.pinOrder,
+        activeWithYouAt: heldActivity?.get(room.id) ?? room.activeWithYouAt,
+        createdAt: room.createdAt,
+        room,
+      })),
+      ...visibleBots.map((bot) => ({
+        kind: "agent" as const,
+        id: bot.id,
+        section: bot.section ?? null,
+        pinned: bot.pinned,
+        pinOrder: bot.pinOrder,
+        activeWithYouAt: heldActivity?.get(bot.id) ?? bot.activeWithYouAt,
+        createdAt: bot.createdAt,
+        bot,
+      })),
+    ];
+    return sidebarLayout(rows, state.sectionOrder);
+  }, [state.bloks, visibleBots, heldActivity, state.sectionOrder]);
 
   const newMenuItems = (
     <DropdownMenuContent align="end" className="min-w-[160px]">
       <DropdownMenuItem onClick={() => dispatch({ type: "toggleNewAgent", open: true })}>
         <BotIcon size={15} />
-        New Bot
+        New agent
       </DropdownMenuItem>
       <DropdownMenuItem onClick={() => dispatch({ type: "toggleNewRoom", open: true })}>
         <Users size={15} />
-        New Room
+        New room
       </DropdownMenuItem>
-      {/* On a phone the footer is gone, so everything that lives there
-          has to be here instead. All four of them: a surface with no way
-          in on the device somebody is holding is a surface that does not
-          exist for them. */}
+      {/* On a phone the footer is gone, so everything behind it has to
+          be here instead: a surface with no way in on the device somebody
+          is holding is a surface that does not exist for them. */}
+      {mobile && (
+        <DropdownMenuItem onClick={() => dispatch({ type: "toggleBrief", open: true })}>
+          <Sunrise size={15} />
+          Morning brief
+        </DropdownMenuItem>
+      )}
       {mobile && (
         <DropdownMenuItem onClick={() => dispatch({ type: "toggleActivity", open: true })}>
           <Activity size={15} />
@@ -679,28 +1073,74 @@ export function Sidebar() {
             </DropdownMenuTrigger>
             {newMenuItems}
           </DropdownMenu>
-          <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto px-0.5">
-            {state.bloks.map((b) => (
-              <RoomListItem key={b.id} blok={b} rail />
-            ))}
-            {visibleBots.map((b) => (
-              <BotListItem key={b.id} bot={b} onMenu={setMenu} rail />
-            ))}
+          <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto px-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {layoutRows(layout).map((row) =>
+              row.kind === "room" ? (
+                <RoomListItem key={row.id} blok={row.room} rail />
+              ) : (
+                <BotListItem key={row.id} bot={row.bot} onMenu={setMenu} rail />
+              ),
+            )}
           </div>
           <button
             onClick={() => dispatch({ type: "toggleAppSettings" })}
             title="Settings"
-            className="rounded-lg p-1.5 text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
+            aria-label={securityRisky > 0 ? "Settings, security checkup found something risky" : "Settings"}
+            className="relative rounded-lg p-1.5 text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
           >
             <SettingsIcon size={16} />
+            {securityRisky > 0 && <span className="absolute right-1 top-1 size-1.5 rounded-full bg-destructive ring-2 ring-sidebar" />}
           </button>
         </header>
-        {menu && <BotContextMenu menu={menu} onClose={() => setMenu(null)} onFile={setFiling} />}
+        {menu && <RowMenu menu={menu} onClose={() => setMenu(null)} onFile={setFiling} />}
         {filing && <SectionPicker filing={filing} onClose={() => setFiling(null)} />}
         {showArchived && <ArchivedAgents onClose={() => setShowArchived(false)} />}
       </>
     );
   }
+
+  const unfiledRooms = layout.unfiled.rooms;
+  const unfiledBots = layout.unfiled.agents;
+  // Rows drag wherever there is a place to put them: into a section, or
+  // to a place among the pins of their own list. Never on the rail.
+  const fileDrag = !rail ? onRowDrag : undefined;
+  // The unfiled list is the way out of a section. With everything on
+  // show filed it has no rows to let go over, so while a filed row is in
+  // hand it opens a place for one.
+  const unfiling = !unfiledRooms.length && !unfiledBots.length ? (dragging?.current ?? null) : null;
+  const searching = Boolean(query.trim());
+
+  /** One list as it is drawn: each row with the line a drop would land
+   * on, and a hairline under the last pin when rows sorted by activity
+   * follow it. That line is the whole of what pinning shows: above it is
+   * held in your order, below it moves with what you are doing. */
+  const drawList = (rows: readonly Row[], folded = false) =>
+    rows.map((row, i) => {
+      const line = rowDrop?.line?.id === row.id ? rowDrop.line.edge : null;
+      const next = rows[i + 1];
+      return (
+        <div key={row.id} className="flex flex-col">
+          <div data-row={row.id} className="relative flex flex-col">
+            {line && <DropLine edge={line} />}
+            {row.kind === "room" ? (
+              <RoomListItem blok={row.room} onMenu={setMenu} onDrag={fileDrag} />
+            ) : (
+              <>
+                <BotListItem bot={row.bot} onMenu={setMenu} onDrag={fileDrag} compact={conversations} />
+                <ConversationRows bot={row.bot} open={conversations && !folded} />
+              </>
+            )}
+          </div>
+          {row.pinned && next && !next.pinned && (
+            <div
+              role="separator"
+              aria-label="Pinned above, most recent with you below"
+              className="mx-3 my-1 h-px bg-border/70"
+            />
+          )}
+        </div>
+      );
+    });
 
   return (
     <aside
@@ -828,184 +1268,184 @@ export function Sidebar() {
         </button>
       )}
 
+      <WaitingRow rail={rail} />
+
       {/* The list. Filed rows stand under their section's heading; the
           unfiled majority keeps the plain Rooms and Agents lists it has
           always had, so sections cost nothing until the first one is
-          named. The rail has no room for headings and stays flat. */}
-      <div className="flex-1 overflow-y-auto px-2 pt-1">
-        <div className={cn("flex flex-col", rail ? "gap-1" : "gap-px")}>
-          {(rail ? state.bloks : inSection(state.bloks, null)).length > 0 && (
-            <>
-              {!rail && (
-                <div className="flex items-center justify-between px-2.5 pb-1 pt-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
-                  Rooms
-                  <button
-                    onClick={() => dispatch({ type: "toggleNewRoom", open: true })}
-                    className="rounded p-0.5 transition-colors hover:text-foreground"
-                    title="New room"
-                  >
-                    <Plus size={12} />
-                  </button>
-                </div>
-              )}
-              {(rail ? state.bloks : inSection(state.bloks, null)).map((b) => (
-                <RoomListItem key={b.id} blok={b} rail={rail} onFile={setFiling} />
-              ))}
-              {rail ? (
-                <div className="mx-3 my-1 border-t" />
+          named. Inside each list, pins first in your order, then the
+          rest by recent activity with you. The rail has no room for
+          headings and runs the same order flat. */}
+      <div
+        className="flex-1 overflow-y-auto px-2 pt-1"
+        onMouseEnter={holdActivity}
+        onMouseLeave={() => setHeldActivity(null)}
+      >
+        {rail ? (
+          <div className="flex flex-col gap-1">
+            {unfiledRooms.map((row) => row.kind === "room" && <RoomListItem key={row.id} blok={row.room} rail />)}
+            {/* the rooms at the top keep the line that always set them apart */}
+            {unfiledRooms.length > 0 && <div className="mx-3 my-1 border-t" />}
+            {[...unfiledBots, ...layout.sections.flatMap((s) => s.rows)].map((row) =>
+              row.kind === "room" ? (
+                <RoomListItem key={row.id} blok={row.room} rail />
               ) : (
-                <div className="px-2.5 pb-1 pt-3 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
-                  Agents
+                <BotListItem key={row.id} bot={row.bot} onMenu={setMenu} rail />
+              ),
+            )}
+          </div>
+        ) : (
+        <div className="flex flex-col gap-px">
+          {(unfiledRooms.length > 0 || unfiledBots.length > 0 || unfiling) && (
+            <div
+              {...fileZone(null, (kind) => (kind === "room" ? unfiledRooms : unfiledBots))}
+              className={cn(
+                "flex flex-col gap-px rounded-xl transition-colors duration-150",
+                rowDrop?.section === null && rowDrop.filing && "bg-brand-soft",
+              )}
+            >
+              {unfiledRooms.length > 0 && (
+                <>
+                  <div className="flex items-center justify-between px-2.5 pb-1 pt-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+                    Rooms
+                    <button
+                      onClick={() => dispatch({ type: "toggleNewRoom", open: true })}
+                      className="rounded p-0.5 transition-colors hover:text-foreground"
+                      title="New room"
+                    >
+                      <Plus size={12} />
+                    </button>
+                  </div>
+                  {drawList(unfiledRooms)}
+                  <div className="flex items-center justify-between px-2.5 pb-1 pt-3 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+                    Agents
+                    <button
+                      onClick={() => setConversations(!conversations)}
+                      aria-pressed={conversations}
+                      className={cn(
+                        "rounded p-0.5 transition-colors hover:text-foreground",
+                        conversations && "text-foreground",
+                      )}
+                      title={conversations ? "Hide conversations" : "Show each agent's conversations"}
+                    >
+                      <ListTree size={12} />
+                    </button>
+                  </div>
+                </>
+              )}
+              {drawList(unfiledBots)}
+              {unfiling && (
+                <div
+                  className={cn(
+                    "rounded-xl border border-dashed px-2.5 py-2 text-center text-[12px] text-muted-foreground transition-colors duration-150",
+                    rowDrop?.section === null && "border-brand/40 text-foreground",
+                  )}
+                >
+                  Remove from {unfiling}
                 </div>
               )}
-            </>
+            </div>
           )}
-          {(rail ? visibleBots : inSection(visibleBots, null)).map((b) => (
-            <BotListItem key={b.id} bot={b} onMenu={setMenu} rail={rail} />
-          ))}
-          {!rail &&
-            sectionNames(visibleBots, state.bloks).map((name) => {
-              const rooms = inSection(state.bloks, name);
-              const bots = inSection(visibleBots, name);
-              if (!rooms.length && !bots.length) return null;
-              const isFolded = folded.includes(name);
-              const searching = Boolean(query.trim());
-              // A folded heading still says something is waiting inside.
-              const waiting = isFolded && !searching && bots.some((b) => b.unread);
-              return (
-                <div key={name} className="flex flex-col gap-px">
-                  <button
-                    onClick={() => toggleFolded(name)}
-                    aria-expanded={!isFolded}
-                    title={isFolded ? "Show this section" : "Fold this section"}
-                    className="flex items-center gap-1.5 rounded px-2.5 pb-1 pt-3 text-left text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground transition-colors hover:text-foreground"
-                  >
-                    <Folder size={11} className="shrink-0" />
-                    <span className="truncate">{name}</span>
-                    {isFolded && !searching && (
-                      <span className="shrink-0 normal-case tracking-normal">{rooms.length + bots.length}</span>
+          {layout.sections.map(({ name, rows }, index) => {
+            const shownSections = layout.sections.map((s) => s.name);
+            const isFolded = folded.includes(name);
+            const shown = shownInSection(rows, isFolded, state.selectedId, searching);
+            // A folded heading still says something is waiting inside.
+            const waiting = isFolded && !searching && rows.some((row) => row.kind === "agent" && row.bot.unread);
+            const hint = sectionDrop?.name === name ? sectionDrop.place : null;
+            return (
+              <div
+                key={name}
+                // the whole section takes a row, heading and rows alike,
+                // so a folded one still does and stays folded after
+                {...fileZone(name, () => shown)}
+                className={cn(
+                  "relative flex flex-col gap-px rounded-xl transition-colors duration-150",
+                  rowDrop?.section === name && rowDrop.filing && "bg-brand-soft",
+                )}
+              >
+                {hint && (
+                  <span
+                    className={cn(
+                      "pointer-events-none absolute inset-x-2 z-10 h-0.5 rounded-full bg-brand",
+                      hint === "before" ? "top-1" : "-bottom-px",
                     )}
-                    {waiting && <span className="size-1.5 shrink-0 rounded-full bg-brand" />}
-                    <ChevronRight
-                      size={11}
-                      className={cn("ml-auto shrink-0 transition-transform", !isFolded && "rotate-90")}
-                    />
-                  </button>
-                  {shownInSection(rooms, isFolded, state.selectedId, searching).map((b) => (
-                    <RoomListItem key={b.id} blok={b} onFile={setFiling} />
-                  ))}
-                  {shownInSection(bots, isFolded, state.selectedId, searching).map((b) => (
-                    <BotListItem key={b.id} bot={b} onMenu={setMenu} />
-                  ))}
-                </div>
-              );
-            })}
-          {visibleBots.length === 0 && !rail && (
+                  />
+                )}
+                <button
+                  onClick={() => toggleFolded(name)}
+                  aria-expanded={!isFolded}
+                  title={isFolded ? "Show this section. Drag to reorder" : "Fold this section. Drag to reorder"}
+                  // Drag a heading to put the sections in your own order;
+                  // Alt with an arrow key does the same from the keyboard.
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData(SECTION_TYPE, name);
+                    e.dataTransfer.effectAllowed = "move";
+                  }}
+                  onDragOver={(e) => {
+                    if (!e.dataTransfer.types.includes(SECTION_TYPE)) return;
+                    e.preventDefault();
+                    const box = e.currentTarget.getBoundingClientRect();
+                    const place = e.clientY < box.top + box.height / 2 ? "before" : "after";
+                    if (sectionDrop?.name !== name || sectionDrop.place !== place) setSectionDrop({ name, place });
+                  }}
+                  onDragLeave={() => setSectionDrop((d) => (d?.name === name ? null : d))}
+                  onDrop={(e) => {
+                    const dragged = e.dataTransfer.getData(SECTION_TYPE);
+                    setSectionDrop(null);
+                    if (!dragged) return;
+                    e.preventDefault();
+                    saveSectionOrder(moveSection(shownSections, dragged, name, hint ?? "before"));
+                  }}
+                  onDragEnd={() => setSectionDrop(null)}
+                  onKeyDown={(e) => {
+                    if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+                    e.preventDefault();
+                    const neighbour = shownSections[index + (e.key === "ArrowUp" ? -1 : 1)];
+                    if (neighbour) saveSectionOrder(moveSection(shownSections, name, neighbour, e.key === "ArrowUp" ? "before" : "after"));
+                  }}
+                  className="flex cursor-grab items-center gap-1.5 rounded px-2.5 pb-1 pt-3 text-left text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground transition-colors hover:text-foreground active:cursor-grabbing"
+                >
+                  <Folder size={11} className="shrink-0" />
+                  <span className="truncate">{name}</span>
+                  {isFolded && !searching && (
+                    <span className="shrink-0 normal-case tracking-normal">{rows.length}</span>
+                  )}
+                  {waiting && <span className="size-1.5 shrink-0 rounded-full bg-brand" />}
+                  <ChevronRight
+                    size={11}
+                    className={cn("ml-auto shrink-0 transition-transform", !isFolded && "rotate-90")}
+                  />
+                </button>
+                {drawList(shown, isFolded)}
+              </div>
+            );
+          })}
+          {visibleBots.length === 0 && (query || state.hydrated) && (
             <div className="px-3 py-8 text-center text-[13px] text-muted-foreground">
               {query ? "No agents match" : "No agents yet. Create one with +"}
             </div>
           )}
         </div>
+        )}
       </div>
 
-      {/* Footer */}
-      <div className={cn("border-t pb-2 pt-1.5", rail ? "px-2" : "px-2")}>
-        {(
-          [
-            [Sunrise, "Brief", () => dispatch({ type: "toggleBrief", open: true })],
-            [Activity, "Activity", () => dispatch({ type: "toggleActivity", open: true })],
-            [FolderKanban, "Projects", () => dispatch({ type: "toggleProjects", open: true })],
-            [Brain, "Memory", () => dispatch({ type: "toggleMemory", open: true, botId: null })],
-            [FlaskConical, "Rehearsals", () => dispatch({ type: "toggleRehearsals", open: true })],
-            [CalendarClock, "Routines", () => dispatch({ type: "toggleRoutines", open: true })],
-            [Sparkles, "Skills", () => dispatch({ type: "toggleSkills", open: true })],
-            [Puzzle, "Plugins", () => dispatch({ type: "togglePlugins", open: true })],
-          ] as const
-        ).map(([Icon, label, onClick]) => (
-          <button
-            key={label}
-            onClick={onClick}
-            title={label}
-            className={cn(
-              "flex items-center gap-2.5 rounded-lg py-1.5 text-left text-[13px] text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground",
-              rail ? "relative mx-auto px-1.5" : "w-full px-2.5",
-            )}
-          >
-            <Icon size={16} />
-            {!rail && label}
-            {label === "Rehearsals" && rehearsalsReady > 0 && (
-              <span
-                className={cn(
-                  "ml-auto rounded-md bg-primary/12 px-1.5 py-0.5 text-[10.5px] tabular-nums text-foreground",
-                  rail && "absolute right-1 top-0.5 ml-0 px-1",
-                )}
-                title={`${rehearsalsReady} ready to review`}
-              >
-                {rehearsalsReady}
-              </span>
-            )}
-            {label === "Memory" && notesWaiting > 0 && (
-              <span
-                className={cn(
-                  "ml-auto rounded-md bg-primary/12 px-1.5 py-0.5 text-[10.5px] tabular-nums text-foreground",
-                  rail && "absolute right-1 top-0.5 ml-0 px-1",
-                )}
-                title={`${notesWaiting} ready to review`}
-              >
-                {notesWaiting}
-              </span>
-            )}
-            {label === "Brief" && briefNew && (
-              <span
-                className={cn("ml-auto size-2 rounded-full bg-brand", rail && "absolute right-1.5 top-1.5 ml-0")}
-                title="A new brief is ready"
-              />
-            )}
-            {((label === "Activity" && (activity.waiting > 0 || activity.running > 0)) ||
-              (label === "Skills" && activity.suggested > 0)) && (
-              <span
-                className={cn(
-                  "ml-auto rounded-md px-1.5 py-0.5 text-[10.5px] tabular-nums",
-                  label === "Skills" || activity.waiting > 0
-                    ? "bg-warning/15 text-warning"
-                    : "bg-muted text-muted-foreground",
-                  rail && "absolute right-1 top-0.5 ml-0 px-1",
-                )}
-              >
-                {label === "Skills"
-                  ? activity.suggested
-                  : activity.waiting > 0
-                    ? activity.waiting
-                    : activity.running}
-              </span>
-            )}
-          </button>
-        ))}
-        <div className={cn("mt-0.5 flex items-center", rail ? "flex-col gap-0.5" : "gap-0.5")}>
-          <button
-            onClick={() => dispatch({ type: "toggleAppSettings" })}
-            title="Settings"
-            className={cn(
-              "flex items-center gap-2.5 rounded-lg py-1.5 text-left text-[13px] text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground",
-              rail ? "px-1.5" : "min-w-0 flex-1 px-2.5",
-            )}
-          >
-            <SettingsIcon size={16} />
-            {!rail && "Settings"}
-          </button>
-          {!rail && (
-            <button
-              onClick={() => setTheme(resolvedTheme === "dark" ? "light" : "dark")}
-              className="rounded-lg p-1.5 text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground active:scale-95"
-              title={resolvedTheme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-            >
-              {resolvedTheme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
-            </button>
-          )}
-        </div>
-      </div>
+      <UpdateCard rail={rail} />
+      <SidebarFooter
+        rail={rail}
+        counts={{
+          briefNew,
+          waiting: activity.waiting,
+          running: activity.running,
+          rehearsalsReady,
+          skillsSuggested: activity.suggested,
+          notesWaiting,
+          securityRisky,
+        }}
+      />
 
-      {menu && <BotContextMenu menu={menu} onClose={() => setMenu(null)} onFile={setFiling} />}
+      {menu && <RowMenu menu={menu} onClose={() => setMenu(null)} onFile={setFiling} />}
       {filing && <SectionPicker filing={filing} onClose={() => setFiling(null)} />}
       {showArchived && <ArchivedAgents onClose={() => setShowArchived(false)} />}
     </aside>
@@ -1043,8 +1483,13 @@ function ArchivedAgents({ onClose }: { onClose: () => void }) {
               <AgentAvatar bot={bot} size={30} />
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-[13.5px] font-medium text-foreground">{bot.name}</span>
-                {bot.title && (
-                  <span className="block truncate text-[11.5px] text-muted-foreground">{bot.title}</span>
+                {bot.archivedBy ? (
+                  <span className="block truncate text-[11.5px] text-muted-foreground" title={bot.archiveNote}>
+                    Archived by {state.bots.find((b) => b.id === bot.archivedBy)?.name ?? "the agent that hired it"}
+                    {bot.archiveNote ? `: ${bot.archiveNote}` : ""}
+                  </span>
+                ) : (
+                  bot.title && <span className="block truncate text-[11.5px] text-muted-foreground">{bot.title}</span>
                 )}
               </span>
               <Button

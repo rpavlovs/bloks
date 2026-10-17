@@ -190,7 +190,7 @@ export function MeetingPanel({ bot }: { bot: Bot }) {
   return (
     <div className="absolute inset-0 z-20 flex animate-fade-in items-center justify-center bg-black/40 dark:bg-black/60" onClick={recording ? undefined : close}>
       <div
-        className="flex max-h-[84%] w-[640px] max-w-[94vw] animate-pop-in flex-col overflow-hidden rounded-2xl border bg-popover shadow-2xl shadow-[--shadow-color]"
+        className="flex max-h-[84%] w-[640px] max-w-[94vw] animate-pop-in flex-col overflow-hidden rounded-2xl border bg-popover shadow-2xl shadow-(color:--shadow-color)"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-label="Meeting notes"

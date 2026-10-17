@@ -1,11 +1,13 @@
 // What a turn changed, and undoing it without losing anything done since.
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, test } from "node:test";
 
-import { Checkpoints, diffLines, MAX_FILE, trackable } from "../server/checkpoints.ts";
+import { execFileSync } from "node:child_process";
+
+import { Checkpoints, diffLines, gitIgnored, MAX_FILE, overlapping, trackable } from "../server/checkpoints.ts";
 
 const scratch = mkdtempSync(join(tmpdir(), "bloks-checkpoints-"));
 after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -160,5 +162,355 @@ describe("checkpoints", () => {
       ["line 20", "line twenty"],
     );
     assert.equal(lines.filter((l) => l.kind === "same").length, 6);
+  });
+
+  test("what the repository ignores is not the turn's work, and Undo leaves it be", async (t) => {
+    const dir = folder("ignored", { ".gitignore": "build/\n*.log\n", "notes.md": "a\n", "build/out.js": "old build\n" });
+    try {
+      execFileSync("git", ["init", "-q", dir]);
+    } catch {
+      return t.skip("no git here");
+    }
+    if (!(await gitIgnored(dir))) return t.skip("no usable git here");
+    const cp = new Checkpoints(join(scratch, "store-ignored"));
+    await cp.begin("lane", "bot", dir);
+    writeFileSync(join(dir, "notes.md"), "b\n");
+    writeFileSync(join(dir, "build", "out.js"), "new build\n");
+    writeFileSync(join(dir, "debug.log"), "log\n");
+    const record = await cp.finish("lane");
+    assert.deepEqual(record!.files.map((f) => `${f.status} ${f.path}`), ["modified notes.md"]);
+    const undo = await cp.revert(record!.id);
+    assert.deepEqual(undo!.restored, ["notes.md"]);
+    assert.equal(readFileSync(join(dir, "build", "out.js"), "utf8"), "new build\n");
+    assert.ok(existsSync(join(dir, "debug.log")));
+  });
+
+  test("Apply keeps a later edit to a file too big to have been kept", async () => {
+    for (const [label, size] of [["small", 32], ["large", MAX_FILE + 1]] as const) {
+      const dir = join(scratch, `apply-${label}`);
+      const copy = join(scratch, `apply-${label}-copy`);
+      mkdirSync(dir);
+      mkdirSync(copy);
+      writeFileSync(join(dir, "data.bin"), Buffer.alloc(size, 65));
+      writeFileSync(join(copy, "data.bin"), Buffer.alloc(size, 65));
+      const cp = new Checkpoints(join(scratch, `apply-${label}-store`));
+      await cp.begin(label, "bot", dir, [], copy);
+      writeFileSync(join(copy, "data.bin"), Buffer.alloc(size, 66));
+      writeFileSync(join(dir, "data.bin"), Buffer.alloc(size + 1, 67));
+      const record = await cp.finish(label);
+      const result = await cp.apply(record!.id);
+      assert.deepEqual(result, { restored: [], skipped: [{ path: "data.bin", why: "changed since the rehearsal began" }] }, label);
+      assert.ok(readFileSync(join(dir, "data.bin")).every((b) => b === 67), `${label}: the later edit was lost`);
+    }
+  });
+
+  test("Apply still brings in a big file nobody touched since", async () => {
+    const dir = join(scratch, "apply-big-clean");
+    const copy = join(scratch, "apply-big-clean-copy");
+    mkdirSync(dir);
+    mkdirSync(copy);
+    const cp = new Checkpoints(join(scratch, "apply-big-clean-store"));
+    await cp.begin("clean", "bot", dir, [], copy);
+    writeFileSync(join(copy, "made.bin"), Buffer.alloc(MAX_FILE + 1, 66));
+    const record = await cp.finish("clean");
+    const result = await cp.apply(record!.id);
+    assert.deepEqual(result!.restored, ["made.bin"]);
+    assert.equal(readFileSync(join(dir, "made.bin")).length, MAX_FILE + 1);
+  });
+
+  test("what a rewind would put back is known before anything is touched", async () => {
+    const dir = folder("would-restore", { "plan.md": "one\n", "notes.md": "mine\n", "old.md": "bye\n" });
+    const cp = new Checkpoints(join(scratch, "store-would-restore"));
+    await cp.begin("lane", "bot", dir);
+    writeFileSync(join(dir, "plan.md"), "two\n");
+    const first = (await cp.finish("lane"))!;
+    await cp.begin("lane", "bot", dir);
+    writeFileSync(join(dir, "plan.md"), "three\n");
+    writeFileSync(join(dir, "extra.md"), "made by the agent\n");
+    writeFileSync(join(dir, "notes.md"), "agent\n");
+    rmSync(join(dir, "old.md"));
+    const second = (await cp.finish("lane"))!;
+    // the person works on one of them afterwards
+    writeFileSync(join(dir, "notes.md"), "mine again\n");
+
+    // newest first, as a rewind takes them: a file two turns changed
+    // counts once, and the one changed since is left out
+    const since = cp.undoableSince("lane", first.at);
+    assert.deepEqual(since.map((r) => r.id), [second.id, first.id]);
+    assert.deepEqual(cp.wouldRestore(since).sort(), ["extra.md", "old.md", "plan.md"]);
+    assert.deepEqual(cp.wouldRestore([second]).sort(), ["extra.md", "old.md", "plan.md"]);
+    // the older turn alone cannot put plan.md back: the later one changed it since
+    assert.deepEqual(cp.wouldRestore([first]), []);
+    // asking changed nothing
+    assert.equal(readFileSync(join(dir, "plan.md"), "utf8"), "three\n");
+    assert.ok(existsSync(join(dir, "extra.md")) && !existsSync(join(dir, "old.md")));
+    assert.ok(!cp.get(first.id)!.revertedAt && !cp.get(second.id)!.revertedAt);
+
+    // and the rewind then does exactly that
+    const restored = new Set<string>();
+    for (const record of since) for (const path of (await cp.revert(record.id))!.restored) restored.add(path);
+    assert.deepEqual([...restored].sort(), ["extra.md", "old.md", "plan.md"]);
+    assert.equal(readFileSync(join(dir, "plan.md"), "utf8"), "one\n");
+    assert.equal(readFileSync(join(dir, "notes.md"), "utf8"), "mine again\n");
+    // nothing left to put back
+    assert.deepEqual(cp.wouldRestore(cp.undoableSince("lane", first.at)), []);
+  });
+});
+
+// GitHub 153: two agents in one folder. A turn that ran beside another
+// keeps as its own only what its engine said it edited; the rest is
+// kept in the checkpoint while the card and Undo show only its own files.
+describe("turns that share a folder", () => {
+  test("each turn claims what it said it edited, and Undo leaves the other agent's work", async () => {
+    const dir = folder("shared", { "notes.md": "a\n", "log.md": "b\n", "skill.md": "c\n" });
+    const cp = new Checkpoints(join(scratch, "store-shared"));
+    await cp.begin("lane-a", "ada", dir);
+    await cp.begin("lane-b", "linus", dir);
+
+    // A edits notes.md with its file tool; B edits log.md the same way and
+    // skill.md from a shell command it never names
+    cp.noteEdits("lane-a", [join(dir, "notes.md")]);
+    writeFileSync(join(dir, "notes.md"), "a, by Ada\n");
+    cp.noteEdits("lane-b", ["log.md"]);
+    writeFileSync(join(dir, "log.md"), "b, by Linus\n");
+    writeFileSync(join(dir, "skill.md"), "c, by a script\n");
+
+    const a = (await cp.finish("lane-a"))!;
+    const own = a.files.filter((f) => !f.shared).map((f) => f.path);
+    const shared = a.files.filter((f) => f.shared).map((f) => f.path).sort();
+    assert.deepEqual(own, ["notes.md"]);
+    assert.deepEqual(shared, ["log.md", "skill.md"]);
+    assert.deepEqual(a.alongside, ["linus"]);
+    assert.equal(a.files[0].path, "notes.md", "its own come first on the card");
+    const summary = cp.summary(a);
+    assert.deepEqual(summary.files.map((f) => f.path), ["notes.md"]);
+    assert.equal(summary.total, 1);
+    assert.equal(Object.hasOwn(summary, "shared"), false);
+
+    const undo = (await cp.revert(a.id))!;
+    assert.deepEqual(undo.restored, ["notes.md"]);
+    assert.deepEqual(undo.skipped, []);
+    assert.equal(readFileSync(join(dir, "notes.md"), "utf8"), "a\n");
+    assert.equal(readFileSync(join(dir, "log.md"), "utf8"), "b, by Linus\n", "the other agent's work is untouched");
+
+    // B still running after A finished: it overlapped A, so it is just as careful
+    const b = (await cp.finish("lane-b"))!;
+    assert.deepEqual(b.files.filter((f) => !f.shared).map((f) => f.path), ["log.md"]);
+    assert.deepEqual(b.alongside, ["ada"]);
+  });
+
+  test("a summary filters shared files before its list limit", async () => {
+    const dir = folder("summary-limit", { "own.md": "before\n", "other.md": "before\n" });
+    const cp = new Checkpoints(join(scratch, "store-summary-limit"));
+    await cp.begin("a", "a", dir);
+    await cp.begin("b", "b", dir);
+    cp.noteEdits("a", ["own.md"]);
+    writeFileSync(join(dir, "own.md"), "own\n");
+    writeFileSync(join(dir, "other.md"), "other\n");
+    const record = (await cp.finish("a"))!;
+    const own = record.files.find((f) => !f.shared)!;
+    const other = record.files.find((f) => f.shared)!;
+    const old = { ...record, files: [...Array.from({ length: 60 }, (_, i) => ({ ...other, path: `other-${i}.md` })), own] };
+    const summary = cp.summary(old, 1);
+    assert.equal(summary.total, 1);
+    assert.deepEqual(summary.files.map((f) => f.path), ["own.md"]);
+    assert.equal(Object.hasOwn(summary, "shared"), false);
+    const empty = cp.summary({ ...record, files: [other] });
+    assert.deepEqual(empty.files, []);
+    assert.equal(empty.total, 0);
+    assert.equal(Object.hasOwn(empty, "shared"), false);
+    assert.equal(record.files.length, 2, "summary does not change the retained checkpoint");
+    cp.cancel("b");
+  });
+
+  test("shared skips are silent before path and size checks, own changed-since still reports", async () => {
+    const dir = folder("silent-shared", { "own.md": "before\n", "other.md": "before\n" });
+    const cp = new Checkpoints(join(scratch, "store-silent-shared"));
+    await cp.begin("a", "a", dir);
+    await cp.begin("b", "b", dir);
+    cp.noteEdits("a", ["own.md"]);
+    writeFileSync(join(dir, "own.md"), "own\n");
+    writeFileSync(join(dir, "other.md"), "other\n");
+    const record = (await cp.finish("a"))!;
+    const other = record.files.find((f) => f.shared)!;
+    const outside = join(dir, "..", "outside-shared.md");
+    writeFileSync(outside, "leave outside alone\n");
+    record.files.push({ ...other, path: "../outside-shared.md" }, { ...other, path: "big-shared.bin", big: true });
+    writeFileSync(join(dir, "own.md"), "changed since\n");
+    const result = (await cp.revert(record.id))!;
+    assert.deepEqual(result.restored, []);
+    assert.deepEqual(result.skipped, [{ path: "own.md", why: "changed since" }]);
+    assert.equal(readFileSync(join(dir, "other.md"), "utf8"), "other\n");
+    assert.equal(readFileSync(outside, "utf8"), "leave outside alone\n");
+    assert.equal(readFileSync(join(dir, "own.md"), "utf8"), "changed since\n");
+    cp.cancel("b");
+  });
+
+  test("later cards restore across a retained cardless shared checkpoint", async () => {
+    const dir = folder("cardless-between", { "notes.md": "before\n", "log.md": "before\n" });
+    const cp = new Checkpoints(join(scratch, "store-cardless-between"));
+    await cp.begin("a", "a", dir);
+    writeFileSync(join(dir, "notes.md"), "first\n");
+    const first = (await cp.finish("a"))!;
+    cp.attachCard(first.id, "a", "first-card");
+    await cp.begin("a", "a", dir);
+    await cp.begin("b", "b", dir);
+    cp.noteEdits("b", ["log.md"]);
+    writeFileSync(join(dir, "log.md"), "other turn\n");
+    const hidden = (await cp.finish("a"))!;
+    await cp.finish("b");
+    assert.equal(cp.summary(hidden).total, 0);
+    assert.equal(hidden.card, undefined);
+    await cp.begin("a", "a", dir);
+    writeFileSync(join(dir, "notes.md"), "later\n");
+    const later = (await cp.finish("a"))!;
+    cp.attachCard(later.id, "a", "later-card");
+    assert.deepEqual(cp.undoableSince("a", first.at).map((r) => r.id), [later.id, hidden.id, first.id]);
+    assert.deepEqual(await cp.revert(later.id), { restored: ["notes.md"], skipped: [] });
+    assert.equal(readFileSync(join(dir, "notes.md"), "utf8"), "first\n");
+    assert.deepEqual(await cp.revert(hidden.id), { restored: [], skipped: [] });
+    assert.deepEqual(await cp.revert(first.id), { restored: ["notes.md"], skipped: [] });
+    assert.equal(readFileSync(join(dir, "notes.md"), "utf8"), "before\n");
+    assert.equal(readFileSync(join(dir, "log.md"), "utf8"), "other turn\n");
+  });
+
+  test("a turn that came and went in the middle of a long one still counts", async () => {
+    const dir = folder("brief", { "x.md": "1\n", "y.md": "2\n" });
+    const cp = new Checkpoints(join(scratch, "store-brief"));
+    await cp.begin("long", "ada", dir);
+    await cp.begin("short", "linus", dir);
+    writeFileSync(join(dir, "y.md"), "2, by Linus\n");
+    await cp.finish("short");
+    writeFileSync(join(dir, "x.md"), "1, by Ada\n");
+    cp.noteEdits("long", ["x.md"]);
+    const long = (await cp.finish("long"))!;
+    assert.deepEqual(long.files.find((f) => f.path === "y.md")?.shared, true);
+    assert.equal(long.files.find((f) => f.path === "x.md")?.shared, undefined);
+  });
+
+  test("a turn that ran alone claims everything, as before", async () => {
+    const dir = folder("alone", { "x.md": "1\n" });
+    const cp = new Checkpoints(join(scratch, "store-alone"));
+    await cp.begin("lane", "ada", dir);
+    writeFileSync(join(dir, "x.md"), "2\n");
+    writeFileSync(join(dir, "z.md"), "new\n");
+    const record = (await cp.finish("lane"))!;
+    assert.ok(record.files.every((f) => !f.shared));
+    assert.equal(record.alongside, undefined);
+    assert.equal(cp.summary(record).shared, undefined);
+    // and a later turn elsewhere, or after this one ended, changes nothing
+    const other = folder("elsewhere", { "q.md": "q\n" });
+    await cp.begin("lane-2", "linus", other);
+    await cp.begin("lane-3", "linus", dir);
+    writeFileSync(join(dir, "x.md"), "3\n");
+    const third = (await cp.finish("lane-3"))!;
+    assert.ok(third.files.every((f) => !f.shared), "a turn elsewhere is not in this folder");
+    cp.cancel("lane-2");
+  });
+
+  test("a folder inside another is the same place, and a path outside the folder is never claimed", async () => {
+    assert.equal(overlapping("/work/repo", "/work/repo/sub"), true);
+    assert.equal(overlapping("/work/repo/sub", "/work/repo"), true);
+    assert.equal(overlapping("/work/repo", "/work/repo2"), false);
+    const dir = folder("nested", { "top.md": "t\n", "sub/inner.md": "i\n" });
+    const cp = new Checkpoints(join(scratch, "store-nested"));
+    await cp.begin("outer", "ada", dir);
+    await cp.begin("inner", "linus", join(dir, "sub"));
+    cp.noteEdits("outer", ["../somewhere-else.md", "/etc/hosts", "top.md"]);
+    writeFileSync(join(dir, "top.md"), "t2\n");
+    writeFileSync(join(dir, "sub", "inner.md"), "i2\n");
+    const outer = (await cp.finish("outer"))!;
+    assert.deepEqual(outer.files.filter((f) => !f.shared).map((f) => f.path), ["top.md"]);
+    assert.deepEqual(outer.files.filter((f) => f.shared).map((f) => f.path), ["sub/inner.md"]);
+    cp.cancel("inner");
+  });
+
+  test("a rehearsal works in its own copy, so it neither shares the folder nor makes others share it", async () => {
+    const dir = folder("rehearsed", { "r.md": "r\n" });
+    const copy = folder("rehearsed-copy", { "r.md": "r\n" });
+    const cp = new Checkpoints(join(scratch, "store-rehearsed"));
+    await cp.begin("real", "ada", dir);
+    await cp.begin("rehearsal", "linus", dir, [], copy);
+    writeFileSync(join(dir, "r.md"), "r, by Ada\n");
+    const real = (await cp.finish("real"))!;
+    assert.ok(real.files.every((f) => !f.shared));
+    cp.cancel("rehearsal");
+  });
+});
+
+// The store is swept of versions nothing names any more, and a sweep
+// must never take one that a turn under way, or still running, needs.
+describe("sweeping the store", () => {
+  /** A store already at `count` records, as a busy one is. */
+  function seeded(name: string, count: number) {
+    const root = join(scratch, name);
+    mkdirSync(root, { recursive: true });
+    const records = Array.from({ length: count }, (_, i) => ({ id: `old-${i}`, threadId: "old", botId: "bot", dir: "/nowhere", at: i, files: [] }));
+    writeFileSync(join(root, "index.json"), JSON.stringify(records));
+    return root;
+  }
+
+  function blobCount(root: string) {
+    if (!existsSync(join(root, "blobs"))) return 0;
+    return readdirSync(join(root, "blobs")).reduce((n, shard) => n + readdirSync(join(root, "blobs", shard)).length, 0);
+  }
+
+  test("a sweep waits for a photograph under way, so that turn can still be undone", async () => {
+    const root = seeded("store-sweep-busy", 400);
+    const cp = new Checkpoints(root);
+    const quick = folder("sweep-quick", { "q.md": "q\n" });
+    const files = Object.fromEntries(Array.from({ length: 1000 }, (_, i) => [`f${i}.txt`, `version one of ${i}\n`]));
+    const slow = folder("sweep-slow", files);
+    await cp.begin("quick", "bot", quick);
+    writeFileSync(join(quick, "q.md"), "q2\n");
+
+    // the quick turn ends, past the record limit, while the slow folder is
+    // part way through its first photograph
+    const kept = blobCount(root);
+    const photographing = cp.begin("slow", "bot", slow);
+    while (blobCount(root) < kept + 20) await new Promise((done) => setImmediate(done));
+    await cp.finish("quick");
+    await photographing;
+
+    for (const name of Object.keys(files)) writeFileSync(join(slow, name), "version two\n");
+    const record = (await cp.finish("slow"))!;
+    const undo = (await cp.revert(record.id))!;
+    assert.deepEqual(undo.skipped, []);
+    assert.equal(undo.restored.length, 1000);
+    assert.equal(readFileSync(join(slow, "f0.txt"), "utf8"), "version one of 0\n");
+  });
+
+  test("a running turn's before photograph keeps what it names, after another replaced it on disk", async () => {
+    const cp = new Checkpoints(seeded("store-sweep-pending", 400));
+    const dir = folder("sweep-pending", { "x.md": "first\n" });
+    await cp.begin("a", "ada", dir);
+    cp.noteEdits("a", ["x.md"]);
+    writeFileSync(join(dir, "x.md"), "second\n");
+    // another lane photographs the folder again, and ends past the record
+    // limit while the first is still running
+    await cp.begin("b", "linus", dir);
+    cp.noteEdits("b", ["y.md"]);
+    writeFileSync(join(dir, "y.md"), "y\n");
+    await cp.finish("b");
+    const a = (await cp.finish("a"))!;
+    assert.deepEqual(await cp.revert(a.id), { restored: ["x.md"], skipped: [] });
+    assert.equal(readFileSync(join(dir, "x.md"), "utf8"), "first\n");
+  });
+
+  test("the store is swept now and then, not after every turn", async () => {
+    const root = seeded("store-sweep-batch", 300);
+    const stray = join(root, "blobs", "ab", `ab${"0".repeat(62)}`);
+    mkdirSync(join(stray, ".."), { recursive: true });
+    writeFileSync(stray, "nothing names this");
+    const cp = new Checkpoints(root);
+    const dir = folder("sweep-batch", { "n.md": "0\n" });
+    for (let turn = 1; turn <= 51; turn++) {
+      await cp.begin("lane", "bot", dir);
+      writeFileSync(join(dir, "n.md"), `${turn}\n`);
+      await cp.finish("lane");
+      if (turn === 1) assert.ok(existsSync(stray), "one turn past the limit is not worth a sweep");
+    }
+    assert.equal(existsSync(stray), false, "fifty past it are");
+    assert.equal(cp.get("old-0"), undefined, "and the oldest records went together");
   });
 });

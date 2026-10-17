@@ -18,6 +18,8 @@ import { createServer, type Server } from "node:net";
 import { randomUUID } from "node:crypto";
 import { unlinkSync } from "node:fs";
 
+import { isQuestionTool } from "../policy.ts";
+
 export interface PendingAsk {
   id: string;
   kind: "permission" | "question";
@@ -84,6 +86,11 @@ export interface AskBroker {
   /** Deliver a person's decision. False when the id is unknown, which
    * usually means it already timed out. */
   answer(askId: string, behavior: string, message?: string): boolean;
+  /** Stop taking new connections and remove the socket, but keep the
+   * ones already open and their asks. For a turn that has ended while its
+   * process runs on (a background task can still ask), so the next turn's
+   * socket is never confused with this one. */
+  retire(): void;
   /** End the turn: settle anything still open and remove the socket. */
   close(): void;
 }
@@ -105,6 +112,7 @@ export function createAskBroker(options: AskBrokerOptions): AskBroker {
     /* nothing there, which is the normal case */
   }
 
+  let retired = false;
   const server: Server = createServer((connection) => {
     // The proxy going away is ordinary (its CLI exited); the turn's own
     // settle path handles the consequences.
@@ -171,16 +179,34 @@ export function createAskBroker(options: AskBrokerOptions): AskBroker {
       const entry = open.get(askId);
       if (!entry) return false;
 
-      // A question cannot be allowed or denied and a permission cannot be
-      // answered with prose. Rejecting the mismatch here keeps a malformed
-      // client from putting the CLI into a state it has no contract for.
-      const permitted = entry.ask.kind === "question" ? ["answer"] : ["allow", "deny"];
-      if (!permitted.includes(behavior)) return false;
-
-      entry.settle(behavior, message, "user");
+      // Whatever the person decided settles the ask, as something its tool
+      // has a contract for. A decision that did not fit used to be refused
+      // here, and the refusal was read as the ask being gone: the card
+      // closed while the CLI went on waiting for it (GitHub 254).
+      // A question takes any decision as its reply, put aside included. A
+      // permission is allowed or refused, and words typed on its card
+      // refuse it with those words. The one exception asks permission to
+      // ask (the CLI's own question tool): its words are the answer, and
+      // the bridge hands them over as one (server/permission-proxy.ts).
+      const asksSomething = entry.ask.kind === "question" || isQuestionTool(entry.ask.tool);
+      entry.settle(asksSomething || behavior === "allow" ? behavior : "deny", message, "user");
       return true;
     },
 
+    retire() {
+      if (retired) return;
+      retired = true;
+      try {
+        server.close();
+      } catch {
+        /* already down */
+      }
+      try {
+        unlinkSync(options.socketPath);
+      } catch {
+        /* already gone */
+      }
+    },
     close() {
       for (const entry of [...open.values()]) {
         if (entry.ask.kind === "question") {
@@ -189,6 +215,8 @@ export function createAskBroker(options: AskBrokerOptions): AskBroker {
           entry.settle("deny", TURN_ENDED_PERMISSION, "shutdown");
         }
       }
+      if (retired) return;
+      retired = true;
       try {
         server.close();
       } catch {

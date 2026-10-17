@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, useMemo } from "react";
 import AlertTriangle from "lucide-react/dist/esm/icons/alert-triangle.mjs";
+import BellOff from "lucide-react/dist/esm/icons/bell-off.mjs";
 import Search from "lucide-react/dist/esm/icons/search.mjs";
 import ChevronUp from "lucide-react/dist/esm/icons/chevron-up.mjs";
 import ChevronDown from "lucide-react/dist/esm/icons/chevron-down.mjs";
@@ -7,49 +8,82 @@ import History from "lucide-react/dist/esm/icons/history.mjs";
 import Loader2 from "lucide-react/dist/esm/icons/loader-2.mjs";
 import Monitor from "lucide-react/dist/esm/icons/monitor.mjs";
 import SquareTerminal from "lucide-react/dist/esm/icons/square-terminal.mjs";
-import Square from "lucide-react/dist/esm/icons/square.mjs";
+import Target from "lucide-react/dist/esm/icons/target.mjs";
 import X from "lucide-react/dist/esm/icons/x.mjs";
-import { api, useStore, formatTime, type Bot, type Message } from "@/state/store";
+import { api, useStore, laneHasMessages, openLaneWorking, type Bot, type Message } from "@/state/store";
+import { CarryOn } from "@/components/CarryOn";
 import { AgentAvatar } from "./Avatar";
 import { OptionCard } from "./OptionCard";
 import { MessageComponent } from "./Gallery";
 import { Composer } from "./Composer";
 import { TerminalPanel } from "./Terminal";
-import { showTypingDots, windowStart, TRANSCRIPT_WINDOW } from "@/lib/transcript";
-import { findHits, splitHighlight, stepHit } from "@/lib/find";
-import { splitBlocks, type TableBlock } from "@/lib/markdownTable";
+import { lastEditable, quietLine, quietRunAt, shouldLoadEarlier, showTypingDots, splitWaiting, windowStart, TRANSCRIPT_WINDOW } from "@/lib/transcript";
+import { useEarlier } from "@/lib/useEarlier";
+import { useLanesInSidebar } from "@/lib/conversationsView";
+import { findHits, stepHit } from "@/lib/find";
+import { isApproval } from "@/lib/cardAnswer";
+import { dayLine, queuedLine, stamp, timeSaidBelow } from "@/lib/when";
 import { attachmentBasename, splitAttachments } from "@/lib/attachments";
 import { TaskStrip } from "./TaskStrip";
+import { WaitingStrip } from "./WaitingStrip";
+import { GoalChip, GoalDialog } from "./Goal";
+import { AfterAgentLink, AgentExchangeDialog, AgentExchangeRow } from "./AgentExchange";
 import { CallButton } from "./Voice";
 import { ArtifactCard } from "./Artifacts";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretCard } from "./SecretCard";
 import { ChangesCard } from "./ChangesCard";
 import { ToolRun } from "./ToolRun";
+import { TurnFoldLine } from "./TurnFold";
+import { RecalledNotes } from "./RecalledNotes";
 import { MeetingPanel } from "./MeetingPanel";
 import AudioLines from "lucide-react/dist/esm/icons/audio-lines.mjs";
+import Mic from "lucide-react/dist/esm/icons/mic.mjs";
 import {
   ForwardDialog,
   MessageActionBar,
   Reactions,
   ReplyContext,
+  useTapToShow,
   type ReplyDraft,
 } from "./MessageActions";
 import { ModelPicker } from "./ModelPicker";
+import { EngineSetupActions } from "./EngineSetup";
+import { Markdownish, withHighlight } from "./Markdown";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
+import { useStickToBottom } from "@/lib/useStickToBottom";
+import { useHoldPlace } from "@/lib/useHoldPlace";
+import { foldHolding, foldTurns, lastFoldKey, rowsFrom, turnRunning } from "@/lib/turnFold";
+import { goalNoteForPerson } from "@/lib/goalNote";
+import { redoLine, type RedoPreview } from "@/lib/redo";
 
-// Minimal markdown for bot bubbles: **bold**, `code`, headings, lists.
-// Rendered as React nodes, model output never reaches the DOM as HTML.
+/** The line over a goal turn: from Bloks, and which turn of how many. */
+function goalLabel(text: string): string {
+  const { turn } = goalNoteForPerson(text);
+  return turn ? `From Bloks, toward your goal · turn ${turn.of} of ${turn.budget}` : "From Bloks, toward your goal";
+}
+
 /**
  * A user bubble's text with its attachment tags lifted out: images come
  * back as thumbnails, files as small name chips, and what remains is
  * the sentence the user actually typed.
  */
 function UserText({ text, highlight }: { text: string; highlight?: string }) {
-  const { display, images, files } = splitAttachments(text);
+  const { display, images, files, voice } = splitAttachments(text);
   return (
     <>
+      {/* a voice message: what it was heard as is the text below, and the
+          recording stays playable, because a transcript can be wrong */}
+      {voice.map((path, i) => (
+        <div key={i} className="mb-1 flex flex-col gap-1">
+          <span className="flex items-center gap-1 text-[11.5px] opacity-80">
+            <Mic size={12} />
+            Voice message, transcribed
+          </span>
+          <audio controls preload="none" src={`/api/attachments/${attachmentBasename(path)}`} className="h-8 max-w-full" />
+        </div>
+      ))}
       {images.length > 0 && (
         <div className="mb-1 flex flex-wrap gap-1.5">
           {images.map((path, i) => (
@@ -76,166 +110,6 @@ function UserText({ text, highlight }: { text: string; highlight?: string }) {
         </div>
       )}
       {withHighlight([display], highlight ?? "")}
-    </>
-  );
-}
-
-/** Wraps every occurrence of the query in the plain-text parts of an
- * already-rendered line. Elements are left alone: breaking a code span
- * to paint it yellow trades a working transcript for a search result. */
-function withHighlight(nodes: React.ReactNode[], query: string): React.ReactNode[] {
-  if (!query.trim()) return nodes;
-  const out: React.ReactNode[] = [];
-  nodes.forEach((node, i) => {
-    if (typeof node !== "string") {
-      out.push(node);
-      return;
-    }
-    for (const [j, part] of splitHighlight(node, query).entries()) {
-      out.push(
-        part.hit ? (
-          <mark key={`h-${i}-${j}`} className="rounded-[3px] bg-warning/40 px-px text-inherit">
-            {part.text}
-          </mark>
-        ) : (
-          part.text
-        ),
-      );
-    }
-  });
-  return out;
-}
-
-function inlineMd(text: string, keyBase: string): React.ReactNode[] {
-  const parts: React.ReactNode[] = [];
-  const re = /(\*\*[^*]+\*\*|`[^`]+`)/g;
-  let last = 0;
-  let i = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text))) {
-    if (m.index > last) parts.push(text.slice(last, m.index));
-    const tok = m[0];
-    if (tok.startsWith("**")) {
-      parts.push(<strong key={`${keyBase}-${i++}`}>{tok.slice(2, -2)}</strong>);
-    } else {
-      parts.push(
-        <code
-          key={`${keyBase}-${i++}`}
-          className="rounded bg-foreground/[0.07] px-1 py-px font-mono text-[12.5px]"
-        >
-          {tok.slice(1, -1)}
-        </code>,
-      );
-    }
-    last = m.index + tok.length;
-  }
-  if (last < text.length) parts.push(text.slice(last));
-  return parts;
-}
-
-/**
- * A table a model wrote, drawn as one.
- *
- * Scrolls inside its own box rather than widening the bubble: a
- * six-column comparison should not decide how wide the transcript is.
- */
-function MarkdownTable({ block, highlight }: { block: TableBlock; highlight: string }) {
-  const align = (i: number) => {
-    const a = block.aligns[i] ?? "left";
-    return a === "right" ? "text-right" : a === "center" ? "text-center" : "text-left";
-  };
-  return (
-    <div className="my-1.5 max-w-full overflow-x-auto rounded-xl border">
-      <table className="w-full border-collapse text-[12.5px]">
-        <thead>
-          <tr className="border-b bg-foreground/[0.04]">
-            {block.columns.map((column, i) => (
-              <th
-                key={i}
-                className={cn("px-2.5 py-1.5 font-semibold whitespace-nowrap", align(i))}
-              >
-                {withHighlight(inlineMd(column, `th${i}`), highlight)}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {block.rows.map((row, r) => (
-            <tr key={r} className="border-b last:border-b-0">
-              {row.map((cell, c) => (
-                <td key={c} className={cn("px-2.5 py-1.5 align-top", align(c))}>
-                  {withHighlight(inlineMd(cell, `td${r}-${c}`), highlight)}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function Markdownish({ text, highlight = "" }: { text: string; highlight?: string }) {
-  const blocks = splitBlocks(text);
-  if (blocks.some((block) => block.kind === "table")) {
-    return (
-      <>
-        {blocks.map((block, b) =>
-          block.kind === "table" ? (
-            <MarkdownTable key={`t${b}`} block={block} highlight={highlight} />
-          ) : (
-            <Markdownish key={`l${b}`} text={block.lines.join("\n")} highlight={highlight} />
-          ),
-        )}
-      </>
-    );
-  }
-  return (
-    <>
-      {text.split("\n").map((line, i) => {
-        const heading = line.match(/^#{1,4}\s+(.*)$/);
-        if (heading) {
-          return (
-            <div key={i} className="mt-1.5 font-semibold">
-              {withHighlight(inlineMd(heading[1], `h${i}`), highlight)}
-            </div>
-          );
-        }
-        const bullet = line.match(/^\s*[-•*]\s+(.*)$/);
-        if (bullet) {
-          return (
-            <div key={i} className="flex gap-2 pl-1">
-              <span className="text-muted-foreground">•</span>
-              <span className="min-w-0">{withHighlight(inlineMd(bullet[1], `b${i}`), highlight)}</span>
-            </div>
-          );
-        }
-        const numbered = line.match(/^\s*(\d+)\.\s+(.*)$/);
-        if (numbered) {
-          return (
-            <div key={i} className="flex gap-2 pl-1">
-              <span className="text-muted-foreground">{numbered[1]}.</span>
-              <span className="min-w-0">{withHighlight(inlineMd(numbered[2], `n${i}`), highlight)}</span>
-            </div>
-          );
-        }
-        // A quoted line: what an agent is answering, or a forward's
-        // original. Left rule and quieter text, because the point is that
-        // it is somebody else's words, not this message's own.
-        const quoted = line.match(/^\s*>\s?(.*)$/);
-        if (quoted) {
-          return (
-            <div
-              key={i}
-              className="my-0.5 border-l-2 border-current/25 pl-2.5 text-current/70"
-            >
-              {quoted[1] ? withHighlight(inlineMd(quoted[1], `q${i}`), highlight) : null}
-            </div>
-          );
-        }
-        if (!line.trim()) return <div key={i} className="h-2.5" />;
-        return <div key={i}>{withHighlight(inlineMd(line, `p${i}`), highlight)}</div>;
-      })}
     </>
   );
 }
@@ -284,6 +158,39 @@ function Rewound({ messages }: { messages: Message[] }) {
   );
 }
 
+/** A run of quiet check-ins as one muted line. It opens to show what was
+ * asked and answered, for whoever wants to see that the routine really is
+ * running, and stays out of the way otherwise. */
+function QuietCheckIns({ messages }: { messages: Message[] }) {
+  const [open, setOpen] = useState(false);
+  const words = messages.filter((m) => m.kind === "text" && m.text);
+  return (
+    <div className="flex flex-col items-center gap-1.5">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex max-w-full items-center gap-1.5 rounded-full px-3 py-1 text-[12px] text-muted-foreground/80 transition-colors duration-150 hover:bg-accent/60 hover:text-foreground"
+      >
+        <BellOff size={12} className="shrink-0" />
+        <span className="truncate">{quietLine(messages, (at) => stamp(at))}</span>
+        {words.length > 0 && <ChevronDown size={12} className={cn("shrink-0 transition-transform duration-200", open && "rotate-180")} />}
+      </button>
+      {open && words.length > 0 && (
+        <div className="flex w-full animate-fade-in flex-col gap-1">
+          {words.map((m) => (
+            <div key={m.id} className={cn("flex w-full", m.role === "user" ? "justify-end" : "justify-start")}>
+              <div className="max-w-[82%] whitespace-pre-wrap rounded-2xl border border-dashed px-3 py-1.5 text-[12.5px] text-muted-foreground sm:max-w-[68%]">
+                {m.text}
+                <span className="ml-2 text-[10.5px] text-muted-foreground/70">{stamp(m.at)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TakenBack({ user }: { user: boolean }) {
   return (
     <div className={cn("flex w-full", user ? "justify-end" : "justify-start")}>
@@ -304,11 +211,21 @@ function Bubble({
   onEdit,
   onDelete,
   onRewind,
+  previewRedo,
+  onRedo,
+  redoTick,
+  agentName,
   nameOf,
   highlight = "",
   isHit,
+  hideTime,
+  editNow,
 }: {
   message: Message;
+  /** The next bubble says the same time, so this one leaves it out. */
+  hideTime?: boolean;
+  /** Changes when ↑ in the empty composer asks to edit this message. */
+  editNow?: number;
   fresh?: boolean;
   author: string;
   onReply: (draft: ReplyDraft) => void;
@@ -317,6 +234,14 @@ function Bubble({
   onEdit?: (messageId: string, text: string) => void;
   onDelete?: (messageId: string) => void;
   onRewind?: (messageId: string) => void;
+  /** What redoing this message would take back, or that it is not
+   * offered: asked of the server, which holds the turns and the files. */
+  previewRedo?: (messageId: string) => Promise<RedoPreview>;
+  /** Redo from the new words. Resolves to why it did not happen, or null. */
+  onRedo?: (messageId: string, text: string) => Promise<string | null>;
+  /** Changes as the conversation moves, so an open editor asks again. */
+  redoTick?: string;
+  agentName?: string;
   nameOf?: (id: string) => string;
   highlight?: string;
   isHit?: boolean;
@@ -325,110 +250,231 @@ function Bubble({
   // Editing happens where the message already is. Sending it back to
   // the composer would lose your place and pretend it is a new message.
   const [editing, setEditing] = useState<string | null>(null);
-
+  // Opened from the keyboard, it hands the keyboard back when it closes,
+  // so the next thing typed lands in the composer again.
+  const returnTo = useRef<HTMLElement | null>(null);
+  // A message the agent has already read can be redone from its editor:
+  // the agent stops, the conversation and the folder go back to before
+  // the message, and the new words are sent (GitHub 258). Saving alone
+  // only rewrites the stored words, which the agent never hears. Whether
+  // Redo is offered, and the line that says what it takes back, come
+  // from the server, asked when the editor opens and again as the
+  // conversation moves under it, so the line stays true while the agent
+  // works.
+  const [redo, setRedo] = useState<RedoPreview | null>(null);
+  const [redoing, setRedoing] = useState(false);
+  const [redoError, setRedoError] = useState<string | null>(null);
+  const asked = useRef<Promise<RedoPreview | null> | null>(null);
+  const startEditing = () => {
+    if (editing !== null) return;
+    setEditing(message.text ?? "");
+  };
+  useEffect(() => {
+    if (!editNow) return;
+    returnTo.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    startEditing();
+  }, [editNow]); // eslint-disable-line react-hooks/exhaustive-deps
+  const stopEditing = (text?: string) => {
+    if (text) onEdit?.(message.id, text);
+    setEditing(null);
+    setRedoError(null);
+    returnTo.current?.focus();
+    returnTo.current = null;
+  };
+  const editorOpen = editing !== null;
+  useEffect(() => {
+    if (!editorOpen || !user || !previewRedo) {
+      asked.current = null;
+      setRedo(null);
+      return;
+    }
+    let live = true;
+    const ask = previewRedo(message.id).catch(() => null);
+    asked.current = ask;
+    void ask.then((preview) => {
+      if (live) setRedo(preview);
+    });
+    return () => {
+      live = false;
+    };
+  }, [editorOpen, message.id, redoTick]); // eslint-disable-line react-hooks/exhaustive-deps
+  const offer = redo?.offered && onRedo ? redo : null;
+  const redoNow = (text: string) => {
+    if (!onRedo || redoing) return;
+    setRedoing(true);
+    setRedoError(null);
+    void onRedo(message.id, text).then((problem) => {
+      setRedoing(false);
+      // refused with nothing taken back: the editor keeps the words
+      if (problem) return setRedoError(problem);
+      // done: the message was rewound, and the keyboard goes back to
+      // the composer it came from
+      stopEditing();
+    });
+  };
+  // Enter presses the editor's main button. Which one that is is the
+  // server's answer, so a quick Enter waits for it rather than saving
+  // words the person meant to redo.
+  const submit = async () => {
+    const text = editing?.trim();
+    if (!text) return stopEditing();
+    if (redoing) return;
+    const preview = redo ?? (await asked.current);
+    if (preview?.offered && onRedo) redoNow(text);
+    else stopEditing(text);
+  };
+  // where nothing hovers, a tap on the bubble shows the bar
+  const tap = useTapToShow();
 
   return (
     <div
       className={cn(
-        "group flex w-full items-center gap-1.5",
-        user ? "justify-end" : "justify-start",
+        "flex flex-col",
+        user ? "items-end" : "items-start",
         // arriving messages rise into place from the side they belong to
         fresh && (user ? "animate-send-in" : "animate-receive-in"),
       )}
     >
-      {user && (
-        <MessageActionBar
-          message={message}
-          author={author}
-          onReply={onReply}
-          onForward={onForward}
-          onReact={onReact ? (emoji) => onReact(message.id, emoji) : undefined}
-          onEdit={user && onEdit ? () => setEditing(message.text ?? "") : undefined}
-          onDelete={onDelete ? () => onDelete(message.id) : undefined}
-          onRewind={onRewind ? () => onRewind(message.id) : undefined}
-        />
-      )}
-      {/* A column, so reactions hang under the bubble they belong to
-          rather than beside it where they would push the text around. */}
-      <div className={cn("flex max-w-[82%] flex-col sm:max-w-[68%]", user && "items-end")}>
-        {user && (message.via === "watcher" || message.via === "email") && (
-          <div className="mb-0.5 px-1 text-[11px] text-muted-foreground">
-            {message.via === "watcher" ? "From your watcher" : "By email"}
-          </div>
+      {/* On a phone the bar floats over the bubble, as it does in rooms:
+          beside it, an invisible bar held 200px of every row and squeezed
+          a message to a few words a line. */}
+      <div ref={tap.row} className={cn("group relative flex w-full items-center gap-1.5", user ? "justify-end" : "justify-start")}>
+        {user && (
+          <MessageActionBar
+            className="max-sm:absolute max-sm:-top-8 max-sm:right-0 max-sm:z-10"
+            open={tap.open}
+            message={message}
+            author={author}
+            onReply={onReply}
+            onForward={onForward}
+            onReact={onReact ? (emoji) => onReact(message.id, emoji) : undefined}
+            onEdit={user && onEdit && message.via !== "goal" ? startEditing : undefined}
+            onDelete={onDelete ? () => onDelete(message.id) : undefined}
+            onRewind={onRewind ? () => onRewind(message.id) : undefined}
+          />
         )}
-        <div
-          className={cn(
-            "px-3.5 py-2 text-[14.5px] leading-relaxed",
-            user
-              ? "whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary text-primary-foreground"
-              : "rounded-2xl rounded-bl-md bg-muted text-foreground",
-            // the hit you are standing on, so n and N feel like movement
-            isHit && "ring-2 ring-warning/70",
+        {/* A column, so reactions hang under the bubble they belong to
+            rather than beside it where they would push the text around. */}
+        <div className={cn("flex max-w-[82%] flex-col sm:max-w-[68%]", user && "items-end")}>
+          {user && (message.via === "watcher" || message.via === "email" || message.via === "webhook" || message.via === "routine" || message.via === "goal") && (
+            <div className="mb-0.5 px-1 text-[11px] text-muted-foreground">
+              {message.via === "routine" ? `From your routine${message.routine?.name ? ` ${message.routine.name}` : ""}` : message.via === "watcher" ? "From your watcher" : message.via === "webhook" ? "From a webhook" : message.via === "goal" ? goalLabel(message.text ?? "") : "By email"}
+            </div>
           )}
-        >
-          {message.replyTo && <ReplyContext replyTo={message.replyTo} onDark={user} />}
-          {editing !== null ? (
-            <div className="flex flex-col gap-1.5">
-              <textarea
-                autoFocus
-                value={editing}
-                onChange={(e) => setEditing(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") setEditing(null);
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    if (editing.trim()) onEdit?.(message.id, editing.trim());
-                    setEditing(null);
-                  }
-                }}
-                rows={Math.min(8, editing.split("\n").length + 1)}
-                className="w-full resize-none rounded-lg bg-black/15 px-2 py-1 text-[14.5px] leading-relaxed outline-none"
-              />
-              <div className="flex items-center gap-2 text-[11.5px] opacity-80">
-                <button
-                  onClick={() => {
-                    if (editing.trim()) onEdit?.(message.id, editing.trim());
-                    setEditing(null);
+          <div
+            onPointerUp={tap.onPointerUp}
+            className={cn(
+              "px-3.5 py-2 text-[14.5px] leading-relaxed",
+              user
+                ? message.via === "goal"
+                  ? // Bloks keeping a goal going, not the person: a quieter
+                    // bubble on their side, so it never reads as their words
+                    "whitespace-pre-wrap rounded-2xl rounded-br-md border border-brand/25 bg-brand-soft text-foreground"
+                  : "whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary text-primary-foreground"
+                : "rounded-2xl rounded-bl-md bg-muted text-foreground",
+              // the hit you are standing on, so n and N feel like movement
+              isHit && "ring-2 ring-warning/70",
+            )}
+          >
+            {message.replyTo && <ReplyContext replyTo={message.replyTo} onDark={user} />}
+            {editing !== null ? (
+              <div className="flex flex-col gap-1.5">
+                <textarea
+                  autoFocus
+                  value={editing}
+                  onChange={(e) => setEditing(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") stopEditing();
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      void submit();
+                    }
                   }}
-                  className="font-medium underline underline-offset-2"
-                >
-                  Save
-                </button>
-                <button onClick={() => setEditing(null)}>Cancel</button>
-                <span className="opacity-70">Enter saves, Escape cancels</span>
+                  rows={Math.min(8, editing.split("\n").length + 1)}
+                  className="w-full resize-none rounded-lg bg-black/15 px-2 py-1 text-[14.5px] leading-relaxed outline-none"
+                />
+                {offer ? (
+                  <>
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11.5px] opacity-80">
+                      <button
+                        onClick={() => editing.trim() && redoNow(editing.trim())}
+                        disabled={redoing}
+                        className="font-medium underline underline-offset-2 disabled:opacity-60"
+                      >
+                        Redo
+                      </button>
+                      {/* the smaller way out: the words change, and the
+                          agent goes on with the ones it read */}
+                      <button onClick={() => stopEditing(editing.trim() || undefined)} disabled={redoing} className="text-[11px]">
+                        Save words only
+                      </button>
+                      <button onClick={() => stopEditing()} className="text-[11px]">
+                        Cancel
+                      </button>
+                      <span className="opacity-70">{redoing ? "Redoing…" : "Enter redoes, Escape cancels"}</span>
+                    </div>
+                    <div className="text-[11.5px] leading-snug opacity-80" role="status">
+                      {redoError ?? redoLine(offer, agentName ?? "the agent")}
+                    </div>
+                  </>
+                ) : (
+                  <div className="flex items-center gap-2 text-[11.5px] opacity-80">
+                    <button
+                      onClick={() => stopEditing(editing.trim() || undefined)}
+                      className="font-medium underline underline-offset-2"
+                    >
+                      Save
+                    </button>
+                    <button onClick={() => stopEditing()}>Cancel</button>
+                    <span className="opacity-70">Enter saves, Escape cancels</span>
+                  </div>
+                )}
               </div>
-            </div>
-          ) : user ? (
-            <UserText text={message.text ?? ""} highlight={highlight} />
-          ) : (
-            <Markdownish text={message.text ?? ""} highlight={highlight} />
-          )}
-          {message.editedAt && editing === null && (
-            <span className="ml-1.5 align-baseline text-[10.5px] opacity-60">edited</span>
-          )}
-          {user && message.queued && (
-            <div className="mt-1 flex items-center gap-1 text-[10.5px] font-medium opacity-70">
-              <span className="inline-block size-1.5 animate-pulse rounded-full bg-current" />
-              Queued, sends when this turn finishes
-            </div>
-          )}
+            ) : user ? (
+              <UserText text={message.via === "goal" ? goalNoteForPerson(message.text ?? "").body : (message.text ?? "")} highlight={highlight} />
+            ) : (
+              <Markdownish text={message.text ?? ""} highlight={highlight} />
+            )}
+            {message.editedAt && editing === null && (
+              <span className="ml-1.5 align-baseline text-[10.5px] opacity-60">edited</span>
+            )}
+          </div>
+          <Reactions
+            reactions={message.reactions}
+            onToggle={(emoji: string) => onReact?.(message.id, emoji)}
+            nameOf={nameOf ?? ((id) => (id === "user" ? "You" : author))}
+          />
+          {/* what recall put ahead of these words for the agent */}
+          {user && message.recalled?.length ? <RecalledNotes notes={message.recalled} /> : null}
         </div>
-        <Reactions
-          reactions={message.reactions}
-          onToggle={(emoji: string) => onReact?.(message.id, emoji)}
-          nameOf={nameOf ?? ((id) => (id === "user" ? "You" : author))}
-        />
+        {!user && (
+          <MessageActionBar
+            className="max-sm:absolute max-sm:-top-8 max-sm:left-0 max-sm:z-10"
+            open={tap.open}
+            message={message}
+            author={author}
+            onReply={onReply}
+            onForward={onForward}
+            onReact={onReact ? (emoji) => onReact(message.id, emoji) : undefined}
+            onDelete={onDelete ? () => onDelete(message.id) : undefined}
+          />
+        )}
       </div>
-      {!user && (
-        <MessageActionBar
-          message={message}
-          author={author}
-          onReply={onReply}
-          onForward={onForward}
-          onReact={onReact ? (emoji) => onReact(message.id, emoji) : undefined}
-          onDelete={onDelete ? () => onDelete(message.id) : undefined}
-        />
-      )}
+      {/* Under the row rather than in it, so the action bar stays centred
+          on the words. One that waited for a turn says both times; it
+          joined the conversation when it went, which is why it is here. */}
+      {message.at && !hideTime ? (
+        <time
+          dateTime={new Date(message.at).toISOString()}
+          className="mt-0.5 px-1 text-[11px] leading-4 tabular-nums text-muted-foreground"
+        >
+          {/* a goal's note goes through the queue only to wait its turn;
+              nobody queued it, so it says when it went, once */}
+          {message.deliveredAt && message.via !== "goal"
+            ? queuedLine(message.queuedAt ?? message.at, message.deliveredAt)
+            : stamp(message.at)}
+        </time>
+      ) : null}
     </div>
   );
 }
@@ -436,18 +482,210 @@ function Bubble({
 /** Something the agent did, as one quiet line. Spinning while it runs,
  * then a tick or a cross. */
 /**
+ * The lane mail from senders the person has not listed is answered in.
+ * It looks like any other conversation, but the person's own words never
+ * run beside those mails: what is typed here goes to the first
+ * conversation (typedLane), and this says so before anything is typed.
+ */
+function GuestMailLine({ bot }: { bot: Bot }) {
+  const open = bot.activeTaskId ?? bot.threadId;
+  if (!bot.tasks?.some((t) => t.id === open && t.guestMail)) return null;
+  const first = bot.tasks.find((t) => !t.guestMail);
+  return (
+    <p className="mx-auto w-full max-w-[760px] px-4 pb-1 text-center text-[12px] leading-snug text-muted-foreground md:px-6">
+      Mail from senders you have not listed is answered here, in conversation only. What you write goes to{" "}
+      {first ? `"${first.title}"` : "the first conversation"}.
+    </p>
+  );
+}
+
+/**
+ * Another of this agent's conversations stopped on a question or an
+ * approval. The card lives in that conversation's transcript, so from this
+ * one it could be listed as waiting and still not be anywhere on screen.
+ */
+function OtherLaneWaiting({ bot }: { bot: Bot }) {
+  const { dispatch } = useStore();
+  const open = bot.activeTaskId ?? bot.threadId;
+  const waiting = (bot.tasks ?? []).filter((t) => t.state === "needs-you" && t.id !== open);
+  if (!waiting.length) return null;
+  const first = waiting[0];
+  return (
+    <div className="mx-auto w-full max-w-[760px] px-4 md:px-6">
+      <button
+        onClick={() => dispatch({ type: "selectTask", botId: bot.id, taskId: first.id })}
+        className="mb-2 flex w-full items-center gap-2 rounded-xl bg-warning/10 px-3.5 py-2 text-left text-[13px] text-warning transition-colors duration-150 hover:bg-warning/15"
+      >
+        <span className="size-1.5 shrink-0 rounded-full bg-warning" />
+        <span className="min-w-0 flex-1 truncate">
+          {waiting.length === 1
+            ? `"${first.title}" is waiting on you`
+            : `${waiting.length} other conversations are waiting on you`}
+        </span>
+        <span className="shrink-0 font-medium">Open</span>
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Said before the first message rather than after it: this agent's engine
+ * is missing or signed out, so anything sent now would come back as an
+ * error. The fix is right here, the same Install or Sign in the first-run
+ * check has, or Settings for an engine that runs on a key.
+ */
+function EngineBanner({ bot }: { bot: Bot }) {
+  const { state, dispatch } = useStore();
+  const instance = state.instances.find((i) => i.instanceId === bot.modelSelection?.instanceId);
+  const missing = instance ? instance.snapshot.state !== "available" : false;
+  const signedOut = Boolean(instance) && !missing && instance!.snapshot.authenticated === false;
+  const refresh = () => {
+    api("/api/instances")
+      .then(({ instances }) => dispatch({ type: "instances", instances }))
+      .catch(() => {});
+  };
+  // Signing in happens in Terminal; coming back to this window is the
+  // moment to look again, so the warning goes without a click.
+  const showing = missing || signedOut;
+  // Dismissed per engine and per problem, so closing "not signed in" does
+  // not also hide a later "not installed" for the same engine.
+  const dismissKey = instance ? `bloks.engineBanner.${instance.instanceId}.${missing ? "missing" : "signedOut"}` : "";
+  const [dismissed, setDismissed] = useState(() => {
+    try {
+      return Boolean(dismissKey) && localStorage.getItem(dismissKey) === "1";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      setDismissed(Boolean(dismissKey) && localStorage.getItem(dismissKey) === "1");
+    } catch {
+      setDismissed(false);
+    }
+  }, [dismissKey]);
+  const dismiss = () => {
+    setDismissed(true);
+    try {
+      localStorage.setItem(dismissKey, "1");
+    } catch {
+      /* hidden for this visit only */
+    }
+  };
+  useEffect(() => {
+    if (!showing) return;
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showing]);
+  if (!instance || !showing || dismissed) return null;
+  // Another engine that would answer right now, preferring one that runs
+  // tools, so the quickest fix is a single click rather than a setup.
+  const ready = state.instances.filter(
+    (i) =>
+      i.instanceId !== instance.instanceId &&
+      i.snapshot.state === "available" &&
+      i.snapshot.authenticated !== false &&
+      Boolean(i.models.default),
+  );
+  const agentic = new Set(state.providers.filter((p) => p.agentic).map((p) => p.kind));
+  const alternative = ready.find((i) => agentic.has(i.driverKind)) ?? ready[0];
+  return (
+    <div className="mx-auto w-full max-w-[760px] px-4 md:px-6">
+      <div className="mb-2 rounded-xl border border-warning/30 bg-warning/5 px-3.5 py-2.5 text-[13px] leading-relaxed">
+        <div className="flex items-start gap-2">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0 text-warning" />
+          <div className="min-w-0 flex-1">
+            <span className="text-foreground">
+              {missing
+                ? `${instance.displayName} isn't ready on this computer, so ${bot.name} can't answer yet.`
+                : `${instance.displayName} isn't signed in yet, so ${bot.name} can't answer.`}
+            </span>{" "}
+            <span className="text-muted-foreground">Set it up here, or pick another engine at the top right.</span>
+            {alternative && (
+              <div className="mt-2">
+                <Button
+                  size="sm"
+                  onClick={() =>
+                    dispatch({
+                      type: "setModel",
+                      botId: bot.id,
+                      selection: { instanceId: alternative.instanceId, model: alternative.models.default },
+                    })
+                  }
+                >
+                  Use {alternative.displayName} instead
+                </Button>
+              </div>
+            )}
+            <EngineSetupActions
+              kind={instance.driverKind}
+              name={instance.displayName}
+              installed={!missing}
+              signedOut={signedOut}
+              onChanged={refresh}
+            />
+            <button
+              onClick={() => dispatch({ type: "toggleAppSettings", open: true, page: "engines" })}
+              className="mt-1.5 text-[12px] text-muted-foreground underline hover:text-foreground"
+            >
+              Open engine settings
+            </button>
+          </div>
+          <button
+            onClick={dismiss}
+            aria-label="Dismiss"
+            title="Dismiss"
+            className="-mr-1 -mt-0.5 shrink-0 rounded-md p-1 text-muted-foreground transition-colors duration-150 hover:bg-warning/10 hover:text-foreground"
+          >
+            <X size={13} />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Something stopped the turn from running: no engine installed, a CLI
  * that is not signed in, a machine out of file handles. The message is
  * usually instructions, so it is readable prose in a card rather than a
  * truncated line of monospace.
  */
 function Notice({ message, fresh }: { message: Message; fresh?: boolean }) {
+  // a compaction is a fact about the conversation, marked like a date line
+  if (message.compaction) {
+    return <div className="py-1 text-center text-[12px] text-muted-foreground">{message.text}</div>;
+  }
+  // The goal's own news. Set and done are not warnings, so they do not
+  // wear one; where it stopped short (blocked, out, paused) still does.
+  if (message.goal) {
+    const short = message.goal === "blocked" || message.goal === "out" || message.goal === "paused";
+    return (
+      <div className={cn("flex justify-start", fresh && "animate-receive-in")}>
+        <div
+          className={cn(
+            "flex max-w-[560px] gap-2.5 rounded-2xl border px-3.5 py-2.5",
+            short ? "border-warning/30 bg-warning/5" : message.goal === "done" ? "border-success/30 bg-success/5" : "bg-card",
+          )}
+        >
+          <Target
+            size={15}
+            className={cn("mt-0.5 shrink-0", short ? "text-warning" : message.goal === "done" ? "text-success" : "text-brand")}
+            aria-hidden
+          />
+          <div className="whitespace-pre-wrap text-[14px] leading-relaxed text-foreground">{message.text}</div>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className={cn("flex justify-start", fresh && "animate-receive-in")}>
       <div className="flex max-w-[560px] gap-2.5 rounded-2xl border border-warning/30 bg-warning/5 px-3.5 py-2.5">
         <AlertTriangle size={15} className="mt-0.5 shrink-0 text-warning" />
         <div className="whitespace-pre-wrap text-[14px] leading-relaxed text-foreground">
           {message.text}
+          <CarryOn message={message} />
         </div>
       </div>
     </div>
@@ -525,9 +763,8 @@ function LiveBrowser({ botId, frame }: { botId: string; frame: { png: string; mi
 function StreamingBubble({ text }: { text: string }) {
   return (
     <div className="flex w-full justify-start">
-      <div className="max-w-[82%] rounded-2xl rounded-bl-md bg-muted px-3.5 py-2 text-[14.5px] leading-relaxed text-foreground sm:max-w-[68%]">
+      <div className="streaming-text max-w-[82%] rounded-2xl rounded-bl-md bg-muted px-3.5 py-2 text-[14.5px] leading-relaxed text-foreground sm:max-w-[68%]">
         <Markdownish text={text} />
-        <span className="ml-0.5 inline-block h-[14px] w-[2px] animate-pulse bg-muted-foreground align-middle" />
       </div>
     </div>
   );
@@ -550,22 +787,24 @@ function TypingIndicator() {
  * watching, never the backlog when you open a thread. Opening a chat and
  * seeing forty bubbles fly in would be noise, not feedback.
  */
-function useArrivals(bot: Bot): Set<string> {
+function useArrivals(botId: string, messages: Message[]): Set<string> {
   const seen = useRef<Set<string>>(new Set());
   const [arrivals, setArrivals] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     // switching threads: adopt the whole transcript silently
-    seen.current = new Set(bot.messages.map((m) => m.id));
+    seen.current = new Set(messages.map((m) => m.id));
     setArrivals(new Set());
-  }, [bot.id]);
+  }, [botId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // a message that waited arrives here when it goes, so it rises into
+  // the conversation like anything else said now
   useEffect(() => {
-    const fresh = bot.messages.filter((m) => !seen.current.has(m.id)).map((m) => m.id);
+    const fresh = messages.filter((m) => !seen.current.has(m.id)).map((m) => m.id);
     if (!fresh.length) return;
     fresh.forEach((id) => seen.current.add(id));
     setArrivals(new Set(fresh));
-  }, [bot.messages]);
+  }, [messages]);
 
   return arrivals;
 }
@@ -601,20 +840,64 @@ export function ChatView({ bot }: { bot: Bot }) {
   const liveBrowser =
     bot.busy && frame?.source === "browser" && frame !== frameAtTurnStart ? frame : null;
   const scrollRef = useRef<HTMLDivElement>(null);
-  const arrivals = useArrivals(bot);
+  // The conversation, and what waits to join it above the composer.
+  const { said, waiting } = useMemo(() => splitWaiting(bot.messages), [bot.messages]);
+  const arrivals = useArrivals(bot.id, said);
   const [replyTo, setReplyTo] = useState<ReplyDraft | null>(null);
   const [forwarding, setForwarding] = useState<{ message: Message; author: string } | null>(null);
   // A rewind hands your message back to the composer, to send again or
   // change first. The nonce makes the same words land twice in a row.
   const [prefill, setPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  // ↑ in the empty composer opens your last message for editing in its
+  // bubble, the same edit as the bubble's own Edit button. The bubble
+  // watches the nonce, so every press is heard.
+  const [editAsk, setEditAsk] = useState<{ id: string; nonce: number } | null>(null);
+  const editLast = () => {
+    const mine = lastEditable(bot.messages);
+    if (!mine) return false;
+    setEditAsk({ id: mine.id, nonce: Date.now() });
+    return true;
+  };
+  // Asked once. The bubble has opened by the time this runs (a child's
+  // effects run first), and one drawn again later, after a trip to
+  // another agent, must not open itself a second time.
+  useEffect(() => {
+    if (editAsk) setEditAsk(null);
+  }, [editAsk]);
+  // Sent again as what it says now, at the end of the conversation like
+  // anything said now, and the one that never went is cleared from the
+  // strip once the new one is in.
+  const sendAgain = (message: Message) => {
+    const threadId = bot.threadId;
+    api(`/api/bots/${bot.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ text: message.text, taskId: threadId }),
+    })
+      .then(() => api(`/api/threads/${threadId}/messages/${message.id}`, { method: "DELETE" }))
+      .catch((e) => dispatch({ type: "error", message: e instanceof Error ? e.message : String(e) }));
+  };
   const rewindTo = (threadId: string, messageId: string) => {
     api(`/api/threads/${threadId}/rewind`, { method: "POST", body: JSON.stringify({ messageId }) })
       .then((r) => setPrefill({ text: r.text ?? "", nonce: Date.now() }))
-      .catch((e) => {
-        dispatch({ type: "error", message: e instanceof Error ? e.message : String(e) });
-        setTimeout(() => dispatch({ type: "error", message: null }), 6000);
-      });
+      .catch((e) => dispatch({ type: "error", message: e instanceof Error ? e.message : String(e) }));
   };
+  // Redo is one call: the server stops the agent, rewinds and sends, so
+  // nothing here can leave a rewound conversation with nothing sent. A
+  // refusal takes nothing back and is said in the editor. If the rewind
+  // went through and the send did not, the words come back to the box,
+  // as they do after a rewind.
+  const previewRedo = (threadId: string, messageId: string): Promise<RedoPreview> =>
+    api(`/api/threads/${threadId}/messages/${messageId}/redo`);
+  const redoFrom = (threadId: string, messageId: string, text: string): Promise<string | null> =>
+    api(`/api/threads/${threadId}/messages/${messageId}/redo`, { method: "POST", body: JSON.stringify({ text }) })
+      .then((r) => {
+        if (r.sent === false) {
+          setPrefill({ text: r.text ?? text, nonce: Date.now() });
+          dispatch({ type: "error", message: r.error ?? "The conversation was rewound, but your message was not sent." });
+        }
+        return null;
+      })
+      .catch((e) => (e instanceof Error ? e.message : String(e)));
   // The terminal drawer. Only whether it is on screen lives here: the
   // shell itself is on the server and outlives this component, so closing
   // the drawer is closing a window onto it rather than ending it.
@@ -631,11 +914,19 @@ export function ChatView({ bot }: { bot: Bot }) {
   // index so appends grow the window instead of sliding rows away
   const [boundary, setBoundary] = useState<number | null>(null);
   const preExpand = useRef<number | null>(null);
+  // A finished turn's work is one line above its result
+  // (src/lib/turnFold.ts). These are the ones opened to read the work.
+  const [openFolds, setOpenFolds] = useState<ReadonlySet<string>>(() => new Set());
   const threadKey = `${bot.id}:${bot.threadId}`;
   const lastThreadKey = useRef(threadKey);
   if (lastThreadKey.current !== threadKey) {
     lastThreadKey.current = threadKey;
     setBoundary(null);
+    setOpenFolds(new Set());
+    // A quote is of a message in the conversation it was picked in, and a
+    // rewind's words belong to theirs: neither goes with you to another.
+    setReplyTo(null);
+    setPrefill(null);
   }
   // ── find within this conversation ──
   // The palette answers "which thread was that in"; this answers "where
@@ -644,16 +935,27 @@ export function ChatView({ bot }: { bot: Bot }) {
   const [finding, setFinding] = useState(false);
   const [query, setQuery] = useState("");
   const [hitAt, setHitAt] = useState(0);
-  const hits = useMemo(() => findHits(bot.messages, query), [bot.messages, query]);
+  const hits = useMemo(() => findHits(said, query), [said, query]);
+  // The last turn folds once it has ended, and not before: this
+  // conversation's turn, whatever the agent's other ones are doing.
+  const openLane = bot.tasks?.find((t) => t.id === (bot.activeTaskId ?? bot.threadId));
+  const running = turnRunning(
+    openLane?.state,
+    Boolean(bot.busy),
+    said,
+    Boolean(bot.tasks?.some((t) => t !== openLane && t.state !== "idle")),
+  );
+  const folded = useMemo(() => foldTurns(said, running), [said, running]);
 
   // Approvals stacked up while the user was away. One or two are a
   // conversation; several are a queue, and a queue deserves queue
-  // controls rather than a scroll of identical presses.
+  // controls rather than a scroll of identical presses. Only approvals:
+  // a question waiting beside them is not something "Allow all" answers.
   const pendingApprovals = useMemo(
     () =>
       bot.messages.filter(
         (m) =>
-          m.kind === "options" && m.card?.requestId && !m.card.answered && !m.card.dismissed,
+          m.kind === "options" && m.card && isApproval(m.card) && !m.card.answered && !m.card.dismissed,
       ),
     [bot.messages],
   );
@@ -670,25 +972,38 @@ export function ChatView({ bot }: { bot: Bot }) {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const start = windowStart(bot.messages.length, boundary);
+  const start = windowStart(said.length, boundary);
   // A hit above the rendered slice would be invisible and unscrollable,
   // so finding one opens the window far enough back to show it.
   const visibleStart = currentHit >= 0 && currentHit < start ? Math.max(0, currentHit - 4) : start;
-  const visibleMessages = bot.messages.slice(visibleStart);
+  const visibleRows = useMemo(() => rowsFrom(folded.rows, visibleStart), [folded, visibleStart]);
+  // A hit in folded work would be just as invisible, so its fold opens,
+  // and stays open as the reader steps on to the next.
+  const hitFold = currentHit >= 0 ? foldHolding(folded.rows, currentHit) : null;
+  const hitShown = !hitFold || openFolds.has(hitFold);
 
   // follow the tail only while the reader is actually at the tail
   const pinned = useRef(true);
+  useStickToBottom(scrollRef, pinned);
+  const scrolledTo = useRef(0);
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
-    pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    // scrolling up near the top brings the next page in without a press
+    const lastTop = scrolledTo.current;
+    scrolledTo.current = el.scrollTop;
+    // Only the reader scrolling up lets go of the end. Content that grew
+    // under a reader who was there (a font, a card laying out) reaches
+    // this as a scroll too, and used to leave them short of the last line.
+    pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80 || (pinned.current && el.scrollTop >= lastTop);
+    if (shouldLoadEarlier({ top: el.scrollTop, lastTop, more: start > 0 || earlier.remaining > 0, loading: earlier.loading })) showEarlier();
   };
 
   useEffect(() => {
     if (pinned.current) {
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
     }
-  }, [bot.id, bot.messages.length, streaming, bot.busy]);
+  }, [bot.id, said.length, waiting.length, streaming, bot.busy]);
 
   // expanding restores the reader's place: the same row stays under the
   // cursor while the earlier window mounts above it
@@ -698,27 +1013,196 @@ export function ChatView({ bot }: { bot: Bot }) {
       el.scrollTop += el.scrollHeight - preExpand.current;
       preExpand.current = null;
     }
-  }, [start]);
+    // a page from the server lands above with start still at 0
+  }, [start, said.length]);
+
+  // When a turn ends its work folds, and the reply stays where it is on
+  // screen for a reader who is not at the end. After the effect above:
+  // that one adds to where the reader is, and this one then finds the
+  // reply already in place.
+  useHoldPlace(
+    scrollRef,
+    pinned,
+    threadKey,
+    lastFoldKey(folded.rows),
+    folded.hold ? `[data-msg-index="${folded.hold.index}"]` : null,
+  );
+
+  // Opening a fold leaves its line where it was pressed. At the end of a
+  // conversation, following the end would scroll the line away instead.
+  const toggleFold = (key: string) => {
+    pinned.current = false;
+    setOpenFolds((open) => {
+      const next = new Set(open);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  };
+  useEffect(() => {
+    if (!hitFold) return;
+    pinned.current = false;
+    setOpenFolds((open) => (open.has(hitFold) ? open : new Set(open).add(hitFold)));
+  }, [hitFold]);
 
   // Walk to a hit: render it, then bring it to the middle of the view.
   useEffect(() => {
     if (currentHit < 0) return;
     const row = document.querySelector(`[data-msg-index="${currentHit}"]`);
     row?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [currentHit, visibleStart]);
+  }, [currentHit, visibleStart, hitShown]);
 
+  // the two-agent exchange opened from one of its rows, if any
+  const [exchange, setExchange] = useState<{ peerId: string; messageId: string; text: string } | null>(null);
+  const earlier = useEarlier("bot", bot);
+  const lanesInSidebar = useLanesInSidebar();
+  // One conversation is the usual agent (GitHub 237): with nothing to
+  // switch to, the strip would only be a "+" inviting a second. New
+  // conversation and Clear stay on the agent's row in the sidebar.
+  const strip = !lanesInSidebar && (bot.tasks?.length ?? 0) > 1;
   const showEarlier = () => {
     preExpand.current = scrollRef.current?.scrollHeight ?? null;
     pinned.current = false;
-    setBoundary(Math.max(0, start - TRANSCRIPT_WINDOW));
+    if (start > 0) return setBoundary(Math.max(0, start - TRANSCRIPT_WINDOW));
+    // everything here is showing; the rest is still on the computer
+    setBoundary(0);
+    void earlier.load();
   };
 
-  const first = bot.messages[0];
+  const first = said[0];
+  // this conversation, not the agent: another one may be the one working
+  const working = openLaneWorking(bot);
+
+  // One stretch of the conversation as its rows: what stays in the open,
+  // or a fold's work once it is opened. A run (a rewind, quiet check-ins,
+  // tool calls) is counted within its stretch, since rows with a fold
+  // between them are not next to each other on the page.
+  const rowsOf = (list: readonly Message[], indexOf: (offset: number) => number) =>
+    list.map((m, offset) => {
+      const fresh = arrivals.has(m.id);
+      const absolute = indexOf(offset);
+      if (m.deleted && m.rewound) {
+        // a run of one rewind shows once, at its first message
+        const before = list[offset - 1];
+        if (before?.deleted && before.rewound === m.rewound) return null;
+        const run: Message[] = [];
+        for (let i = offset; i < list.length; i++) {
+          const next = list[i];
+          if (!next.deleted || next.rewound !== m.rewound) break;
+          run.push(next);
+        }
+        return <Rewound key={m.id} messages={run} />;
+      }
+      if (m.deleted) return <TakenBack key={m.id} user={m.role === "user"} />;
+      // a run of quiet check-ins shows once, at its first message
+      if (m.quiet) {
+        const run = quietRunAt(list, offset);
+        return run ? <QuietCheckIns key={m.id} messages={run} /> : null;
+      }
+      // to or from another agent: a compact row, not a bubble that
+      // looks like the person's own words
+      // A reply the agent wrote in its own chat is never compacted,
+      // whoever started the turn (older ones were marked dir "reply").
+      if (m.takeBack || (m.agent && m.agent.dir !== "reply" && (m.kind === "text" || m.kind === "activity"))) {
+        return (
+          <div key={m.id} data-msg-index={absolute}>
+            <AgentExchangeRow
+              message={m}
+              botId={bot.id}
+              fresh={fresh}
+              onOpen={(peerId, messageId, text) => setExchange({ peerId, messageId, text })}
+            />
+          </div>
+        );
+      }
+      switch (m.kind) {
+        case "options":
+          return <OptionCard key={m.id} botId={bot.id} message={m} />;
+        case "activity": {
+          // a run of tool calls is one line; it starts at the first
+          const before = list[offset - 1];
+          if (before?.kind === "activity" && !before.deleted && !before.agent && !before.takeBack && !before.quiet) return null;
+          const run: Message[] = [];
+          for (let i = offset; i < list.length; i++) {
+            const next = list[i];
+            if (next.kind !== "activity" || next.deleted || next.agent || next.takeBack || next.quiet) break;
+            run.push(next);
+          }
+          return <ToolRun key={m.id} messages={run} fresh={fresh} />;
+        }
+        case "notice":
+          return <Notice key={m.id} message={m} fresh={fresh} />;
+        case "screen":
+          return m.png ? <ScreenFrame key={m.id} png={m.png} mime={m.mime} /> : null;
+        case "artifact":
+          return m.artifact ? (
+            <div key={m.id} className={cn("flex", fresh && "animate-receive-in")}>
+              <ArtifactCard botId={bot.id} artifact={m.artifact} />
+            </div>
+          ) : null;
+        case "component":
+          return m.component ? (
+            <div key={m.id} className={cn("flex", fresh && "animate-receive-in")}>
+              <MessageComponent message={m} threadId={bot.threadId} />
+            </div>
+          ) : null;
+        case "connector":
+          return <ConnectorCard key={m.id} botId={bot.id} message={m} />;
+        case "secret":
+          return <SecretCard key={m.id} botId={bot.id} message={m} />;
+        case "changes":
+          return <ChangesCard key={m.id} message={m} fresh={fresh} />;
+        default: {
+          // context for a reply in a turn another agent started: what
+          // prompted it, a click from the exchange, and nothing more.
+          // Once its turn has folded, the line above it says who asked.
+          const after = folded.named.has(m.id) ? undefined : (m.afterAgent ?? (m.agent?.dir === "reply" ? m.agent : undefined));
+          return (
+            <div key={m.id} data-msg-index={absolute}>
+            {after && (
+              <AfterAgentLink
+                peerId={after.peerId}
+                peerName={after.peerName}
+                onOpen={() => setExchange({ peerId: after.peerId, messageId: m.id, text: m.text ?? "" })}
+              />
+            )}
+            <Bubble
+              message={m}
+              // a folded check-in below says no time of its own
+              hideTime={list[offset + 1]?.quiet ? false : timeSaidBelow(m, list[offset + 1])}
+              fresh={fresh}
+              author={m.role === "user" ? "You" : bot.name}
+              onReply={setReplyTo}
+              onForward={(message, author) => setForwarding({ message, author })}
+              onReact={(messageId, emoji) => reactTo(bot.threadId, messageId, emoji)}
+              onEdit={(messageId, next) => editMessage(bot.threadId, messageId, next)}
+              onDelete={(messageId) => deleteMessage(bot.threadId, messageId)}
+              onRewind={(messageId) => rewindTo(bot.threadId, messageId)}
+              previewRedo={(messageId) => previewRedo(bot.threadId, messageId)}
+              onRedo={(messageId, next) => redoFrom(bot.threadId, messageId, next)}
+              redoTick={`${bot.messages.length}:${working}`}
+              agentName={bot.name}
+              highlight={finding ? query : ""}
+              isHit={absolute === currentHit}
+              editNow={editAsk?.id === m.id ? editAsk.nonce : undefined}
+              nameOf={(id) => (id === "user" ? "You" : (state.bots.find((b) => b.id === id)?.name ?? bot.name))}
+            />
+            </div>
+          );
+        }
+      }
+    });
 
   return (
     <main className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
-      {/* Header */}
-      <div className="titlebar-drag flex h-[52px] shrink-0 items-center justify-between gap-2 px-3 md:px-4">
+      {/* Header. Its line comes from the tab strip below it when there is
+          one; with the conversations in the sidebar, or only one of them,
+          there is no strip, so the header draws its own. */}
+      <div
+        className={cn(
+          "titlebar-drag flex h-[52px] shrink-0 items-center justify-between gap-2 px-3 md:px-4",
+          !strip && "border-b",
+        )}
+      >
         <button
           onClick={() => dispatch({ type: "toggleSettings" })}
           className="flex min-w-0 items-center gap-2.5 rounded-lg px-1.5 py-1 transition-colors duration-150 hover:bg-accent"
@@ -727,25 +1211,14 @@ export function ChatView({ bot }: { bot: Bot }) {
           <AgentAvatar bot={bot} size={28} />
           <span className="flex min-w-0 items-baseline gap-2 text-left">
             <span className="truncate text-[14px] font-semibold text-foreground">{bot.name}</span>
-            {(bot.busy || bot.title) && (
+            {(working || bot.title) && (
               <span className="hidden truncate text-[12px] text-muted-foreground sm:block">
-                {bot.busy ? "working…" : bot.title}
+                {working ? "working…" : bot.title}
               </span>
             )}
           </span>
         </button>
         <div className="flex shrink-0 items-center gap-1.5">
-          {bot.busy && (
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => dispatch({ type: "interrupt", botId: bot.id })}
-              title="Stop this turn"
-            >
-              <Square size={11} className="fill-current" />
-              Stop
-            </Button>
-          )}
           <ModelPicker bot={bot} />
           <CallButton bot={bot} />
           {window.bloks?.meetingStart && (
@@ -780,24 +1253,31 @@ export function ChatView({ bot }: { bot: Bot }) {
         </div>
       </div>
 
-      {/* Error banner */}
-      {state.error && (
-        <div className="mx-auto w-full max-w-[760px] px-4">
-          <div className="mt-2 animate-rise-in rounded-xl bg-destructive/10 px-3 py-2 text-[13px] text-destructive">
-            {state.error}
-          </div>
-        </div>
-      )}
-
-      {/* Messages */}
-      <TaskStrip
+      {/* Messages. The strip repeats what the sidebar lists when it lists
+          conversations, so it only shows when the sidebar does not, and
+          only once there is more than one to choose between. */}
+      {strip && <TaskStrip
         tasks={bot.tasks ?? []}
         activeId={bot.activeTaskId ?? bot.threadId}
         onSelect={(taskId) => taskId !== bot.activeTaskId && dispatch({ type: "selectTask", botId: bot.id, taskId })}
         onNew={() => dispatch({ type: "newTask", botId: bot.id })}
-        onClose={(taskId) => dispatch({ type: "closeTask", botId: bot.id, taskId })}
+        onClose={(taskId) => {
+          // Closing deletes the transcript, and on a phone the X sits right
+          // where a thumb lands, so a lane with anything in it asks first,
+          // in the words the sidebar's Close uses. An empty one just goes.
+          const lane = bot.tasks?.find((t) => t.id === taskId);
+          const open = taskId === (bot.activeTaskId ?? bot.threadId);
+          const said = laneHasMessages(lane) || (open && bot.messages.length > 0);
+          if (said && !window.confirm(`Close "${lane?.title ?? "this conversation"}"? Its messages are deleted.`)) return;
+          dispatch({ type: "closeTask", botId: bot.id, taskId });
+        }}
+        onClear={(taskId) => {
+          if (window.confirm("Clear this conversation? Its messages are deleted.")) {
+            dispatch({ type: "clearTask", botId: bot.id, taskId });
+          }
+        }}
         onRename={(taskId, title) => dispatch({ type: "renameTask", botId: bot.id, taskId, title })}
-      />
+      />}
       {finding && (
         <div className="flex shrink-0 items-center gap-2 border-b bg-background/95 px-4 py-2 md:px-6">
           <Search size={14} className="shrink-0 text-muted-foreground" />
@@ -865,94 +1345,42 @@ export function ChatView({ bot }: { bot: Bot }) {
         className="flex-1 overflow-y-auto px-4 md:px-6 [overflow-anchor:none]"
       >
         <div className="mx-auto flex max-w-[760px] flex-col gap-2.5 pb-4 pt-2">
-          {start > 0 ? (
+          {start > 0 || earlier.remaining > 0 ? (
             <button
               onClick={showEarlier}
-              className="mx-auto mt-3 rounded-full border px-3.5 py-1.5 text-[12px] text-muted-foreground transition-colors duration-150 hover:border-foreground/25 hover:text-foreground"
+              disabled={earlier.loading}
+              className="mx-auto mt-3 inline-flex items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-[12px] text-muted-foreground transition-colors duration-150 hover:border-foreground/25 hover:text-foreground disabled:opacity-60"
             >
-              Show earlier messages ({start} more)
+              {earlier.loading && <Loader2 size={12} className="animate-spin" />}
+              Show earlier messages ({start + earlier.remaining} more)
             </button>
           ) : (
             first && (
               <div className="py-3 text-center text-[12px] text-muted-foreground">
-                Today {formatTime(first.at)}
+                {dayLine(first.at)}
               </div>
             )
           )}
-          {visibleMessages.map((m, offset) => {
-            const fresh = arrivals.has(m.id);
-            const absolute = visibleStart + offset;
-            if (m.deleted && m.rewound) {
-              // a run of one rewind shows once, at its first message
-              const before = visibleMessages[offset - 1];
-              if (before?.deleted && before.rewound === m.rewound) return null;
-              const run: Message[] = [];
-              for (let i = offset; i < visibleMessages.length; i++) {
-                const next = visibleMessages[i];
-                if (!next.deleted || next.rewound !== m.rewound) break;
-                run.push(next);
-              }
-              return <Rewound key={m.id} messages={run} />;
-            }
-            if (m.deleted) return <TakenBack key={m.id} user={m.role === "user"} />;
-            switch (m.kind) {
-              case "options":
-                return <OptionCard key={m.id} botId={bot.id} message={m} />;
-              case "activity": {
-                // a run of tool calls is one line; it starts at the first
-                const before = visibleMessages[offset - 1];
-                if (before?.kind === "activity" && !before.deleted) return null;
-                const run: Message[] = [];
-                for (let i = offset; i < visibleMessages.length; i++) {
-                  const next = visibleMessages[i];
-                  if (next.kind !== "activity" || next.deleted) break;
-                  run.push(next);
-                }
-                return <ToolRun key={m.id} messages={run} fresh={fresh} />;
-              }
-              case "notice":
-                return <Notice key={m.id} message={m} fresh={fresh} />;
-              case "screen":
-                return m.png ? <ScreenFrame key={m.id} png={m.png} mime={m.mime} /> : null;
-              case "artifact":
-                return m.artifact ? (
-                  <div key={m.id} className={cn("flex", fresh && "animate-receive-in")}>
-                    <ArtifactCard botId={bot.id} artifact={m.artifact} />
-                  </div>
-                ) : null;
-              case "component":
-                return m.component ? (
-                  <div key={m.id} className={cn("flex", fresh && "animate-receive-in")}>
-                    <MessageComponent message={m} threadId={bot.threadId} />
-                  </div>
-                ) : null;
-              case "connector":
-                return <ConnectorCard key={m.id} botId={bot.id} message={m} />;
-              case "secret":
-                return <SecretCard key={m.id} botId={bot.id} message={m} />;
-              case "changes":
-                return <ChangesCard key={m.id} message={m} fresh={fresh} />;
-              default:
-                return (
-                  <div key={m.id} data-msg-index={absolute}>
-                  <Bubble
-                    message={m}
-                    fresh={fresh}
-                    author={m.role === "user" ? "You" : bot.name}
-                    onReply={setReplyTo}
-                    onForward={(message, author) => setForwarding({ message, author })}
-                    onReact={(messageId, emoji) => reactTo(bot.threadId, messageId, emoji)}
-                    onEdit={(messageId, next) => editMessage(bot.threadId, messageId, next)}
-                    onDelete={(messageId) => deleteMessage(bot.threadId, messageId)}
-                    onRewind={(messageId) => rewindTo(bot.threadId, messageId)}
-                    highlight={finding ? query : ""}
-                    isHit={absolute === currentHit}
-                    nameOf={(id) => (id === "user" ? "You" : (state.bots.find((b) => b.id === id)?.name ?? bot.name))}
-                  />
-                  </div>
-                );
-            }
-          })}
+          {visibleRows.flatMap((row) =>
+            row.kind === "said"
+              ? rowsOf(
+                  row.items.map((item) => item.message),
+                  (offset) => row.items[offset].index,
+                )
+              : [
+                  <TurnFoldLine
+                    key={`fold:${row.fold.key}`}
+                    fold={row.fold}
+                    open={openFolds.has(row.fold.key)}
+                    onToggle={() => toggleFold(row.fold.key)}
+                    onOpenExchange={(asker) =>
+                      setExchange({ peerId: asker.peerId, messageId: asker.message.id, text: asker.message.text ?? "" })
+                    }
+                  >
+                    {openFolds.has(row.fold.key) && rowsOf(row.fold.messages, (offset) => row.fold.indices[offset])}
+                  </TurnFoldLine>,
+                ],
+          )}
           {provisioning && (
             <div className="flex justify-start">
               <div className="flex items-center gap-2 px-1.5 py-0.5 text-[12px] text-muted-foreground">
@@ -965,7 +1393,7 @@ export function ChatView({ bot }: { bot: Bot }) {
           {streaming ? (
             <StreamingBubble text={streaming} />
           ) : (
-            showTypingDots(bot.busy, streaming, bot.messages[bot.messages.length - 1]) && (
+            showTypingDots(working, streaming, said[said.length - 1]) && (
               <TypingIndicator />
             )
           )}
@@ -1033,7 +1461,54 @@ export function ChatView({ bot }: { bot: Bot }) {
           </button>
         </div>
       )}
-      <Composer bot={bot} replyTo={replyTo} onClearReply={() => setReplyTo(null)} prefill={prefill} />
+      <OtherLaneWaiting bot={bot} />
+      <EngineBanner bot={bot} />
+      <WaitingStrip
+        messages={waiting}
+        threadId={bot.threadId}
+        senderOf={(m) =>
+          m.agent?.dir === "in"
+            ? m.agent.peerName
+            : m.via === "watcher"
+              ? "your watcher"
+              : m.via === "webhook"
+                ? "a webhook"
+                : m.via === "email"
+                  ? "email"
+                  : m.via === "goal"
+                    ? "your goal"
+                    : m.via === "routine"
+                    ? `your routine${m.routine?.name ? ` ${m.routine.name}` : ""}`
+                    : null
+        }
+        working={working}
+        // the same stop Cmd+Enter makes before it sends: the turn ends,
+        // and what waited behind it goes together in the next one, as
+        // when a turn ends on its own
+        onSendNow={working ? () => dispatch({ type: "interrupt", botId: bot.id }) : undefined}
+        onSendAgain={sendAgain}
+        editAsk={editAsk}
+      />
+      <GuestMailLine bot={bot} />
+      <GoalChip bot={bot} />
+      <GoalDialog />
+      <Composer
+        key={`${bot.id}:${bot.activeTaskId ?? bot.threadId}`}
+        bot={bot}
+        replyTo={replyTo}
+        onClearReply={() => setReplyTo(null)}
+        prefill={prefill}
+        onEditLast={editLast}
+      />
+      {exchange && (
+        <AgentExchangeDialog
+          botId={bot.id}
+          peerId={exchange.peerId}
+          focusId={exchange.messageId}
+          focusText={exchange.text}
+          onClose={() => setExchange(null)}
+        />
+      )}
       {state.meetingFor === bot.id && <MeetingPanel bot={bot} />}
       {forwarding && (
         <ForwardDialog

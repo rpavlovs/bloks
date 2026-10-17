@@ -24,6 +24,14 @@ export interface McpServerConfig {
   args?: string[];
   url?: string;
   headers?: Record<string, string>;
+  /** A stdio server's own environment. */
+  env?: Record<string, string>;
+}
+
+/** Only the names that have a value. One with none is waiting for the
+ * person to fill it in, and sending it empty would hide that. */
+function filled(map: Record<string, string> | undefined): Record<string, string> {
+  return Object.fromEntries(Object.entries(map ?? {}).filter(([, value]) => value));
 }
 
 export interface McpTool {
@@ -61,6 +69,10 @@ export const MAX_RESOURCE_BYTES = 2 * 1024 * 1024;
 
 export interface McpConnection {
   request(method: string, params?: unknown): Promise<any>;
+  /** A message that expects no answer. Sent as a request instead, with
+   * an id, a server that follows the spec never replies, and anything
+   * waiting on it waits forever. */
+  notify(method: string, params?: unknown): Promise<void>;
   close(): void;
 }
 
@@ -70,7 +82,8 @@ function connectStdio(config: McpServerConfig): McpConnection {
   if (!config.command) throw new Error("that server has no command to run");
   const child = spawn(config.command, config.args ?? [], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: process.env,
+    env: { ...process.env, ...filled(config.env) },
+    windowsHide: true,
   }) as ChildProcessWithoutNullStreams;
 
   let link: RpcLink | null = attachRpc({
@@ -114,6 +127,9 @@ function connectStdio(config: McpServerConfig): McpConnection {
     request: (method, params) => {
       if (!link) return Promise.reject(new Error("the server is not running"));
       return link.request(method, params);
+    },
+    notify: async (method, params) => {
+      link?.notify(method, params);
     },
     close,
   };
@@ -159,7 +175,7 @@ function connectHttp(config: McpServerConfig): McpConnection {
           "content-type": "application/json",
           accept: "application/json, text/event-stream",
           ...(session ? { "mcp-session-id": session } : {}),
-          ...(config.headers ?? {}),
+          ...filled(config.headers),
         },
         body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }),
         signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
@@ -169,6 +185,21 @@ function connectHttp(config: McpServerConfig): McpConnection {
       session = response.headers.get("mcp-session-id") ?? session;
       if (!response.ok) throw new Error(`that server answered HTTP ${response.status}`);
       return unwrapFrame(await response.text());
+    },
+    async notify(method, params) {
+      if (closed) return;
+      // no id, and a 202 with no body is the whole answer
+      await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          ...(session ? { "mcp-session-id": session } : {}),
+          ...filled(config.headers),
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", method, params }),
+        signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+      }).catch(() => {});
     },
     close() {
       closed = true;
@@ -207,7 +238,7 @@ export class McpClient {
       );
       // the spec's handshake: the server is not to be called until it has
       // been told the client is ready
-      await connection.request("notifications/initialized").catch(() => {});
+      await connection.notify("notifications/initialized").catch(() => {});
     })();
     const held: Held = { connection, ready, usedAt: Date.now() };
     this.held.set(config.id, held);

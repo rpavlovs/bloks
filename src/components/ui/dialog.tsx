@@ -34,7 +34,7 @@ function DialogContent({
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          "fixed left-1/2 top-1/2 z-50 w-full max-w-[440px] -translate-x-1/2 -translate-y-1/2 animate-pop-in rounded-2xl border bg-popover p-5 shadow-2xl shadow-[--shadow-color] outline-none",
+          "fixed left-1/2 top-1/2 z-50 w-full max-w-[440px] -translate-x-1/2 -translate-y-1/2 animate-pop-in rounded-2xl border bg-popover p-5 shadow-2xl shadow-(color:--shadow-color) outline-none",
           className,
         )}
         {...props}

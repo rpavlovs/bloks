@@ -257,7 +257,7 @@ export function DesktopOverlay({
       className={cn(
         "flex min-h-0 min-w-0 flex-col bg-background",
         layout.dock === "float" &&
-          "fixed z-[70] overflow-hidden rounded-2xl border shadow-2xl shadow-[--shadow-color]",
+          "fixed z-[70] overflow-hidden rounded-2xl border shadow-2xl shadow-(color:--shadow-color)",
       )}
       style={
         layout.dock === "float"

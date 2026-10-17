@@ -23,6 +23,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/cn";
+import { useEscape } from "@/lib/useEscape";
 
 interface DiffLine {
   kind: "same" | "add" | "del" | "gap";
@@ -71,12 +72,7 @@ export function MemoryPanel() {
   const bot = agents.find((b) => b.id === botId) ?? null;
   const close = () => dispatch({ type: "toggleMemory", open: false, botId: null });
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  useEscape(close);
 
   return (
     <div
@@ -84,7 +80,7 @@ export function MemoryPanel() {
       onClick={close}
     >
       <div
-        className="flex h-[82%] w-[900px] max-w-[94vw] animate-pop-in flex-col overflow-hidden rounded-2xl border bg-popover shadow-2xl shadow-[--shadow-color]"
+        className="flex h-[82%] w-[900px] max-w-[94vw] animate-pop-in flex-col overflow-hidden rounded-2xl border bg-popover shadow-2xl shadow-(color:--shadow-color)"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-label="Memory"
@@ -320,7 +316,10 @@ function Files({ bot }: { bot: Bot }) {
               onChange={(e) => setNaming(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") createTopic();
-                if (e.key === "Escape") setNaming(null);
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setNaming(null);
+                }
               }}
               placeholder="people, projects..."
               className="h-7 text-[12px]"

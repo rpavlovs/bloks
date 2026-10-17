@@ -66,7 +66,7 @@ describe("bloks-mcp", () => {
     child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
     const { result } = await rpc("tools/list");
     const names = result.tools.map((t: any) => t.name).sort();
-    assert.deepEqual(names, ["ask_agent", "list_agents", "list_rooms", "message_room", "morning_brief", "read_conversation", "search", "waiting_on_me"]);
+    assert.deepEqual(names, ["ask_agent", "list_agents", "list_rooms", "message_room", "morning_brief", "read_conversation", "read_message", "search", "waiting_on_me"]);
     assert.ok(!names.some((n: string) => /approve|delete|setting|key/i.test(n)), "nothing that approves, deletes or configures");
   });
 
@@ -85,5 +85,22 @@ describe("bloks-mcp", () => {
     assert.match(missing.text, /No agent called "Nobody"\. Agents: .*Writer/);
     assert.equal((await tool("waiting_on_me")).text, "Nothing is waiting on you.");
     assert.equal((await tool("morning_brief")).text, "No brief yet.");
+  });
+
+  test("an archived room is left out of the room list", async () => {
+    const { bots } = await h.json("/api/bots?messages=0");
+    const { bot: second } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Editor" }) });
+    const memberIds = [bots.find((b: any) => b.name === "Writer").id, second.id];
+    const room = (name: string) => h.json("/api/bloks", { method: "POST", body: JSON.stringify({ name, memberIds }) });
+    const { blok: open } = await room("Open room");
+    const { blok: shelved } = await room("Shelved room");
+    await h.json(`/api/bloks/${shelved.id}`, { method: "PATCH", body: JSON.stringify({ archived: true }) });
+
+    const { text } = await tool("list_rooms");
+    assert.match(text, /- Open room: /);
+    assert.doesNotMatch(text, /Shelved room/, "an archived room is listed as if it were open");
+
+    await h.fetch(`/api/bloks/${open.id}`, { method: "DELETE" });
+    await h.fetch(`/api/bloks/${shelved.id}`, { method: "DELETE" });
   });
 });

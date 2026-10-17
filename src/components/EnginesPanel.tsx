@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/cn";
 import { EngineReport } from "./EngineReport";
+import { EngineSetupActions, EngineUpdateNote } from "./EngineSetup";
 
 const AUTH_NOTE: Record<ProviderRow["auth"], string> = {
   oauth: "Browser sign-in",
@@ -82,6 +83,15 @@ function EngineRow({ provider }: { provider: ProviderRow }) {
   // an engine can be connected and still be down: no CLI on PATH, a key
   // the provider rejected, a local server that is not running
   const instance = state.instances.find((i) => i.driverKind === provider.kind);
+  // after an install or a sign-in, only a fresh look can say it worked
+  const refresh = () => {
+    api("/api/providers")
+      .then(({ providers }) => dispatch({ type: "providers", providers }))
+      .catch(() => {});
+    api("/api/instances")
+      .then(({ instances }) => dispatch({ type: "instances", instances }))
+      .catch(() => {});
+  };
   const down = instance && instance.snapshot.state !== "available";
 
   const signIn = () => {
@@ -116,14 +126,22 @@ function EngineRow({ provider }: { provider: ProviderRow }) {
           <div
             className={cn(
               "truncate text-[12px]",
-              down ? "text-warning" : provider.connected ? "text-success" : "text-muted-foreground",
+              down || provider.needsSignIn
+                ? "text-warning"
+                : provider.connected
+                  ? "text-success"
+                  : "text-muted-foreground",
             )}
           >
+            {/* installed without a login cannot answer, so it is not
+                "Connected", however green that would look */}
             {down
               ? (instance!.snapshot.reason ?? "unavailable")
-              : provider.connected
-                ? "Connected"
-                : AUTH_NOTE[provider.auth]}
+              : provider.needsSignIn
+                ? "Installed, not signed in"
+                : provider.connected
+                  ? "Connected"
+                  : AUTH_NOTE[provider.auth]}
           </div>
         </div>
 
@@ -162,6 +180,17 @@ function EngineRow({ provider }: { provider: ProviderRow }) {
         <KeyForm provider={provider} onDone={() => setOpen(false)} />
       )}
       {provider.auth === "cli" && (!provider.connected || provider.needsSignIn) && (
+        <div className="pl-10">
+          <EngineSetupActions
+            kind={provider.kind}
+            name={provider.name}
+            installed={provider.connected}
+            signedOut={Boolean(provider.needsSignIn)}
+            onChanged={refresh}
+          />
+        </div>
+      )}
+      {provider.auth === "cli" && (!provider.connected || provider.needsSignIn) && (
         <div className="mt-1.5 pl-10 text-[11.5px] leading-relaxed text-muted-foreground">
           {/* Installed and installed-but-signed-out need different advice.
               Some CLIs sign in where we cannot see it, so the second is a
@@ -170,6 +199,9 @@ function EngineRow({ provider }: { provider: ProviderRow }) {
             ? `No sign-in detected. ${provider.signInHint ?? provider.keyHint}`
             : provider.keyHint}
         </div>
+      )}
+      {provider.auth === "cli" && provider.connected && (
+        <EngineUpdateNote kind={provider.kind} name={provider.name} className="ml-10 mt-2" />
       )}
       {error && <div className="mt-1.5 pl-10 text-[12px] text-destructive">{error}</div>}
     </div>
@@ -198,7 +230,8 @@ export function EnginesPanel() {
   const providers = state.providers;
   if (!providers.length) return null;
 
-  const connected = providers.filter((p) => p.connected).length;
+  // counted the way the rows read: installed without a login is not ready
+  const connected = providers.filter((p) => p.connected && !p.needsSignIn).length;
   // Twelve flat rows is a list you scan past. The split is the one that
   // actually changes what an agent can do.
   const agents = providers.filter((p) => p.agentic);
@@ -209,7 +242,7 @@ export function EnginesPanel() {
       <div className="mt-4 overflow-hidden rounded-2xl border bg-card">
         <div className="px-4 pb-3 pt-4">
           <div className="flex items-baseline justify-between gap-2">
-            <div className="text-[13.5px] font-semibold text-foreground">Engines</div>
+            <div className="text-[13.5px] font-semibold text-foreground">Your engines</div>
             <div className="text-[11.5px] text-muted-foreground">{connected} connected</div>
           </div>
           <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted-foreground">

@@ -1,16 +1,17 @@
 // Antigravity, Google's agentic CLI, driven headless.
 //
-// `agy --print` runs one turn and emits newline-delimited JSON when asked
+// agy runs one turn headless and emits newline-delimited JSON when asked
 // for stream-json output. Continuity is agy's own conversation id, handed
 // back in its first event and replayed with `--conversation` next turn.
 //
 // Two things about this CLI shape the driver:
 //
-//   The prompt travels in argv. agy has no stdin path in print mode (a
-//   bare --print just exits), so this is the one engine where the turn
-//   text is briefly visible to `ps`. There is nothing to route around
-//   that with; anyone for whom that matters should prefer an engine that
-//   reads stdin.
+//   The prompt travels on stdin. argv is readable by every process on the
+//   machine through ps, and the persona carries whatever the person wrote
+//   about themselves in settings, so since agy 1.1.15 the turn goes in as
+//   one stream-json line on stdin, which is then closed: agy answers it
+//   and exits. An agy older than that has no stdin path in print mode (a
+//   bare --print just exits) and is still handed the prompt with --print.
 //
 //   There is no interactive permission channel in print mode. accept-edits
 //   lets it edit files and refuses the rest; the full-auto setting removes
@@ -18,6 +19,8 @@
 //   Approval cards therefore never originate here.
 import { execFile, spawn } from "node:child_process";
 import { homedir } from "node:os";
+
+import { lineSplitter } from "../ndjson.ts";
 
 import type {
   DriverCreateInput,
@@ -32,6 +35,8 @@ import type {
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
 import { describeEarlyExit, describeSpawnError } from "./spawn-error.ts";
+import { OWN_GROUP } from "../no-console.ts";
+import { EngineProcesses } from "./engine-processes.ts";
 
 const DRIVER_KIND = "antigravity";
 
@@ -113,12 +118,29 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     const { instanceId, config } = input;
     const listeners = new Set<RuntimeEventListener>();
     const running = new Map<string, { turnId: string; abort: () => void }>();
+    /** Every engine process this instance started, ended on dispose (engine-processes.ts). */
+    const engines = new EngineProcesses();
+
+    // Whether this agy takes its prompt on stdin (1.1.15 and later), asked
+    // of the CLI once. A version it does not print plainly is taken to be
+    // a current one: the prompt stays out of argv unless agy is known to be
+    // too old to read it anywhere else.
+    let stdinPath: Promise<boolean> | null = null;
+    const readsStdin = () =>
+      (stdinPath ??= new Promise<boolean>((resolve) => {
+        execFile(config.cli, ["--version"], { timeout: 8_000, windowsHide: true }, (error, stdout) => {
+          const found = error ? null : /(\d+)\.(\d+)\.(\d+)/.exec(String(stdout));
+          if (!found) return resolve(true);
+          const [major, minor, patch] = found.slice(1).map(Number);
+          resolve(major > 1 || (major === 1 && (minor > 1 || (minor === 1 && patch >= 15))));
+        });
+      }));
 
     // what this account can run, from the CLI itself; signed out or
     // unreadable leaves the list above in place
     const models: ModelCatalog = { default: MODELS.default, options: [...MODELS.options] };
     const catalogReady = new Promise<void>((resolve) => {
-      execFile(config.cli, ["models"], { timeout: 20_000 }, (error, stdout) => {
+      execFile(config.cli, ["models"], { timeout: 20_000, windowsHide: true }, (error, stdout) => {
         const catalog = error ? null : catalogFromAgyModels(String(stdout));
         if (catalog) {
           models.options = catalog.options;
@@ -146,17 +168,19 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       const resume = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
 
       // The persona rides ahead of the message in the same prompt, since
-      // print mode offers no separate system channel.
+      // headless agy offers no separate system channel.
       const prompt = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
+      const viaStdin = await readsStdin();
 
       const argv = [
-        "--print", prompt,
+        ...(viaStdin ? ["--input-format", "stream-json"] : ["--print", prompt]),
         "--output-format", "stream-json",
         // agy's own ceiling on a stuck turn; without it a wedged tool call
         // would pin the composer forever
         "--print-timeout", "10m",
       ];
-      if (config.fullAuto) argv.push("--dangerously-skip-permissions");
+      // a turn the owner did not vouch for asks, however the engine is set
+      if ((config.fullAuto && !turn.untrusted) || (turn.fullAccess && !turn.shared)) argv.push("--dangerously-skip-permissions");
       else argv.push("--mode", "accept-edits");
       if (turn.model) argv.push("--model", turn.model);
       if (resume) argv.push("--conversation", resume);
@@ -165,9 +189,16 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         cwd: turn.cwd ?? homedir(),
         // the turn's own credential (see server/agent-cli.ts)
         env: { ...process.env, ...(turn.env ?? {}) },
-        stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: OWN_GROUP,
+        windowsHide: true,
       });
+      engines.add(child);
+      // The turn as one line, then the end of input: agy answers it and
+      // exits. An older agy reads nothing here and gets the end at once.
+      // A process that died at once closes its end first; its exit says why.
+      child.stdin.on("error", () => {});
+      child.stdin.end(viaStdin ? `${JSON.stringify({ event: "user", message: { content: prompt } })}\n` : undefined);
 
       let finished = false;
       const finish = (ok: boolean, stopReason: string | null) => {
@@ -212,6 +243,8 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                   itemType: "tool",
                   itemId,
                   title: payload.tool_name,
+                  // agy never says which files a step wrote
+                  mayWrite: true,
                 });
               } else if (payload.state === "DONE" || payload.state === "ERROR") {
                 emit({
@@ -265,17 +298,13 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
 
       // multibyte text can split across chunks; decode as utf8 stream
       child.stdout.setEncoding("utf8");
-      let pending = "";
-      child.stdout.on("data", (chunk: string) => {
-        pending += chunk;
-        for (;;) {
-          const cut = pending.indexOf("\n");
-          if (cut === -1) break;
-          const line = pending.slice(0, cut);
-          pending = pending.slice(cut + 1);
+      // read in linear time, however long a line (see lineSplitter)
+      child.stdout.on(
+        "data",
+        lineSplitter((line) => {
           if (line.trim()) consume(line);
-        }
-      });
+        }),
+      );
 
       let stderr = "";
       child.stderr.on("data", (chunk) => {
@@ -324,14 +353,15 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
 
       running.set(threadId, { turnId, abort });
       emit({ ...envelope(threadId, turnId), type: "turn.started" });
-      appendNative(threadId, { dir: "out", source: "agy.stream", msg: { argv: argv.slice(2) } });
+      // never the prompt, which an older agy has in its argv
+      appendNative(threadId, { dir: "out", source: "agy.stream", msg: { argv: viaStdin ? argv : argv.slice(2) } });
 
       return { turnId };
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const version = await new Promise<string | null>((resolve) => {
-        execFile(config.cli, ["--version"], { timeout: 8_000 }, (error, stdout) =>
+        execFile(config.cli, ["--version"], { timeout: 8_000, windowsHide: true }, (error, stdout) =>
           resolve(error ? null : stdout.trim()),
         );
       });
@@ -371,6 +401,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       dispose: async () => {
         for (const turn of running.values()) turn.abort();
         listeners.clear();
+        await engines.end();
       },
     };
   },

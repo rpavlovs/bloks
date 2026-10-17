@@ -17,6 +17,8 @@ import { AgentAvatar } from "./Avatar";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/cn";
+import { useEscape } from "@/lib/useEscape";
+import { plural } from "@/lib/plural";
 
 interface BriefPart {
   botId: string | null;
@@ -97,12 +99,7 @@ export function BriefPanel() {
     setPlaying(null);
   };
   useEffect(() => stop, []);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  useEscape(close);
 
   // Each part is fetched as a file and played from memory, the way the
   // rest of the app plays speech; the next one is fetched while this one
@@ -151,8 +148,7 @@ export function BriefPanel() {
   };
 
   const open = (botId: string, threadId: string) => {
-    dispatch({ type: "select", id: botId });
-    dispatch({ type: "selectTask", botId, taskId: threadId });
+    dispatch({ type: "select", id: botId, lane: threadId });
     close();
   };
 
@@ -172,7 +168,7 @@ export function BriefPanel() {
       onClick={close}
     >
       <div
-        className="flex h-[84%] w-[760px] max-w-[94vw] animate-pop-in flex-col overflow-hidden rounded-2xl border bg-popover shadow-2xl shadow-[--shadow-color]"
+        className="flex h-[84%] w-[760px] max-w-[94vw] animate-pop-in flex-col overflow-hidden rounded-2xl border bg-popover shadow-2xl shadow-(color:--shadow-color)"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-label="Morning brief"
@@ -298,7 +294,7 @@ export function BriefPanel() {
                   ))}
                   {brief.spend.turns > 0 && (
                     <span className="rounded-full bg-muted px-2.5 py-1">
-                      {brief.spend.turns} turns
+                      {plural(brief.spend.turns, "turn")}
                       {brief.spend.costKnown && brief.spend.cost > 0 ? `, about $${brief.spend.cost.toFixed(2)}` : ""}
                     </span>
                   )}

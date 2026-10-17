@@ -59,6 +59,10 @@ test("agent names match as whole words, any case", () => {
 test("nothing the room says can ping a whole channel", () => {
   assert.doesNotMatch(outbound("slack", { kind: "agent", name: "Nova" }, "done <!channel> <!here>"), /<!/);
   assert.doesNotMatch(outbound("discord", { kind: "agent", name: "Nova" }, "done @everyone @here"), /@everyone|@here/);
+  // nor a Slack user group, which pings everyone in it
+  const group = outbound("slack", { kind: "agent", name: "Nova" }, "cc <!subteam^S0123ABC|@engineering> and <!subteam^S9>");
+  assert.doesNotMatch(group, /<!/);
+  assert.match(group, /@engineering/);
 });
 
 test("a person's name cannot smuggle markup", () => {

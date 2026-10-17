@@ -161,15 +161,19 @@ describe("through the server", () => {
     assert.equal(fired.fired, true, fired.note);
     const lane = await waitFor(async () => {
       const w = (await h.json("/api/watchers")).watchers.find((x: any) => x.id === watcher.id);
-      return w?.laneId ? w : null;
+      return w?.fires.length ? w : null;
     });
     assert.ok(lane);
     assert.equal(lane.fires.length, 1);
     await waitFor(async () => (heard.some((q) => q.includes("invoice-march.pdf")) ? true : null));
     assert.ok(heard.some((q) => /New: invoice-march\.pdf/.test(q) && /File new invoices by date/.test(q)));
+    // in the agent's one conversation, General, and no lane of its own (GitHub 237)
+    const general = bot.tasks[0].id;
+    const { messages } = await h.json(`/api/bots/${bot.id}/messages?thread=${general}&limit=50`);
+    assert.ok(messages.some((m: any) => m.via === "watcher" && /invoice-march\.pdf/.test(m.text)));
     const { bots } = await h.json("/api/bots");
     const me = bots.find((b: any) => b.id === bot.id);
-    assert.ok(me.tasks.some((t: any) => t.id === lane.laneId && /Watching/.test(t.title)));
+    assert.deepEqual(me.tasks.map((t: any) => t.title), ["General"]);
   });
 
   test("a page fires only when it mentions what it was told to look for", async () => {
@@ -187,5 +191,28 @@ describe("through the server", () => {
     assert.equal(fired.fired, true, fired.note);
     await h.fetch(`/api/watchers/${id}`, { method: "DELETE" });
     assert.ok(!(await h.json("/api/watchers")).watchers.some((w: any) => w.id === id));
+  });
+
+  test("a change found while a person holds the agent is still there after the release (GitHub 135)", async () => {
+    const { bot } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Held" }) });
+    await h.fetch(`/api/bots/${bot.id}`, { method: "PATCH", body: JSON.stringify({ modelSelection: { instanceId: "grok", model: "m-1" } }) });
+    page = "<p>Departs 14:00</p>";
+    const made = await h.json("/api/watchers", {
+      method: "POST",
+      body: JSON.stringify({ botId: bot.id, kind: "page", target: pageUrl, instruction: "Tell me the new time." }),
+    });
+    const id = made.watcher.id;
+    await waitFor(async () => ((await h.json("/api/watchers")).watchers.find((w: any) => w.id === id)?.lastCheck ? true : null));
+    page = "<p>Departs 15:00</p>";
+    await h.json(`/api/bots/${bot.id}/wheel`, { method: "POST", body: JSON.stringify({ why: "checking something" }) });
+    const whileHeld = await h.json(`/api/watchers/${id}/check`, { method: "POST" });
+    assert.equal(whileHeld.fired, false);
+    assert.match(whileHeld.note, /held/);
+    await h.json(`/api/bots/${bot.id}/wheel`, { method: "DELETE" });
+    const after = await h.json(`/api/watchers/${id}/check`, { method: "POST" });
+    assert.equal(after.fired, true, `the change was used up while the agent was held: ${after.note}`);
+    await waitFor(async () => (heard.some((q) => q.includes("Departs 15:00")) ? true : null));
+    assert.ok(heard.some((q) => q.includes("+ Departs 15:00")));
+    await h.fetch(`/api/watchers/${id}`, { method: "DELETE" });
   });
 });

@@ -34,6 +34,9 @@ contextBridge.exposeInMainWorld("bloks", {
   updateState: () => ipcRenderer.invoke("update:state"),
   updateCheck: () => ipcRenderer.invoke("update:check"),
   updateInstall: () => ipcRenderer.invoke("update:install"),
+  updateRestartNow: () => ipcRenderer.invoke("update:restart-now"),
+  updateLater: () => ipcRenderer.invoke("update:later"),
+  updateNotInstalledSeen: () => ipcRenderer.invoke("update:not-installed-seen"),
   relaunch: () => ipcRenderer.invoke("app:relaunch"),
   // a Bloks on another computer (electron/remote.mjs)
   remoteStatus: () => ipcRenderer.invoke("remote:status"),
@@ -49,6 +52,9 @@ contextBridge.exposeInMainWorld("bloks", {
   // bloks:// links from the website (electron/main.mjs)
   onLink: subscription("link:open"),
   pendingLink: () => ipcRenderer.invoke("link:pending"),
+  // the macOS menu bar's own items, Settings among them (electron/app-menu.mjs)
+  onMenuCommand: subscription("menu:command"),
+  pendingMenuCommand: () => ipcRenderer.invoke("menu:pending"),
   speechStart: () => ipcRenderer.invoke("speech:start"),
   speechStop: () => ipcRenderer.invoke("speech:stop"),
   // meeting notes: the helper's long-running mode (electron/speech.mjs)

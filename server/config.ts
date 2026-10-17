@@ -8,12 +8,14 @@
 // Credentials may also arrive from the environment, which is what a
 // container or a CI run wants and what lets someone try the app without
 // writing a key to disk at all.
-import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { readFileSync, mkdirSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readSaved, isRecord, writeFileAtomic } from "./atomic-write.ts";
 import type { InstanceConfigMap } from "./contracts.ts";
+import { usableSecrets } from "./env-names.ts";
 import { CUSTOM_SPEC, PROVIDER_SPECS, specFor } from "./providers.ts";
 
 /** One connected engine: the credential, plus an override for people
@@ -44,6 +46,10 @@ export interface CustomEndpoint {
 }
 
 export interface AppConfig {
+  /** The port to listen on when BLOKS_PORT does not say. Chosen by hand,
+   * for a machine where the usual one is taken; the desktop app reads it
+   * too, since an app opened from Finder never sees BLOKS_PORT. */
+  port?: number;
   /** Model providers, keyed by the catalog's driver kind. */
   providers?: Record<string, ProviderConfig>;
   /** Pre-catalog xAI slot. Still read, still written through to
@@ -97,16 +103,11 @@ export interface AppConfig {
   };
   /** Reaching agents from a phone over Telegram. The token is a
    * credential, so it lives here with the rest of them. */
-  telegram?: {
-    token?: string;
-    chatIds?: number[];
-    botId?: string;
-    pairing?: string | null;
-    offset?: number;
-    enabled?: boolean;
-  };
+  telegram?: import("./telegram-bots.ts").TelegramConfig;
   /** User-registered MCP servers, attachable per agent. Headers and
-   * commands live here because this file is already the secrets file. */
+   * commands live here because this file is already the secrets file.
+   * `env` is a stdio server's own environment; a name with an empty value
+   * is one the person has yet to fill in, and is not passed on. */
   mcpServers?: Array<{
     id: string;
     name: string;
@@ -115,6 +116,7 @@ export interface AppConfig {
     args?: string[];
     url?: string;
     headers?: Record<string, string>;
+    env?: Record<string, string>;
   }>;
   /** Values agents asked for via secret cards, injected into engine
    * environments under their env-var names. Never echoed to clients. */
@@ -125,6 +127,11 @@ export interface AppConfig {
    * open the app on a different port, and a returning user is asked to
    * onboard again while a genuinely new one is skipped past it. */
   setupDoneAt?: number;
+  /** When the routines, watchers and webhooks that named no conversation
+   * were given the one they already ran in, once, on the upgrade that
+   * made an agent's first conversation the default (GitHub 237). Here
+   * for the same reason as setupDoneAt: it describes this workspace. */
+  oneConversationAt?: number;
   /** Shared context every agent receives, not a secret, echoed back to
    * the app so the settings field can prefill. */
   /** `name` is how members of a shared room see the owner. */
@@ -132,16 +139,38 @@ export interface AppConfig {
   /** The morning brief (server/brief.ts): on unless turned off, at 08:00
    * unless another time is chosen. */
   brief?: { enabled?: boolean; time?: string };
+  /** The daily backup (server/backup.ts): on unless turned off. It never
+   * holds saved keys, since nobody is there to give it a passphrase. */
+  backups?: { auto?: boolean };
   /** How a lane is kept inside the model's window. Off means the fold
    * happens once at a threshold; on means one message is absorbed after
    * each turn instead. See the note in server/context.ts for what that
    * trades: absorbing every turn rewrites history every turn, which
-   * breaks the provider's prompt cache prefix every turn. */
-  compaction?: { micro?: boolean };
+   * breaks the provider's prompt cache prefix every turn. `idle` asks a
+   * quiet Claude Code conversation to compact before its cache expires;
+   * see the note in server/context.ts. `beforeTurn` is the most tokens a
+   * native session may carry into a new turn before it is compacted
+   * first, 0 for never and unset for the default; `beforeTurnAt` is the
+   * share of the window that also counts as too full (GitHub 222, 223). */
+  compaction?: { micro?: boolean; idle?: boolean; beforeTurn?: number; beforeTurnAt?: number };
   /** Whether a finished session is read back for something worth keeping.
    * Off unless asked for: it spends the person's own tokens on work they
    * did not request. What it finds is always staged, never installed. */
   skills?: { propose?: boolean };
+  /** How long a tool call may go without a word from the engine before
+   * Bloks stops the turn, in minutes; 0 is never. Unset is the default
+   * in server/drivers/stall.ts. */
+  turns?: { stallMinutes?: number };
+  /** Whether an agent is reminded, before the person's turn, of what it
+   * said elsewhere that matches. Unset is on; each agent can also turn it
+   * off for itself (BotRecord.recallBeforeTurn). */
+  recall?: { beforeTurn?: boolean };
+  /** Agent-started turns in a row, 1 to 50, default 12. There is no Off;
+   * anything else stored here is read as 12 (agentTurnLimit). */
+  agents?: { turnLimit?: number };
+  /** Show a card for files changed during an overlapping turn even when
+   * none are named as its own. On unless turned off; own-file cards stay. */
+  changes?: { showShared?: boolean };
   /** What every new agent starts with, whoever hires it. Without this an
    * agent's first chat pins to its own workspace before anybody can
    * point it elsewhere. A missing key keeps the built-in start: its own
@@ -149,7 +178,7 @@ export interface AppConfig {
    * An agent hiring an agent never passes on more approvals than it has. */
   agentDefaults?: {
     cwd?: string;
-    approvals?: "ask" | "edits" | "auto";
+    approvals?: "ask" | "edits" | "auto" | "full";
     modelSelection?: { instanceId: string; model: string };
     effort?: "low" | "medium" | "high";
   };
@@ -204,12 +233,12 @@ export function ensureDirs() {
 }
 
 export function loadConfig(): AppConfig {
-  let cfg: AppConfig = {};
-  try {
-    cfg = JSON.parse(readFileSync(join(DATA_DIR, "config.json"), "utf8"));
-  } catch {
-    /* first run, env fallbacks below */
-  }
+  return withEnvironment(readSaved<AppConfig>(join(DATA_DIR, "config.json"), {}, isRecord));
+}
+
+/** Also used on the result of a save: a successful write must not be
+ * followed by another fallible read just to refresh the live settings. */
+function withEnvironment(cfg: AppConfig): AppConfig {
   cfg.xai = { key: process.env.XAI_API_KEY, ...cfg.xai };
   cfg.composio = { key: process.env.COMPOSIO_KEY, ...cfg.composio };
   cfg.box = { token: process.env.BOX_TOKEN, ...cfg.box };
@@ -245,14 +274,9 @@ export function connectedProviders(cfg: AppConfig): string[] {
 /** Merge changes into the config file, preserving whatever else is in
  * it. Nothing written here is ever sent back to a client: the API answers
  * questions about credentials with yes or no, never with the value. */
-export function saveConfig(patch: Partial<AppConfig>): void {
+export function saveConfig(patch: Partial<AppConfig>, beforeWrite?: () => void): AppConfig {
   const p = join(DATA_DIR, "config.json");
-  let disk: Record<string, unknown> = {};
-  try {
-    disk = JSON.parse(readFileSync(p, "utf8"));
-  } catch {
-    /* first write */
-  }
+  const disk = readSaved<Record<string, unknown>>(p, {}, isRecord);
   // An allowlist, not a spread: this file holds credentials and a request
   // body is not a config file. A section missing from here is a section
   // that silently will not save, which is what happened the first time
@@ -270,12 +294,21 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     "shortcuts",
     "compaction",
     "skills",
+    "turns",
+    "recall",
+    "agents",
+    "changes",
     "telegram",
     "chat",
     "brief",
+    "backups",
   ] as const) {
     if (patch[key] && typeof patch[key] === "object") {
-      disk[key] = { ...(disk[key] as object), ...patch[key] };
+      // The migrated Telegram section is a complete private record. A
+      // merge would retain the old workspace token or a removed binding.
+      disk[key] = key === "telegram" && patch.telegram?.version === 1
+        ? patch.telegram
+        : { ...(disk[key] as object), ...patch[key] };
     }
   }
   if (Array.isArray((patch as Record<string, unknown>).mcpServers)) {
@@ -291,35 +324,38 @@ export function saveConfig(patch: Partial<AppConfig>): void {
   if (typeof (patch as Record<string, unknown>).setupDoneAt === "number") {
     disk.setupDoneAt = (patch as Record<string, unknown>).setupDoneAt;
   }
+  if (typeof patch.oneConversationAt === "number") disk.oneConversationAt = patch.oneConversationAt;
   mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
   // this file holds API keys in plaintext, never leave it group/world
-  // readable (mode on write only applies to a fresh file, so chmod too)
-  writeFileSync(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
-  try {
-    chmodSync(p, 0o600);
-  } catch {
-    /* non-POSIX filesystem, best effort */
-  }
+  // readable; every save is a new file made 0600, whatever the old one was
+  beforeWrite?.();
+  writeFileAtomic(p, JSON.stringify(disk, null, 2), 0o600);
+  return withEnvironment(disk as AppConfig);
+}
+
+/** Forgets one saved secret, by its name. Deleted rather than merged
+ * away: saveConfig merges, and a merged `undefined` would leave the name
+ * in the live settings, handed to every turn with no value. Null when
+ * there was no such secret. */
+export function forgetSecret(name: string): AppConfig | null {
+  const p = join(DATA_DIR, "config.json");
+  const disk = readSaved<Record<string, any> | null>(p, null, isRecord);
+  if (!disk || !isRecord(disk.secrets) || !Object.prototype.hasOwnProperty.call(disk.secrets, name)) return null;
+  delete disk.secrets[name];
+  writeFileAtomic(p, JSON.stringify(disk, null, 2), 0o600);
+  return withEnvironment(disk);
 }
 
 /** Forgets a provider's credential entirely, rather than blanking it. */
-export function disconnectProvider(kind: string): void {
+export function disconnectProvider(kind: string): AppConfig {
   const p = join(DATA_DIR, "config.json");
-  let disk: Record<string, any> = {};
-  try {
-    disk = JSON.parse(readFileSync(p, "utf8"));
-  } catch {
-    return;
-  }
+  const disk = readSaved<Record<string, any> | null>(p, null, isRecord);
+  if (!disk) return withEnvironment({});
   if (disk.providers) delete disk.providers[kind];
   // the legacy slot is the same credential under an older name
   if (kind === "grok") delete disk.xai;
-  writeFileSync(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
-  try {
-    chmodSync(p, 0o600);
-  } catch {
-    /* non-POSIX filesystem, best effort */
-  }
+  writeFileAtomic(p, JSON.stringify(disk, null, 2), 0o600);
+  return withEnvironment(disk);
 }
 
 // Default fleet: the CLI agents and the box, plus an instance for every
@@ -377,7 +413,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   }
   for (const entry of Object.values(map)) {
     entry.environment = {
-      ...cfg.secrets,
+      ...usableSecrets(cfg.secrets),
       ...Object.fromEntries(
         Object.entries(cfg.providers ?? {})
           .filter(([, v]) => v?.key)
