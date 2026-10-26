@@ -325,9 +325,9 @@ export function memoryPrompt(botId: string, how: "files" | "tools" = "files"): s
   const loaded = `auto-loaded each turn, the first ${MEMORY_MAX_LINES} lines and ${MEMORY_MAX_BYTES / 1000} KB; the rest is cut`;
   const guidance = [
     how === "tools"
-      ? `You keep persistent memory with the memory_read and memory_write tools: MEMORY.md (${loaded}) and topic files that you read when relevant.`
-      : `You keep persistent memory in ${join(dir, "MEMORY.md")} (${loaded}) and topic files under ${join(dir, "memory")}/ that you read when relevant.`,
-    "Curate it: keep it short, correct wrong notes, delete stale ones.",
+      ? `Bloks provides fallback persistent memory with the memory_read and memory_write tools: MEMORY.md (${loaded}) and topic files that you read when relevant.`
+      : `Bloks provides fallback persistent memory in ${join(dir, "MEMORY.md")} (${loaded}) and topic files under ${join(dir, "memory")}/ that you read when relevant.`,
+    "Use the configured canonical record when one exists; otherwise Bloks memory is available. Curate the record you use: keep it short, correct wrong notes, delete stale ones.",
     "Before ending a turn, retain a settled decision, a commitment you adopt for later work, or a correction when future work will need it, without waiting to be asked to remember.",
     "Use an existing canonical record rather than duplicate it; keep enough context and a useful topic pointer where needed to find it after the conversation is no longer available. Read the relevant records when later work depends on them.",
     "Record facts only when confirmed by the user or your own verified work. Label adopted decisions and commitments as such, with their source and reason. A correction supersedes the earlier fact or decision it corrects. Passing discussion needs no record.",
