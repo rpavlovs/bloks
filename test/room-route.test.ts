@@ -180,13 +180,20 @@ test("every way the model can fail lands on the lead, and says why", async () =>
 test("a model past the deadline is not waited for", async () => {
   let release!: (text: string) => void;
   const { run } = ask(() => new Promise<string>((r) => (release = r)), 60);
-  const started = Date.now();
-  const route = await run();
-  assert.ok(Date.now() - started < 1_000, "the deadline was not held to");
-  assert.deepEqual(route, fallbackRoute(ada.id, "timeout", "Gemini (flash-lite)"));
-  assert.equal(routeWords(route, nameOf).chat, "Ada answers as the lead: Auto took too long");
-  // a late answer changes nothing
-  release('{"ids":["m2"],"reason":"late","confidence":1}');
+  // The deadline timer is unrefed, so the test needs a bounded handle of
+  // its own while it waits for the timeout rather than a real server.
+  const keepAlive = setTimeout(() => {}, 1_000);
+  try {
+    const started = Date.now();
+    const route = await run();
+    assert.ok(Date.now() - started < 1_000, "the deadline was not held to");
+    assert.deepEqual(route, fallbackRoute(ada.id, "timeout", "Gemini (flash-lite)"));
+    assert.equal(routeWords(route, nameOf).chat, "Ada answers as the lead: Auto took too long");
+    // a late answer changes nothing
+    release('{"ids":["m2"],"reason":"late","confidence":1}');
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });
 
 test("no engine that can answer is a fallback like any other, and asks nothing", async () => {
