@@ -140,7 +140,7 @@ test("a Telegram follow-up ready while Codex is preparing reaches the first turn
 
 test("the initial snapshot and the first steer preserve ready order", async (t) => {
   const s = await fixture(t);
-  s.spec({ hold: true, holdThread: true, holdSkills: true });
+  s.spec({ hold: true, holdThread: true, holdSkills: true, holdSteerSkills: true });
   s.push("FIRST $selected");
   await s.called("thread/start", 1);
   const first = s.push("READY_A $other-skill");
@@ -148,11 +148,17 @@ test("the initial snapshot and the first steer preserve ready order", async (t) 
   await waitFor(async () => (await s.messages()).some((m) => m.text === "READY_A $other-skill"));
   s.threadGate();
   await s.called("skills/list", 1);
-  const second = s.push("READY_B");
+  const second = s.push("READY_B $selected");
   await waitFor(() => s.polled.has(second));
-  await waitFor(async () => (await s.messages()).some((m) => m.text === "READY_B"));
+  await waitFor(async () => (await s.messages()).some((m) => m.text === "READY_B $selected"));
+  await waitFor(() => s.sends.some((m) => m.reply_parameters?.message_id === second + 1));
+  const receiptId = s.sends.findIndex((m) => m.reply_parameters?.message_id === second + 1) + 1;
   s.skillsGate();
   await s.called("turn/start", 1);
+  await s.called("skills/list", 2);
+  await waitFor(async () => (await s.messages()).some((m) => m.text === "READY_B $selected" && m.delivery?.line === "Waiting to join this turn"));
+  await waitFor(() => s.edits.some((m) => m.message_id === receiptId && m.text === "Waiting to join this turn."));
+  s.steerSkillsGate();
   await s.called("turn/steer", 1);
   const effects = s.calls().filter((c) => ["turn/start", "turn/steer"].includes(c.method));
   assert.match(JSON.stringify(effects[0].params.input), /READY_A/);
@@ -368,6 +374,7 @@ for (const mismatched of [false, true]) test(`an addition arriving during a ${mi
   await s.called("turn/steer", 1);
   s.push("STEER_SECOND");
   await waitFor(async () => (await s.messages()).some((m) => m.text === "STEER_SECOND" && m.preparation?.state === "pending"));
+  assert.equal((await s.messages()).find((m) => m.text === "STEER_SECOND")?.delivery?.line, "Waiting for an earlier input's receipt");
   s.steerGate();
   if (mismatched) {
     await waitFor(async () => (await s.messages()).some((m) => m.text === "STEER_FIRST" && m.preparation?.state === "uncertain"));

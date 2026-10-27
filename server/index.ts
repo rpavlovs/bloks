@@ -16180,14 +16180,14 @@ function prepareFollowup(
     updatePreparationReceipt(lane.id, message.id);
     return message;
   }
-  const earlierInFlight = attempt.unsupported && attempt.messages.some((id) => {
+  const earlierInFlight = attempt.messages.some((id) => {
     const p = store.messagesFor(lane.id).find((row) => row.id === id)?.preparation;
     return p?.state === "dispatching" || p?.state === "uncertain";
-  });
+  }) || (attempt.phase === "running" && steerAttempts.has(lane.id));
   const next = Boolean(attempt.unsupported && !earlierInFlight);
   const delivery: Delivery = next
     ? { route: "queued", why: "you", line: deliveryLine("queued", "you", bot.name) }
-    : { route: "pending", why: "you", line: earlierInFlight ? "Waiting for an earlier input's receipt" : deliveryLine("pending", "you", bot.name) };
+    : { route: "pending", why: "you", line: earlierInFlight ? "Waiting for an earlier input's receipt" : attempt.phase === "running" ? "Waiting to join this turn" : deliveryLine("pending", "you", bot.name) };
   const message = queueOnLane(bot.id, lane.id, text, {
     ...options, delivery,
     preparation: { attempt: attempt.id, state: next ? "next" : "pending", ...(options.source ? { source: options.source } : {}) },
@@ -16268,6 +16268,16 @@ function turnPreparation(attempt: PreparationAttempt): TurnPreparation {
       if (!preparationCurrent(attempt)) return;
       attempt.engineTurnId = turnId;
       attempt.phase = "running";
+      const pending = attempt.messages.filter((id) => store.messagesFor(attempt.laneId).find((m) => m.id === id)?.preparation?.state === "pending");
+      try {
+        const changed = store.patchMessages(attempt.laneId, pending, () => ({
+          delivery: { route: "pending", why: "you", line: "Waiting to join this turn" },
+        }));
+        for (const m of changed) {
+          broadcast({ kind: "message.patch", threadId: attempt.laneId, message: m });
+          updatePreparationReceipt(attempt.laneId, m.id);
+        }
+      } catch { /* A receipt update must not prevent delivery. */ }
       void drainPreparation(attempt);
     },
     withoutSteering() { if (preparationCurrent(attempt)) attempt.unsupported = true; },
@@ -16470,7 +16480,7 @@ async function drainPreparation(attempt: PreparationAttempt): Promise<void> {
 }
 
 function preparationReceiptText(state: NonNullable<Message["preparation"]>["state"], line?: string): string {
-  if (state === "pending") return line === "Waiting for an earlier input's receipt" ? `${line}.` : "Waiting for this turn to start.";
+  if (state === "pending") return line === "Waiting for an earlier input's receipt" || line === "Waiting to join this turn" ? `${line}.` : "Waiting for this turn to start.";
   if (state === "dispatching") return "Sending to this turn.";
   if (state === "joined") return "Joined this turn.";
   if (state === "next") return "For the next turn.";
