@@ -22350,19 +22350,27 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         return json(res, 200, { message: patched });
       }
 
-      // Editing is for your own words. An agent's message is a record of
-      // what it said, and rewriting that would make the transcript lie.
-      if (existing.role !== "user") {
-        return json(res, 403, { error: "only your own messages can be edited" });
-      }
-      if (existing.deleted) return json(res, 409, { error: "that message was taken back" });
-      if (existing.preparation && ["dispatching", "uncertain", "joined"].includes(existing.preparation.state)) {
-        return json(res, 409, { error: "These words were already submitted or their delivery is unknown. Send a new message to change them." });
-      }
+      const refused = (row: Message | undefined): { status: number; error: string } | null => {
+        if (!row) return { status: 404, error: "no such message" };
+        // Editing is for your own words. An agent's message is a record of
+        // what it said, and rewriting that would make the transcript lie.
+        if (row.role !== "user") return { status: 403, error: "only your own messages can be edited" };
+        if (row.deleted) return { status: 409, error: "that message was taken back" };
+        if (row.preparation && ["dispatching", "uncertain", "joined"].includes(row.preparation.state)) {
+          return { status: 409, error: "These words were already submitted or their delivery is unknown. Send a new message to change them." };
+        }
+        return null;
+      };
+      const early = refused(existing);
+      if (early) return json(res, early.status, { error: early.error });
       const body = await readBody(req);
       const text = typeof body.text === "string" ? body.text.trim() : "";
       if (!text) return json(res, 400, { error: "an edited message still needs words" });
       if (text.length > MAX_MESSAGE_CHARS) return json(res, 413, { error: "that message is too long" });
+      // Asked again with the body in: while it arrived, the words may
+      // have gone to a turn or been taken back.
+      const late = refused(store.messagesFor(m[1]).find((msg) => msg.id === m![2]));
+      if (late) return json(res, late.status, { error: late.error });
       const patched = store.patchMessage(m[1], m[2], { text, editedAt: Date.now() });
       broadcast({ kind: "message.patch", threadId: m[1], message: patched! });
       // A save closes the editor it came from. Here rather than in a

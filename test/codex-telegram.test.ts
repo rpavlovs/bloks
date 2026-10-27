@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, request } from "node:http";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
@@ -291,6 +291,78 @@ test("an edit during steering setup sends the saved version once", async (t) => 
   await s.settled();
   assert.equal(s.count("turn/start"), 1);
 });
+
+/** A save whose headers have arrived and whose body is still coming:
+ * the server holds it at the body read until finish(). */
+async function slowSave(t: TestContext, s: any, id: string, text: string) {
+  const body = JSON.stringify({ text });
+  let answered = false;
+  let finish!: () => void;
+  const status = new Promise<number>((resolve, reject) => {
+    const req = request(`${s.h.url}/api/threads/${s.bot.threadId}/messages/${id}`, {
+      method: "PATCH",
+      headers: { origin: "http://localhost:5199", "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+    }, (res) => { answered = true; res.resume(); res.on("end", () => resolve(res.statusCode!)); });
+    req.on("error", reject);
+    t.after(() => req.destroy());
+    req.write(body.slice(0, 8));
+    finish = () => req.end(body.slice(8));
+  });
+  // Past the first checks and waiting for the rest of the body.
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(answered, false, "the save was answered before its body arrived");
+  return { status, finish };
+}
+
+test("a slow save still edits words that are waiting", async (t) => {
+  const s = await fixture(t);
+  s.spec({ hold: true, holdSkills: true });
+  await s.say("FIRST $selected");
+  await s.called("skills/list", 1);
+  await s.say("SLOW_OLD");
+  await waitFor(async () => (await s.messages()).some((m) => m.text === "SLOW_OLD"));
+  const row = (await s.messages()).find((m) => m.text === "SLOW_OLD")!;
+  const save = await slowSave(t, s, row.id, "SLOW_NEW");
+  save.finish();
+  assert.equal(await save.status, 200);
+  s.skillsGate();
+  await s.called("turn/steer", 1);
+  const sent = s.calls().filter((c) => c.method === "turn/steer");
+  assert.equal(sent.length, 1);
+  assert.match(JSON.stringify(sent[0].params.input), /SLOW_NEW/);
+  assert.doesNotMatch(JSON.stringify(sent[0].params.input), /SLOW_OLD/);
+  s.gate();
+  await s.settled();
+});
+
+for (const outcome of ["dispatching", "joined", "uncertain"] as const) {
+  test(`a slow save that ends after the words went (${outcome}) keeps the submitted version`, async (t) => {
+    const s = await fixture(t);
+    s.spec({ hold: true, holdSkills: true, holdSteer: outcome === "dispatching", wrongSteerId: outcome === "uncertain" });
+    await s.say("FIRST $selected");
+    await s.called("skills/list", 1);
+    await s.say("SUBMITTED_WORDS");
+    await waitFor(async () => (await s.messages()).some((m) => m.text === "SUBMITTED_WORDS"));
+    const row = (await s.messages()).find((m) => m.text === "SUBMITTED_WORDS")!;
+    assert.equal(row.preparation?.state, "pending");
+    const save = await slowSave(t, s, row.id, "REWRITTEN_LATE");
+    s.skillsGate();
+    await s.called("turn/steer", 1);
+    await waitFor(async () => (await s.messages()).find((m) => m.id === row.id)?.preparation?.state === outcome);
+    save.finish();
+    assert.equal(await save.status, 409);
+    const after = (await s.messages()).find((m) => m.id === row.id)!;
+    assert.equal(after.text, "SUBMITTED_WORDS");
+    assert.equal(after.preparation.state, outcome);
+    const sent = s.calls().filter((c) => c.method === "turn/steer");
+    assert.equal(sent.length, 1);
+    assert.match(JSON.stringify(sent[0].params.input), /SUBMITTED_WORDS/);
+    assert.doesNotMatch(JSON.stringify(sent[0].params.input), /REWRITTEN_LATE/);
+    s.steerGate();
+    s.gate();
+    await s.settled();
+  });
+}
 
 test("a ready text does not wait for an unfinished voice transcription", async (t) => {
   const s = await fixture(t);
