@@ -7732,6 +7732,7 @@ async function startClaimedTurn(
           resumeCursor: _cursor,
           handoff: _handoff,
           compactFirst: _compactFirst,
+          preparation: _preparation,
           ...kept
         } = sending;
         lastSent.set(task.id, { instanceId, input: kept });
@@ -12225,7 +12226,9 @@ function compactThenSend(
     idleCompacting.set(laneId, run);
     lastRequest.delete(laneId);
     turnTokens.delete(laneId);
-    const { handoff: _handoff, compactFirst: _compactFirst, ...same } = input;
+    // A compaction is not the pending turn. Its input must not commit or
+    // consume that turn's preparation additions.
+    const { handoff: _handoff, compactFirst: _compactFirst, preparation: _preparation, ...same } = input;
     instance.adapter
       .sendTurn({ ...same, codexSpeed: resolveCodexSpeed(cfg, store.bot(bot.id)), text: "/compact" })
       .catch(() => idleCompacting.get(laneId) === run && idleCompactionEnded(laneId));
@@ -17123,7 +17126,15 @@ async function sendUserMessage(
     // Before the input boundary the person is still adding to the
     // request. Respect an explicit later choice and the existing queue
     // setting, without asking a model to classify a preparation follow-up.
-    if (yours && options.steer && !paused && preparations.has(lane.id)) {
+    // Once an unsupported engine has committed its input, new words use
+    // the ordinary running-turn rules unless earlier preparation words
+    // are still being settled. Those must keep their order.
+    const preparing = preparations.get(lane.id);
+    const earlierPreparing = preparing?.messages.some((id) => {
+      const state = store.messagesFor(lane.id).find((m) => m.id === id)?.preparation?.state;
+      return state === "pending" || state === "dispatching" || state === "uncertain";
+    });
+    if (yours && options.steer && !paused && preparing && (!preparing.unsupported || earlierPreparing)) {
       const mode = resolveMode(bot.delivery, cfg.delivery?.mode);
       const choice = options.delivery === "answer" ? "now" : options.delivery;
       const read = deliveryPlan(mode, text, {}, choice);

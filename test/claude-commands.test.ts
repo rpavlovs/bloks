@@ -496,6 +496,24 @@ test("automatic compaction before ordinary words initializes and settles without
   assert.ok(!(await s.messages()).some((m) => m.role === "user" && m.text === "/compact"));
 });
 
+test("words ready during pre-turn compaction reach the requested turn, not the compact command", async (t) => {
+  const s = await setup(t);
+  s.spec({ used: 210000, window: 1000000 });
+  await s.turn("fill the session");
+  s.spec({ used: 210000, window: 1000000, compact: true, holdCompact: true });
+  await s.say("ORIGINAL_AFTER_COMPACT");
+  await until(() => s.calls().length === 2, "automatic compact never started");
+  assert.equal(s.calls()[1].text, "/compact");
+  const followup = await s.say("READY_DURING_COMPACT");
+  assert.equal(followup.queued, true);
+  writeFileSync(join(s.home, "compact-gate"), "");
+  await until(async () => s.calls().length === 3 && !(await s.busy()), "the requested turn did not follow compaction");
+  assert.equal(s.calls()[2].text, "ORIGINAL_AFTER_COMPACT\n\nREADY_DURING_COMPACT");
+  assert.equal(s.calls().filter((call) => call.text.includes("READY_DURING_COMPACT")).length, 1);
+  const row = (await s.messages()).find((m) => m.text === "READY_DURING_COMPACT");
+  assert.equal(row.preparation.state, "uncertain", "this older fake CLI has no supported input confirmation");
+});
+
 test("idle compaction initializes and settles without replacing the command catalog", async (t) => {
   const s = await setup(t, undefined, { BLOKS_IDLE_CACHE_MS: "6000" });
   await s.h.json("/api/config", { method: "PUT", body: JSON.stringify({ compaction: { idle: true, beforeTurn: 0 } }) });

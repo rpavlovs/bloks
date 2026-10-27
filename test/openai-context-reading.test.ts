@@ -109,7 +109,7 @@ test("an API-backed turn includes uncommitted additions and confirms only after 
   assert.equal(f.bodies.length, 1);
 });
 
-test("an unsupported adapter queues a follow-up after its input is committed", async t => {
+test("a message explicitly for later waits behind an unsupported turn already committed", async t => {
   const f = await fixture(t, (body, round) => round === 0 ? null : body.stream
     ? 'data: {"choices":[{"delta":{"content":"Done"}}]}\n\ndata: [DONE]\n\n'
     : reply());
@@ -120,15 +120,33 @@ test("an unsupported adapter queues a follow-up after its input is committed", a
   await h.fetch(`/api/bots/${bot.id}`, { method: "PATCH", body: JSON.stringify({ modelSelection: { instanceId: "grok", model: "grok-4" } }) });
   await h.json(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "FIRST" }) });
   assert.ok(await waitFor(() => f.held.length === 1), "the first request did not reach the fixture");
-  const followup = await h.json(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "UNSUPPORTED_FOLLOWUP", delivery: "now" }) });
+  const followup = await h.json(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "UNSUPPORTED_FOLLOWUP", delivery: "wait" }) });
   assert.equal(followup.delivery.route, "queued");
   const rows = await h.json(`/api/bots/${bot.id}/messages?thread=${bot.threadId}&limit=500`);
-  assert.equal(rows.messages.find((m: any) => m.text === "UNSUPPORTED_FOLLOWUP")?.preparation?.state, "next");
+  assert.equal(rows.messages.find((m: any) => m.text === "UNSUPPORTED_FOLLOWUP")?.preparation, undefined);
   assert.equal(f.bodies.length, 1, "the original request was stopped or followed too early");
   f.held.splice(0).forEach(done => done());
   assert.ok(await waitFor(() => f.bodies.length === 2), "the follow-up never got its next turn");
   assert.doesNotMatch(JSON.stringify(f.bodies[0].messages), /UNSUPPORTED_FOLLOWUP/);
   assert.match(JSON.stringify(f.bodies[1].messages), /UNSUPPORTED_FOLLOWUP/);
+});
+
+test("send now after an unsupported turn has committed keeps its existing explicit stop behavior", async t => {
+  const f = await fixture(t, (body, round) => round === 0 ? null : body.stream
+    ? 'data: {"choices":[{"delta":{"content":"Done"}}]}\n\ndata: [DONE]\n\n'
+    : reply());
+  const h = await startHarness();
+  t.after(() => h.stop());
+  assert.ok((await h.fetch("/api/providers/grok/connect", { method: "POST", body: JSON.stringify({ key: "local-fixture", url: f.url }) })).ok);
+  const { bot } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Fixture" }) });
+  await h.fetch(`/api/bots/${bot.id}`, { method: "PATCH", body: JSON.stringify({ modelSelection: { instanceId: "grok", model: "grok-4" } }) });
+  await h.json(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "FIRST" }) });
+  assert.ok(await waitFor(() => f.held.length === 1), "the first request did not reach the fixture");
+  const followup = await h.json(`/api/bots/${bot.id}/messages`, { method: "POST", body: JSON.stringify({ text: "SEND_NOW", delivery: "now" }) });
+  assert.equal(followup.delivery.route, "stopped");
+  assert.ok(await waitFor(() => f.bodies.length === 2), "the explicit next turn never started");
+  assert.doesNotMatch(JSON.stringify(f.bodies[0].messages), /SEND_NOW/);
+  assert.match(JSON.stringify(f.bodies[1].messages), /SEND_NOW/);
 });
 
 test("OpenAI-compatible missing, zero and malformed prompt usage produce no request reading", async t => {
