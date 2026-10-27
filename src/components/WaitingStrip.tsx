@@ -8,7 +8,7 @@
 // reworded (a double-click, as on the bubble it used to be), sent now,
 // or taken back; what another agent or a person in a room queued is
 // shown with who sent it, and is theirs, not yours to change.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { ArrowUp } from "@/components/icons";
 import { Hourglass } from "@/components/icons";
 import { Pencil } from "@/components/icons";
@@ -24,23 +24,101 @@ import { confirm } from "@/components/ui/confirm";
  * closes it, saving the words given or cancelling without any. Either
  * one waits for the opening to land first, so a quick Escape never
  * arrives ahead of the hold it is meant to end. A save lets go on the
- * server's side, once the new words are in; one the server refuses lets
- * go here instead, rather than leaving the burst to its timeout. In a
+ * server's side once the new words are in. When the save fails, its
+ * outcome may be unknown, so the existing hold expires on its own. In a
  * room nothing is held, and the save is an ordinary edit, which the
  * room reads when the message goes. */
 export function editQueued(threadId: string, messageId: string) {
   const path = `/api/threads/${threadId}/messages/${messageId}`;
   const editing = (on: boolean) => api(`${path}/editing`, { method: "POST", body: JSON.stringify({ editing: on }) });
   const opened = editing(true).catch(() => {});
-  return (text?: string) => {
-    void opened
-      .then(() =>
-        text
-          ? api(path, { method: "PATCH", body: JSON.stringify({ text }) }).catch(() => editing(false))
-          : editing(false),
-      )
-      .catch(() => {});
+  return async (text?: string) => {
+    await opened;
+    if (!text) return void (await editing(false).catch(() => {}));
+    await api(path, { method: "PATCH", body: JSON.stringify({ text }) });
   };
+}
+
+type EditOutcome = "saving" | "rejected" | "unknown" | "interrupted";
+type FailedEdit = { id: number; text: string; outcome: EditOutcome };
+const noFailedEdits: readonly FailedEdit[] = [];
+// A row can leave while its save is in flight. Keep the words with this
+// conversation in this window, even when its composer is temporarily gone.
+const failedEdits = new Map<string, readonly FailedEdit[]>();
+const editListeners = new Set<() => void>();
+let failedEditId = 0;
+
+function keepFailedEdit(key: string, text: string, outcome: EditOutcome) {
+  const id = ++failedEditId;
+  failedEdits.set(key, [...(failedEdits.get(key) ?? noFailedEdits), { id, text, outcome }]);
+  editListeners.forEach((listener) => listener());
+  return id;
+}
+
+function dismissFailedEdit(key: string, id: number) {
+  const rest = (failedEdits.get(key) ?? noFailedEdits).filter((edit) => edit.id !== id);
+  if (rest.length) failedEdits.set(key, rest);
+  else failedEdits.delete(key);
+  editListeners.forEach((listener) => listener());
+}
+
+function watchEditSave(key: string, text: string, request: Promise<void>) {
+  const id = keepFailedEdit(key, text, "saving");
+  void request.then(
+    () => dismissFailedEdit(key, id),
+    (error: unknown) => {
+      const status = error && typeof error === "object" && "status" in error ? error.status : undefined;
+      const rejected = typeof status === "number" && [400, 401, 403, 404, 409, 413].includes(status);
+      const edits = failedEdits.get(key) ?? noFailedEdits;
+      failedEdits.set(key, edits.map((edit) => edit.id === id ? { ...edit, outcome: rejected ? "rejected" : "unknown" } : edit));
+      editListeners.forEach((listener) => listener());
+    },
+  );
+}
+
+function useFailedEdits(key: string) {
+  return useSyncExternalStore(
+    (listener) => {
+      editListeners.add(listener);
+      return () => editListeners.delete(listener);
+    },
+    () => failedEdits.get(key) ?? noFailedEdits,
+    () => noFailedEdits,
+  );
+}
+
+function FailedEdits({ edits, recoveryKey }: { edits: readonly FailedEdit[]; recoveryKey: string }) {
+  return edits.map((edit) => (
+    <div key={edit.id} role={edit.outcome === "saving" ? "status" : "alert"} className="rounded-xl bg-warning/8 px-3 py-2 text-body">
+      <p>
+        {edit.outcome === "saving"
+          ? "Waiting for the edit's result."
+          : edit.outcome === "rejected"
+            ? "The edit was rejected. Check what was sent before using these words."
+            : edit.outcome === "unknown"
+              ? "Could not confirm whether the edit was saved. Check the conversation before using these words."
+              : "The edit was not saved. Check the conversation before using these words."}
+      </p>
+      {(edit.outcome === "rejected" || edit.outcome === "unknown") && (
+        <p className="mt-1 text-small text-muted-foreground">A waiting message may stay held until the edit timeout.</p>
+      )}
+      <textarea
+        readOnly
+        aria-label="Your replacement words"
+        value={edit.text}
+        rows={Math.min(6, edit.text.split("\n").length + 1)}
+        className="mt-1.5 max-h-[calc(6lh+10px)] w-full resize-y rounded-lg border bg-background px-2 py-1 text-body text-foreground"
+      />
+      <div className="mt-1 flex items-center gap-2 text-small text-muted-foreground">
+        <span>Select and copy your words.</span>
+        {edit.outcome !== "saving" && (
+          <button onClick={() => dismissFailedEdit(recoveryKey, edit.id)} className="font-medium text-foreground underline underline-offset-2">
+            Dismiss
+          </button>
+        )}
+      </div>
+    </div>
+  ));
 }
 
 function takeBack(threadId: string, messageId: string) {
@@ -78,6 +156,8 @@ function WaitingRow({
   onSendAgain,
   editNow,
   onEditing,
+  onEditFailure,
+  onEditSave,
 }: {
   message: Message;
   threadId: string;
@@ -90,16 +170,21 @@ function WaitingRow({
   /** Told when the editor opens and closes, so whatever holds the row
    * keeps it on screen while it has the words. */
   onEditing?: (id: string, on: boolean) => void;
+  onEditFailure: (text: string, outcome: EditOutcome) => void;
+  onEditSave: (text: string, request: Promise<void>) => void;
 }) {
   const yours = sender === null;
   const [editing, setEditingState] = useState<string | null>(null);
   const setEditing = (next: string | null) => {
     setEditingState(next);
+    draft.current = next;
     onEditing?.(message.id, next !== null);
   };
+  const draft = useRef<string | null>(null);
+  const original = useRef("");
   // how an editor opened on this message closes again: with words to
   // save, or without them to cancel
-  const close = useRef<((text?: string) => void) | null>(null);
+  const close = useRef<((text?: string) => Promise<void>) | null>(null);
   // Opened from the keyboard, it hands the keyboard back when it closes,
   // so the next thing typed lands in the composer again.
   const returnTo = useRef<HTMLElement | null>(null);
@@ -109,13 +194,15 @@ function WaitingRow({
     (!message.preparation || message.preparation.state === "pending" || message.preparation.state === "next");
   const startEditing = () => {
     if (!editable || editing !== null) return;
+    original.current = message.text ?? "";
     setEditing(message.text ?? "");
     close.current = editQueued(threadId, message.id);
   };
   const stopEditing = (text?: string) => {
     const done = close.current;
     close.current = null;
-    done?.(text);
+    const request = done?.(text);
+    if (text && request) onEditSave(text, request);
     setEditing(null);
     returnTo.current?.focus();
     returnTo.current = null;
@@ -129,8 +216,11 @@ function WaitingRow({
   // back elsewhere, lets go of what it held
   useEffect(
     () => () => {
-      if (close.current) onEditing?.(message.id, false);
-      close.current?.();
+      if (close.current) {
+        onEditing?.(message.id, false);
+        if (draft.current?.trim() && draft.current !== original.current) onEditFailure(draft.current, "interrupted");
+        void close.current();
+      }
     },
     [], // eslint-disable-line react-hooks/exhaustive-deps
   );
@@ -299,6 +389,7 @@ export function waitingSender(m: Message): string | null {
 export function useQueuedNotice({
   messages,
   threadId,
+  recoveryKey = threadId,
   senderOf = waitingSender,
   working,
   onSendNow,
@@ -307,12 +398,15 @@ export function useQueuedNotice({
 }: {
   messages: Message[] | undefined;
   threadId: string;
+  /** The composer's conversation key, including its lane. */
+  recoveryKey?: string;
   senderOf?: (message: Message) => string | null;
   working: boolean;
   onSendNow?: () => void;
   onSendAgain?: (message: Message) => void;
   editAsk?: { id: string; nonce: number } | null;
 }): Notice | null {
+  const failed = useFailedEdits(recoveryKey);
   const [editing, setEditing] = useState<ReadonlySet<string>>(() => new Set());
   const onEditing = (id: string, on: boolean) =>
     setEditing((cur) => {
@@ -322,18 +416,24 @@ export function useQueuedNotice({
       else next.delete(id);
       return next;
     });
-  if (!messages?.length) return null;
+  if (!messages?.length && !failed.length) return null;
+  messages ??= [];
   const unsent = messages.filter((m) => m.unsent).length;
+  const editNeedsAttention = failed.some((edit) => edit.outcome !== "saving");
   const mineQueued = messages.some((m) => m.queued && senderOf(m) === null && (!m.preparation || m.preparation.state === "next"));
   const unresolved = messages.filter((m) => m.preparation?.state === "dispatching" || m.preparation?.state === "uncertain").length;
   const asked = Boolean(editAsk && messages.some((m) => m.id === editAsk.id));
   return {
     id: "queued",
-    tone: unsent ? "warn" : "info",
-    rank: unsent ? RANK.unsent : RANK.queued,
+    tone: unsent || editNeedsAttention ? "warn" : "info",
+    rank: editNeedsAttention ? RANK.feedback : unsent ? RANK.unsent : RANK.queued,
     icon: <Hourglass size={14} />,
     title:
-      unresolved === messages.length
+      editNeedsAttention
+        ? "A waiting message edit needs attention."
+        : failed.length
+          ? "Saving a waiting message edit."
+        : unresolved === messages.length
         ? "Message delivery is unresolved."
         : unresolved
           ? "Messages are waiting or have unresolved delivery."
@@ -341,21 +441,26 @@ export function useQueuedNotice({
         ? `${unsent === 1 ? "A message" : `${unsent} messages`} didn't send.`
         : `${messages.length === 1 ? "A message is" : `${messages.length} messages are`} waiting to send.`,
     actions: mineQueued && working && onSendNow && <TrayButton onClick={onSendNow}>Send now</TrayButton>,
-    keepOpen: asked || editing.size > 0,
+    keepOpen: asked || editing.size > 0 || failed.length > 0,
     body: (
-      <div className="flex max-h-[30vh] flex-col gap-1 overflow-y-auto overscroll-contain" aria-label="Waiting to send">
-        {messages.map((m) => (
-          <WaitingRow
-            key={m.id}
-            message={m}
-            threadId={threadId}
-            sender={senderOf(m)}
-            working={working}
-            onSendAgain={onSendAgain}
-            editNow={editAsk?.id === m.id ? editAsk.nonce : undefined}
-            onEditing={onEditing}
-          />
-        ))}
+      <div className="flex max-h-[30vh] flex-col gap-1 overflow-y-auto overscroll-contain">
+        <FailedEdits edits={failed} recoveryKey={recoveryKey} />
+        <div aria-label="Waiting to send" className="flex flex-col gap-1">
+          {messages.map((m) => (
+            <WaitingRow
+              key={m.id}
+              message={m}
+              threadId={threadId}
+              sender={senderOf(m)}
+              working={working}
+              onSendAgain={onSendAgain}
+              editNow={editAsk?.id === m.id ? editAsk.nonce : undefined}
+              onEditing={onEditing}
+              onEditFailure={(text, outcome) => keepFailedEdit(recoveryKey, text, outcome)}
+              onEditSave={(text, request) => watchEditSave(recoveryKey, text, request)}
+            />
+          ))}
+        </div>
       </div>
     ),
   };
@@ -389,13 +494,15 @@ export function WaitingStrip({
   /** ↑ in the empty composer asked to edit this one. */
   editAsk?: { id: string; nonce: number } | null;
 }) {
-  if (!messages.length) return null;
+  const failed = useFailedEdits(threadId);
+  if (!messages.length && !failed.length) return null;
   return (
     <div className="px-4 md:px-6">
       <div
         className="mx-auto flex max-h-[40vh] max-w-[var(--transcript-width,760px)] flex-col gap-1.5 overflow-y-auto pb-1"
         aria-label="Waiting to send"
       >
+        <FailedEdits edits={failed} recoveryKey={threadId} />
         {messages.map((m) => (
           <WaitingRow
             key={m.id}
@@ -406,6 +513,8 @@ export function WaitingStrip({
             onSendNow={onSendNow}
             onSendAgain={onSendAgain}
             editNow={editAsk?.id === m.id ? editAsk.nonce : undefined}
+            onEditFailure={(text, outcome) => keepFailedEdit(threadId, text, outcome)}
+            onEditSave={(text, request) => watchEditSave(threadId, text, request)}
           />
         ))}
       </div>
