@@ -585,6 +585,19 @@ export async function post(token: string, chatId: number, text: string, keyboard
   return Number.isSafeInteger(id) ? id : undefined;
 }
 
+/** One quiet status anchored to the message it describes. An uncertain
+ * send is not repeated: it may already be visible at Telegram. */
+export async function postReceipt(token: string, chatId: number, messageId: number, text: string, canSend: () => boolean, threadId?: number): Promise<number | undefined> {
+  if (!canSend()) return undefined;
+  const body = await call(token, "sendMessage", {
+    chat_id: chatId, text: text.slice(0, TELEGRAM_MESSAGE_CHARS), disable_notification: true,
+    reply_parameters: { message_id: messageId, ...(chatId > 0 ? { allow_sending_without_reply: true } : {}) },
+    ...(threadId ? { message_thread_id: threadId } : {}),
+  }) as { ok?: boolean; result?: { message_id?: unknown } };
+  const id = body?.result?.message_id;
+  return body?.ok === true && typeof id === "number" && Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
 /** A person's explicit plain-text reply. No formatting, buttons, truncation
  * or retry after an uncertain network result. */
 export async function replyText(token: string, chatId: number, text: string, messageId: number | undefined, canSend: () => boolean, threadId?: number): Promise<void> {
@@ -1267,7 +1280,8 @@ export class Inbox {
     // so an approval is answered by typing. Asked before the audio goes
     // anywhere, and again after, in case a card arrived meanwhile.
     const typed = `That one needs a tap or a typed answer. ${ASK_AGAIN}`;
-    if (hooks.waiting(chatId, source)?.permission) return hooks.send(chatId, typed);
+    const waitingBefore = hooks.waiting(chatId, source);
+    if (waitingBefore?.permission) return hooks.send(chatId, typed);
     const lost = (why: string, alone: string, captioned: string) =>
       this.missed(chatId, caption, `A voice message came with this and did not arrive (${why}).`, alone, captioned, refusalNote(media, why), replyTo, source);
     const transcribe = hooks.transcriber();
@@ -1305,7 +1319,7 @@ export class Inbox {
     }
     const waiting = hooks.waiting(chatId, source);
     if (waiting?.permission) return hooks.send(chatId, typed);
-    if (waiting) return this.answer(chatId, waiting, [caption, said].filter(Boolean).join("\n\n"));
+    if (waiting && waiting === waitingBefore) return this.answer(chatId, waiting, [caption, said].filter(Boolean).join("\n\n"));
     let path: string;
     try {
       path = hooks.saveVoice(audio);

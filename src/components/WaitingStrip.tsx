@@ -103,7 +103,10 @@ function WaitingRow({
   // Opened from the keyboard, it hands the keyboard back when it closes,
   // so the next thing typed lands in the composer again.
   const returnTo = useRef<HTMLElement | null>(null);
-  const editable = yours && Boolean(message.queued) && Boolean(message.text);
+  const unresolved = message.preparation?.state === "dispatching" || message.preparation?.state === "uncertain";
+  const sendable = !message.preparation || message.preparation.state === "next";
+  const editable = yours && Boolean(message.queued) && Boolean(message.text) &&
+    (!message.preparation || message.preparation.state === "pending" || message.preparation.state === "next");
   const startEditing = () => {
     if (!editable || editing !== null) return;
     setEditing(message.text ?? "");
@@ -133,7 +136,11 @@ function WaitingRow({
   );
 
   const queuedAt = message.queuedAt ?? message.at;
-  const status = message.unsent
+  const status = message.delivery?.route === "uncertain"
+    ? "Delivery could not be confirmed. It will not be sent again automatically."
+    : message.delivery?.route === "pending" || message.delivery?.route === "not-sent"
+    ? message.delivery.line
+    : message.unsent
     ? "Not sent. Bloks restarted before it could go."
     : editing !== null
       ? "Queued, waits until you save or cancel"
@@ -236,14 +243,14 @@ function WaitingRow({
               <Pencil size={13} strokeWidth={1.8} />
             </IconButton>
           )}
-          {yours && message.queued && onSendNow && (
+          {yours && message.queued && sendable && onSendNow && (
             <IconButton label="Send now" onClick={onSendNow}>
               <ArrowUp size={14} strokeWidth={1.8} />
             </IconButton>
           )}
           {/* not yours to take back while it waits; one never sent, though,
               is only clutter if it stays, so anyone's can be cleared */}
-          {(yours || message.unsent) && (
+          {(yours || message.unsent) && !unresolved && (
             <IconButton label={message.unsent ? "Delete" : "Take back"} onClick={() => takeBack(threadId, message.id)}>
               <Trash2 size={13} strokeWidth={1.8} />
             </IconButton>
@@ -317,7 +324,8 @@ export function useQueuedNotice({
     });
   if (!messages?.length) return null;
   const unsent = messages.filter((m) => m.unsent).length;
-  const mineQueued = messages.some((m) => m.queued && senderOf(m) === null);
+  const mineQueued = messages.some((m) => m.queued && senderOf(m) === null && (!m.preparation || m.preparation.state === "next"));
+  const unresolved = messages.filter((m) => m.preparation?.state === "dispatching" || m.preparation?.state === "uncertain").length;
   const asked = Boolean(editAsk && messages.some((m) => m.id === editAsk.id));
   return {
     id: "queued",
@@ -325,7 +333,11 @@ export function useQueuedNotice({
     rank: unsent ? RANK.unsent : RANK.queued,
     icon: <Hourglass size={14} />,
     title:
-      unsent === messages.length
+      unresolved === messages.length
+        ? "Message delivery is unresolved."
+        : unresolved
+          ? "Messages are waiting or have unresolved delivery."
+        : unsent === messages.length
         ? `${unsent === 1 ? "A message" : `${unsent} messages`} didn't send.`
         : `${messages.length === 1 ? "A message is" : `${messages.length} messages are`} waiting to send.`,
     actions: mineQueued && working && onSendNow && <TrayButton onClick={onSendNow}>Send now</TrayButton>,

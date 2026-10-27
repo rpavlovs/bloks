@@ -167,10 +167,12 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       const turnId = newId();
       const resume = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
 
+      const viaStdin = await readsStdin();
+      const prepared = turn.preparation?.freeze().commit();
+      const words = prepared?.text ? `${turn.text}\n\n${prepared.text}` : turn.text;
       // The persona rides ahead of the message in the same prompt, since
       // headless agy offers no separate system channel.
-      const prompt = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
-      const viaStdin = await readsStdin();
+      const prompt = turn.system ? `${turn.system}\n\n${words}` : words;
 
       const argv = [
         ...(viaStdin ? ["--input-format", "stream-json"] : ["--print", prompt]),
@@ -185,20 +187,29 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       if (turn.model) argv.push("--model", turn.model);
       if (resume) argv.push("--conversation", resume);
 
-      const child = spawn(config.cli, argv, {
+      const child = (() => { try { return spawn(config.cli, argv, {
         cwd: turn.cwd ?? homedir(),
         // the turn's own credential (see server/agent-cli.ts)
         env: { ...process.env, ...(turn.env ?? {}) },
         stdio: ["pipe", "pipe", "pipe"],
         detached: OWN_GROUP,
         windowsHide: true,
-      });
+      }); } catch (error) { prepared?.settle("refused"); turn.preparation?.unavailable(); throw error; } })();
       engines.add(child);
       // The turn as one line, then the end of input: agy answers it and
       // exits. An older agy reads nothing here and gets the end at once.
       // A process that died at once closes its end first; its exit says why.
       child.stdin.on("error", () => {});
       child.stdin.end(viaStdin ? `${JSON.stringify({ event: "user", message: { content: prompt } })}\n` : undefined);
+      turn.preparation?.withoutSteering?.();
+      // Neither the argv launch nor a pipe write is a native receipt.
+      let preparationSettled = false;
+      const settlePreparation = (outcome: "accepted" | "refused" | "uncertain") => {
+        if (preparationSettled) return;
+        preparationSettled = true;
+        prepared?.settle(outcome);
+        turn.preparation?.unavailable();
+      };
 
       let finished = false;
       const finish = (ok: boolean, stopReason: string | null) => {
@@ -266,6 +277,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
             break;
 
           case "result": {
+            settlePreparation(payload.status === "SUCCESS" ? "accepted" : "uncertain");
             // the assistant text arrives here, whole, not streamed
             const text = typeof payload.response === "string" ? payload.response : "";
             if (text) {
@@ -313,6 +325,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       });
 
       child.on("error", (error) => {
+        settlePreparation(child.pid ? "uncertain" : "refused");
         emit({
           ...envelope(threadId, turnId),
           type: "runtime.error",
@@ -328,6 +341,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
 
       child.on("close", (code) => {
         if (finished) return;
+        settlePreparation("uncertain");
         emit({
           ...envelope(threadId, turnId),
           type: "runtime.error",

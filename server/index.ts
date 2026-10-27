@@ -120,7 +120,7 @@ import { JoinClient } from "./join-client.ts";
 import * as invites from "./invites.ts";
 import { CLI_PROVIDERS, CUSTOM_SPEC, PROVIDER_SPECS, normalizeCompatUrl, specFor } from "./providers.ts";
 import { callbackPage, finishOAuth, startOAuth, supportsOAuth } from "./oauth.ts";
-import type { ModelSelection, PlanUsage, ProviderInstance, ProviderSnapshot, RuntimeEvent, SendTurnInput, UsageNotice } from "./contracts.ts";
+import type { ModelSelection, PlanUsage, ProviderInstance, ProviderSnapshot, RuntimeEvent, SendTurnInput, TurnPreparation, UsageNotice } from "./contracts.ts";
 import { planNotices, sortNotices } from "./plan-usage.ts";
 import { newId } from "./contracts.ts";
 
@@ -5002,6 +5002,8 @@ bus.subscribe((event: RuntimeEvent) => {
         // anything said while the card was being made goes now
         drainSteer(event.threadId);
       });
+      const preparing = preparations.get(event.threadId);
+      if (preparing && preparing.engineTurnId && preparing.engineTurnId === event.turnId) finishPreparation(preparing);
       store.setTaskBusy(event.threadId, false);
       turnStarted.delete(event.threadId);
       repeats.end(event.threadId);
@@ -6083,7 +6085,36 @@ function delegateTrust(delegate: TelegramSender | undefined): string | undefined
 
 /** A start's hold on its lane, from its busy check until it marks the
  * lane busy. */
-type LaneClaim = { lane?: string; cancelPrimaryTry?: () => void };
+type LaneClaim = { lane?: string; cancelPrimaryTry?: () => void; preparation?: PreparationAttempt };
+
+/** Identity belongs to one start attempt, before its first asynchronous
+ * preparation. It must never be inferred from a lane's later defaults. */
+type PreparationAttempt = {
+  id: string;
+  botId: string;
+  laneId: string;
+  requester: string;
+  audience: string;
+  person?: TelegramSender;
+  delegate?: TelegramSender;
+  group?: TelegramOwnerGroup;
+  ownerTelegram?: { generation: string; userId: number; chatId: number };
+  phase: "open" | "frozen" | "running" | "ended";
+  messages: string[];
+  engineTurnId?: string;
+  driverKind?: string;
+  draining?: boolean;
+  blocked?: boolean;
+  unsupported?: boolean;
+  waitingFor?: Promise<Message | null>;
+};
+const preparations = new Map<string, PreparationAttempt>();
+const preparationReceipts = new Map<string, { again: boolean }>();
+const preparationReceiptQueue = new Map<string, { laneId: string; messageId: string }>();
+const steerQueues = new Map<
+  string,
+  { botId: string; items: Array<{ messageId?: string; text?: string; source?: "webhook"; chain?: number; chainTask?: ChainTask; requester?: string; telegramPerson?: TelegramSender; telegramGroup?: TelegramOwnerGroup }> }
+>();
 
 /** Lanes a start has found free and not yet marked busy, to the start
  * that holds each. Getting ready awaits (a shared room's plan, a fold of
@@ -6174,6 +6205,7 @@ async function startTurn(botId: string, text: string, opts: Parameters<typeof st
     if (claim.lane && claimedLanes.get(claim.lane) === claim) {
       claimedLanes.delete(claim.lane);
       claim.cancelPrimaryTry?.();
+      if (claim.preparation) finishPreparation(claim.preparation);
       drainSteer(claim.lane);
       drainRoomTags(botId);
     }
@@ -6357,6 +6389,32 @@ async function startClaimedTurn(
   // (or startTurn lets go of it, if this start gives up first).
   claim.lane = task.id;
   claimedLanes.set(task.id, claim);
+  // Do not attach personal additions to a room, command, automation or
+  // another agent's turn. A retry or backup is a different attempt too.
+  const native = acceptingNative(bot, task.id);
+  const ownerTelegramState = opts.fromTelegram && !personSource && !delegateSource && !groupSource ? telegramBinding(bot.id) : undefined;
+  const verifiedTelegramOwner = !ownerTelegramState || Boolean(ownerTelegramState.ownerUserId && ownerTelegramState.ownerChatId);
+  if ((opts.byYou || personSource || delegateSource || groupSource) &&
+      !opts.from && !opts.routine && !opts.rehearsal && !opts.answersMail &&
+      !opts.carriedOn && !opts.retry && !opts.fallback && !sharing &&
+      (!opts.roomId || opts.roomId === task.id) && !task.guestMail &&
+      verifiedTelegramOwner && !(native && commandFor(text, native))) {
+    const attempt: PreparationAttempt = {
+      id: newId(), botId: bot.id, laneId: task.id,
+      requester: opts.requester ?? turnPerson ?? "owner",
+      audience: telegramAudience(personSource ?? groupSource),
+      ...(personSource ? { person: personSource } : {}),
+      ...(delegateSource ? { delegate: delegateSource } : {}),
+      ...(groupSource ? { group: groupSource } : {}),
+      ...(() => {
+        const state = opts.fromTelegram && !personSource && !delegateSource && !groupSource ? telegramBinding(bot.id) : undefined;
+        return state?.ownerUserId && state.ownerChatId ? { ownerTelegram: { generation: state.generation, userId: state.ownerUserId, chatId: state.ownerChatId } } : {};
+      })(),
+      phase: "open", messages: [],
+    };
+    claim.preparation = attempt;
+    preparations.set(task.id, attempt);
+  }
 
   // Bloks is finishing what is running before it restarts
   // (server/drain.ts). Nothing new starts here, and nothing is turned
@@ -7018,6 +7076,7 @@ async function startClaimedTurn(
   // was never going to come.
   const settleUnsent = (failure?: string) => {
     codexDispatches.delete(task.id);
+    if (claim.preparation) finishPreparation(claim.preparation);
     claim.cancelPrimaryTry?.();
     commandTurns.delete(task.id);
     checkInTurns.delete(task.id);
@@ -7561,6 +7620,7 @@ async function startClaimedTurn(
 
       const sending: SendTurnInput = {
         threadId: task.id,
+        ...(claim.preparation ? { preparation: turnPreparation(claim.preparation) } : {}),
         cwd: turnCwd,
         ...(credential
           ? {
@@ -7808,8 +7868,10 @@ async function startClaimedTurn(
       }
       const textOrigin: { origin: CodexText["origin"]; turnId?: string } = { origin: opts.byYou ? "person" : !opts.recovery && !opts.routine && (opts.from || opts.answering || opts.roomAgentStarted) ? "agent" : opts.recovery ? "unknown" : "other" };
       if (engine.driverKind === "codex") codexOrigins.set(task.id, textOrigin);
+      if (claim.preparation) claim.preparation.driverKind = engine.driverKind;
       try {
-        await engine.adapter.sendTurn(sending);
+        const started = await engine.adapter.sendTurn(sending);
+        if (claim.preparation && preparations.get(task.id) === claim.preparation) claim.preparation.engineTurnId = started.turnId;
       } catch (error) {
         if (codexOrigins.get(task.id) === textOrigin) codexOrigins.delete(task.id);
         throw error;
@@ -13991,6 +14053,8 @@ interface TelegramRuntime {
   /** Each chat's messages, taken in the order they came: asking an engine
    * to take one mid-turn is a round trip, and the next must not pass it. */
   intake: Map<number | string, Promise<void>>;
+  /** Transcription runs independently of reading later ready messages. */
+  media: Set<Promise<void>>;
   /** This connection's share of telegramWorking, to stop when it goes. */
   working: Set<TelegramWaiter>;
 }
@@ -14224,8 +14288,11 @@ async function revokeTelegramPersonTurns(botId: string, matches: (sender: Telegr
     for (const message of store.messagesFor(lane.id)) {
       const sender = message.telegramPerson ?? message.telegramDelegate;
       if (message.queued && sender && matches(sender)) {
-        const patched = store.patchMessage(lane.id, message.id, { queued: false, unsent: true });
+        if (preserveUncertainPreparation(lane.id, message)) continue;
+        const patched = store.patchMessage(lane.id, message.id, { queued: false, unsent: true,
+          ...(message.preparation ? { preparation: { ...message.preparation, state: "not-sent" as const }, delivery: { route: "not-sent" as const, why: "you" as const, line: "Not sent" } } : {}) });
         if (patched) broadcast({ kind: "message.patch", threadId: lane.id, message: patched });
+        updatePreparationReceipt(lane.id, message.id);
       }
     }
     const running = laneTelegramPerson.get(lane.id) ?? laneTelegramDelegate.get(lane.id);
@@ -14248,8 +14315,11 @@ async function closeTelegramGroups(botId: string): Promise<void> {
   for (const lane of store.bot(botId)?.tasks ?? []) {
     for (const message of store.messagesFor(lane.id)) {
       if (!message.queued || !(message.telegramGroup || message.telegramPerson?.group)) continue;
-      const patched = store.patchMessage(lane.id, message.id, { queued: false, unsent: true });
+      if (preserveUncertainPreparation(lane.id, message)) continue;
+      const patched = store.patchMessage(lane.id, message.id, { queued: false, unsent: true,
+        ...(message.preparation ? { preparation: { ...message.preparation, state: "not-sent" as const }, delivery: { route: "not-sent" as const, why: "you" as const, line: "Not sent" } } : {}) });
       if (patched) broadcast({ kind: "message.patch", threadId: lane.id, message: patched });
+      updatePreparationReceipt(lane.id, message.id);
     }
   }
   await revokeTelegramPersonTurns(botId, (sender) => Boolean(sender.group), "Telegram groups were turned off for this agent.");
@@ -14303,6 +14373,14 @@ function deliverTelegramPerson(sender: TelegramReplySender, text: string): void 
   const provenance = "owner" in sender ? { telegramGroup: sender } : { telegramPerson: sender, personal: false };
   const intake = (runtime.intake.get(intakeKey) ?? Promise.resolve()).then(async () => {
     if (!telegramReplySenderCurrent(telegramBinding(bot.id), sender)) return;
+    const source = sender.messageId
+      ? { chatId: sender.chatId, senderId: sender.userId, messageId: sender.messageId, ...(sender.group?.threadId ? { topicId: sender.group.threadId } : {}), generation: sender.bindingGeneration }
+      : undefined;
+    if (source && bot.tasks.some((task) => store.messagesFor(task.id).some((m) =>
+      m.preparation?.source?.generation === source.generation && m.preparation.source.chatId === source.chatId &&
+      m.preparation.source.senderId === source.senderId && m.preparation.source.messageId === source.messageId &&
+      m.preparation.source.topicId === source.topicId))) return;
+    if (source && prepareFollowup(bot, lane, text, { ...provenance, fromTelegram: true, telegramBinding: { botId: bot.id, generation: sender.bindingGeneration }, source })) return;
     if (lane.busy && laneRequester.get(lane.id) === sender.requester) {
       if (await steerLane(bot, lane, text, { ...provenance, fromTelegram: true, telegramBinding: { botId: bot.id, generation: sender.bindingGeneration } })) return;
     }
@@ -14533,6 +14611,10 @@ function telegramReturnState(laneId: string, reply: TelegramReply): telegram.Tel
   if (!bot || (reply.botId && reply.botId !== bot.id)) return {};
   const state = telegramBinding(bot.id);
   if (!state || (reply.generation ? reply.generation !== state.generation : cfg.telegram?.migratedBotId !== bot.id)) return {};
+  if (reply.delegate) {
+    if (reply.delegate.chatId !== reply.chatId || !telegramDelegateCurrent(state, reply.delegate)) return {};
+    return { ...state, botId: bot.id, chatIds: [reply.chatId] };
+  }
   return { ...state, botId: bot.id, chatIds: pairedChats(state) };
 }
 
@@ -14547,7 +14629,7 @@ const telegramReturns = new TelegramReturns(
   async (laneId, chatId, said, reply) => {
     const owner = store.bots.find((bot) => bot.tasks.some((lane) => lane.id === laneId));
     const runtime = owner ? liveTelegram(owner.id) : undefined;
-    if (runtime && telegramReturnState(laneId, reply).token) await telegramFiles(runtime, chatId, deliverablesIn(runtime.botId, said));
+    if (runtime && telegramReturnState(laneId, reply).token) await telegramFiles(runtime, chatId, deliverablesIn(runtime.botId, said), reply.delegate);
   },
   redactSecrets,
 );
@@ -14628,7 +14710,7 @@ function settleTelegramCard(requestId: string, outcome: (card: ForwardedCard) =>
 function makeTelegramRuntime(botId: string, state: AgentTelegram): TelegramRuntime {
   const runtime: TelegramRuntime = {
     botId, generation: state.generation, token: state.token!, abort: new AbortController(),
-    refused: new Set(), asks: new Map(), personAsks: new Map(), typing: new Map(), turns: new Map(), intake: new Map(), working: new Set(),
+    refused: new Set(), asks: new Map(), personAsks: new Map(), typing: new Map(), turns: new Map(), intake: new Map(), media: new Set(), working: new Set(),
     inbox: null as unknown as telegram.Inbox, personInboxes: new Map(), groups: null as unknown as TelegramGroupMessages,
     groupBudget: { taken: [], told: new Map() },
   };
@@ -14709,8 +14791,8 @@ function makeTelegramRuntime(botId: string, state: AgentTelegram): TelegramRunti
       }
       await pressTelegramCard(runtime, chatId, press);
     },
-    deliver(chatId, text, suppliedReply) {
-      deliverOverTelegram(runtime, chatId, text, replyRef(suppliedReply));
+    deliver(chatId, text, suppliedReply, origin) {
+      deliverOverTelegram(runtime, chatId, text, replyRef(suppliedReply), undefined, origin);
     },
   });
   runtime.groups = new TelegramGroupMessages(() => currentTelegram(runtime), (parts, destination) => takeTelegramGroup(runtime, parts, destination));
@@ -14744,15 +14826,30 @@ async function pressTelegramCard(runtime: TelegramRuntime, chatId: number, press
 /** Words from the owner's chat, or from the chat of a person with full
  * access (`delegate`), taken in the order they came. Each chat's turns
  * run one after another, and each is answered in the chat that asked. */
-function deliverOverTelegram(runtime: TelegramRuntime, chatId: number, text: string, replyTo: ReplyRef | undefined, delegate?: TelegramSender): void {
+function deliverOverTelegram(runtime: TelegramRuntime, chatId: number, text: string, replyTo: ReplyRef | undefined, delegate?: TelegramSender, origin?: telegram.Incoming): void {
   const { botId } = runtime;
   const current = () => Boolean(currentTelegram(runtime)) && (!delegate || telegramDelegateCurrent(telegramBinding(botId), delegate));
   const intake = (runtime.intake.get(chatId) ?? Promise.resolve()).then(async () => {
     if (!current()) return;
+    if (!delegate && origin) {
+      const state = currentTelegram(runtime);
+      if (!state || telegram.decide(inboxState(state), origin).kind !== "deliver") return;
+    }
     const bot = store.bot(botId);
     const lane = bot?.tasks.find((task) => task.id === activeLaneOf(bot));
     const binding = { botId, generation: runtime.generation };
     const who = { replyTo, fromTelegram: true, telegramBinding: binding, ...(delegate ? { telegramDelegate: delegate } : {}) };
+    const source = origin && Number.isSafeInteger(origin.messageId) && Number.isSafeInteger(origin.fromId)
+      ? { chatId, senderId: origin.fromId!, messageId: origin.messageId!, ...(origin.topicId ? { topicId: origin.topicId } : {}), generation: runtime.generation }
+      : undefined;
+    // One Telegram update may be observed again after a transport race.
+    // Its physical source, not its reply-to context, is the deduplication key.
+    if (source && bot?.tasks.some((task) => store.messagesFor(task.id).some((m) =>
+      m.preparation?.source?.generation === source.generation && m.preparation.source.chatId === source.chatId &&
+      m.preparation.source.senderId === source.senderId && m.preparation.source.messageId === source.messageId &&
+      m.preparation.source.topicId === source.topicId))) return;
+    const ownerVerified = delegate || (currentTelegram(runtime)?.ownerUserId === source?.senderId && currentTelegram(runtime)?.ownerChatId === source?.chatId);
+    if (bot && lane && source && ownerVerified && prepareFollowup(bot, lane, text, { ...who, source })) return;
     // A follow-up while this chat waits on an answer goes into the turn
     // being answered, and that one reply covers it, rather than waiting
     // for the answer to come back before it is even read (GitHub 213).
@@ -14831,7 +14928,7 @@ function fullAccessInbox(runtime: TelegramRuntime, person: TelegramPerson): tele
     },
     deliver(chatId, text, suppliedReply, origin) {
       const who = sender(origin?.messageId);
-      if (who) deliverOverTelegram(runtime, chatId, text, replyRef(suppliedReply), who);
+      if (who) deliverOverTelegram(runtime, chatId, text, replyRef(suppliedReply), who, origin);
     },
   });
 }
@@ -14868,6 +14965,11 @@ function startTelegramBot(botId: string): void {
   if (!state?.token || !state.enabled || !store.bot(botId) || movedAway()) return;
   const runtime = makeTelegramRuntime(botId, state);
   telegramRuntimes.set(botId, runtime);
+  for (const lane of store.bot(botId)?.tasks ?? []) {
+    for (const message of store.messagesFor(lane.id)) {
+      if (message.queued && message.preparation?.source) updatePreparationReceipt(lane.id, message.id);
+    }
+  }
   void telegramLoop(runtime);
 }
 
@@ -14877,11 +14979,14 @@ function dropQueuedTelegram(botId: string, generation: string): void {
   for (const lane of store.bot(botId)?.tasks ?? []) {
     const waiting = store.messagesFor(lane.id).filter((message) => message.queued && !message.deleted &&
       (message.telegramBinding?.generation === generation || message.telegramReply?.generation === generation));
-    for (const message of waiting) {
-      const patch = store.patchMessage(lane.id, message.id, { queued: false, unsent: true, ...(message.telegramReply ? { telegramReply: { ...message.telegramReply, state: "failed" as const } } : {}) });
+    const unsent = waiting.filter((message) => !preserveUncertainPreparation(lane.id, message));
+    for (const message of unsent) {
+      const patch = store.patchMessage(lane.id, message.id, { queued: false, unsent: true,
+        ...(message.preparation ? { preparation: { ...message.preparation, state: "not-sent" as const }, delivery: { route: "not-sent" as const, why: "you" as const, line: "Not sent" } } : {}),
+        ...(message.telegramReply ? { telegramReply: { ...message.telegramReply, state: "failed" as const } } : {}) });
       if (patch) broadcast({ kind: "message.patch", threadId: lane.id, message: patch });
     }
-    if (waiting.length) {
+    if (unsent.length) {
       const notice = store.appendMessage(lane.id, { role: "bot", kind: "notice", text: "Queued Telegram messages were not sent because this agent's Telegram connection changed. Their words remain in the app." });
       broadcast({ kind: "message", threadId: lane.id, message: notice });
     }
@@ -14924,7 +15029,16 @@ async function telegramRound(runtime: TelegramRuntime): Promise<void> {
   if (offset !== (current.offset ?? 0)) saveTelegramBinding(runtime.botId, { ...current, offset });
   for (const message of messages) {
     if (!currentTelegram(runtime)) return;
-    await takeTelegramIncoming(runtime, message);
+    // A voice's transcription can take longer than a later text or
+    // shorter recording. Admit words in readiness order, not by waiting
+    // for unfinished audio. At capacity, retain the old backpressure.
+    const now = currentTelegram(runtime);
+    const known = message.fromId === now?.ownerUserId || now?.people?.[String(message.fromId)]?.state === "allowed";
+    if (message.media?.kind === "voice" && known && message.fromBot === false && !message.anonymous && runtime.media.size < MAX_WEBHOOK_QUEUE_ITEMS) {
+      const pending = takeTelegramIncoming(runtime, message).catch(() => {});
+      runtime.media.add(pending);
+      void pending.finally(() => runtime.media.delete(pending));
+    } else await takeTelegramIncoming(runtime, message);
   }
 }
 
@@ -15787,10 +15901,6 @@ function maybeResumeAfterConnect(botId: string, threadId: string, resumeKey: str
 // to wait on, so it is always still due, and its words travel with it.
 // An item an agent sent carries its place in a chain of agents' messages
 // (agentChain), which a restart forgets along with the rest of memory.
-const steerQueues = new Map<
-  string,
-  { botId: string; items: Array<{ messageId?: string; text?: string; source?: "webhook"; chain?: number; chainTask?: ChainTask; requester?: string; telegramPerson?: TelegramSender; telegramGroup?: TelegramOwnerGroup }> }
->();
 
 /** What one waiting item says now, or null for a message that no longer
  * says anything: taken back, rewound, or gone from the lane. A message
@@ -15798,12 +15908,15 @@ const steerQueues = new Map<
  * queued, with who it is from and how to answer. */
 function steerWords(laneId: string, item: { messageId?: string; text?: string; telegramPerson?: TelegramSender; telegramGroup?: TelegramOwnerGroup }): string | null {
   const m = item.messageId ? store.messagesFor(laneId).find((msg) => msg.id === item.messageId) : undefined;
+  if (m?.preparation?.state === "dispatching" || m?.preparation?.state === "uncertain") return null;
   const sender = item.telegramPerson ?? m?.telegramPerson ?? item.telegramGroup ?? m?.telegramGroup;
   const delegate = m?.telegramDelegate;
   if ((sender && !telegramReplySenderCurrent(telegramBinding(sender.botId), sender)) || (delegate && !telegramDelegateCurrent(telegramBinding(delegate.botId), delegate))) {
     if (m?.queued) {
-      const removed = store.patchMessage(laneId, m.id, { queued: false, unsent: true });
+      const removed = store.patchMessage(laneId, m.id, { queued: false, unsent: true,
+        ...(m.preparation ? { preparation: { ...m.preparation, state: "not-sent" as const }, delivery: { route: "not-sent" as const, why: "you" as const, line: "Not sent" } } : {}) });
       if (removed) broadcast({ kind: "message.patch", threadId: laneId, message: removed });
+      updatePreparationReceipt(laneId, m.id);
     }
     return null;
   }
@@ -15922,6 +16035,8 @@ function editClosed(laneId: string, messageId: string) {
   open.delete(messageId);
   if (open.size) return;
   beingEdited.delete(laneId);
+  const preparation = preparations.get(laneId);
+  if (preparation?.phase === "running") void drainPreparation(preparation);
   drainSteer(laneId);
 }
 
@@ -15977,6 +16092,7 @@ function queueOnLane(
     chainTask?: ChainTask;
     /** Why the person's words wait, said under them (server/delivery.ts). */
     delivery?: Delivery;
+    preparation?: Message["preparation"];
     /** Told the words as written down, after the admission, so another
      * agent's record of sending them can follow them (tieRecord). */
     onQueued?: (laneId: string, waiting: Message) => void;
@@ -16006,6 +16122,7 @@ function queueOnLane(
     ...(options.telegramGroup ? { telegramGroup: options.telegramGroup } : {}),
     ...(!options.from && !options.via && store.bot(botId) ? { commandInstance } : {}),
     ...(options.delivery ? { delivery: options.delivery } : {}),
+    ...(options.preparation ? { preparation: options.preparation } : {}),
   });
   options.admission?.accepted("queued");
   options.onQueued?.(laneId, message);
@@ -16019,6 +16136,473 @@ function queueOnLane(
   });
   steerQueues.set(laneId, entry);
   return message;
+}
+
+/** Admit only the same authenticated requester and audience to the
+ * attempt that claimed this lane. The transcript row is the queue. */
+function prepareFollowup(
+  bot: BotRecord,
+  lane: TaskRecord,
+  text: string,
+  options: { replyTo?: ReplyRef; personal?: boolean; fromTelegram?: boolean; telegramBinding?: Message["telegramBinding"]; telegramPerson?: TelegramSender; telegramDelegate?: TelegramSender; telegramGroup?: TelegramOwnerGroup; source?: NonNullable<Message["preparation"]>["source"] } = {},
+): Message | null {
+  const attempt = preparations.get(lane.id);
+  if (!attempt || attempt.botId !== bot.id ||
+      (attempt.phase !== "open" && attempt.phase !== "frozen" && !(attempt.phase === "running" && attempt.draining)) ||
+      drain.on || wheel.heldBy(bot.id) || bot.archivedAt) return null;
+  if (commandTurns.has(lane.id)) return null;
+  const native = acceptingNative(bot, lane.id);
+  if (!options.telegramPerson && native && commandFor(text, native)) return null;
+  const requester = options.telegramPerson?.requester ?? options.telegramGroup?.requester ?? "owner";
+  if (requester !== attempt.requester || telegramAudience(options.telegramPerson ?? options.telegramGroup) !== attempt.audience ||
+      !sameTelegramDelegate(attempt.delegate, options.telegramDelegate)) return null;
+  if (options.telegramBinding && !telegramConnectionCurrent(options.telegramBinding)) return null;
+  if (options.telegramPerson && !telegramSenderCurrent(telegramBinding(bot.id), options.telegramPerson)) return null;
+  if (options.telegramDelegate && !telegramDelegateCurrent(telegramBinding(bot.id), options.telegramDelegate)) return null;
+  if (options.telegramGroup && !telegramOwnerGroupCurrent(telegramBinding(bot.id), options.telegramGroup)) return null;
+  if (attempt.messages.length >= MAX_WEBHOOK_QUEUE_ITEMS) {
+    // Do not let excess words silently become a later turn that could
+    // overtake an unresolved addition. The existing transcript keeps
+    // them for the sender, who can choose to send them again.
+    const message = store.appendMessage(lane.id, {
+      role: "user", kind: "text", text, unsent: true,
+      namedSkills: options.personal !== false,
+      ...(options.replyTo ? { replyTo: options.replyTo } : {}),
+      ...(options.fromTelegram ? { fromTelegram: true } : {}),
+      ...(options.telegramBinding ? { telegramBinding: options.telegramBinding } : {}),
+      ...(options.telegramPerson ? { telegramPerson: options.telegramPerson } : {}),
+      ...(options.telegramDelegate ? { telegramDelegate: options.telegramDelegate } : {}),
+      ...(options.telegramGroup ? { telegramGroup: options.telegramGroup } : {}),
+      preparation: { attempt: attempt.id, state: "not-sent", ...(options.source ? { source: options.source } : {}) },
+      delivery: { route: "not-sent", why: "you", line: "Not sent" },
+    });
+    broadcast({ kind: "message", threadId: lane.id, message });
+    updatePreparationReceipt(lane.id, message.id);
+    return message;
+  }
+  const earlierInFlight = attempt.unsupported && attempt.messages.some((id) => {
+    const p = store.messagesFor(lane.id).find((row) => row.id === id)?.preparation;
+    return p?.state === "dispatching" || p?.state === "uncertain";
+  });
+  const next = Boolean(attempt.unsupported && !earlierInFlight);
+  const delivery: Delivery = next
+    ? { route: "queued", why: "you", line: deliveryLine("queued", "you", bot.name) }
+    : { route: "pending", why: "you", line: earlierInFlight ? "Waiting for an earlier input's receipt" : deliveryLine("pending", "you", bot.name) };
+  const message = queueOnLane(bot.id, lane.id, text, {
+    ...options, delivery,
+    preparation: { attempt: attempt.id, state: next ? "next" : "pending", ...(options.source ? { source: options.source } : {}) },
+  });
+  if (next) {
+    const reply = preparationFallbackReply(bot.id, message);
+    if (reply) store.patchMessage(lane.id, message.id, { telegramReply: reply });
+  }
+  attempt.messages.push(message.id);
+  updatePreparationReceipt(lane.id, message.id);
+  return message;
+}
+
+function preparationCurrent(attempt: PreparationAttempt): boolean {
+  const bot = store.bot(attempt.botId);
+  if (preparations.get(attempt.laneId) !== attempt || attempt.phase === "ended" ||
+      !bot || bot.archivedAt || wheel.heldBy(bot.id) || drain.on || stoppedGettingReady.has(attempt.laneId)) return false;
+  const state = telegramBinding(attempt.botId);
+  if (attempt.person && !telegramSenderCurrent(state, attempt.person)) return false;
+  if (attempt.delegate && !telegramDelegateCurrent(state, attempt.delegate)) return false;
+  if (attempt.group && !telegramOwnerGroupCurrent(state, attempt.group)) return false;
+  if (attempt.ownerTelegram && (!state || state.generation !== attempt.ownerTelegram.generation ||
+      state.ownerUserId !== attempt.ownerTelegram.userId || state.ownerChatId !== attempt.ownerTelegram.chatId)) return false;
+  return true;
+}
+
+/** The frozen set is fixed before any remaining asynchronous lookup.
+ * Its words and authority are read again immediately before dispatch. */
+function turnPreparation(attempt: PreparationAttempt): TurnPreparation {
+  return {
+    freeze() {
+      if (attempt.phase === "open") attempt.phase = "frozen";
+      const ids = attempt.phase === "frozen" && preparationCurrent(attempt) && !beingEdited.has(attempt.laneId)
+        ? attempt.messages.filter((id) => store.messagesFor(attempt.laneId).find((m) => m.id === id)?.preparation?.state === "pending")
+        : [];
+      const initial = ids.flatMap((id) => {
+        const m = store.messagesFor(attempt.laneId).find((row) => row.id === id);
+        return m?.namedSkills && m.text ? [m.text] : [];
+      });
+      return {
+        hasInputs: ids.length > 0,
+        skillNames: codexSkillNames(initial),
+        commit() {
+          if (!preparationCurrent(attempt)) throw new Error("This turn is no longer allowed to take preparation follow-ups.");
+          const selected = !beingEdited.has(attempt.laneId) ? ids.flatMap((id) => {
+            const m = store.messagesFor(attempt.laneId).find((row) => row.id === id);
+            if (!m?.preparation || m.preparation.attempt !== attempt.id || m.preparation.state !== "pending") return [];
+            const words = steerWords(attempt.laneId, { messageId: id });
+            if (words === null || (m.preparation.source && !preparationReceiptCurrent(attempt.botId, m))) return [];
+            return [{ m, words }];
+          }) : [];
+          const selectedIds = selected.map(({ m }) => m.id);
+          if (selectedIds.length) {
+            // One synchronous transcript write precedes the native effect.
+            const marked = store.patchMessages(attempt.laneId, selectedIds, (m) => ({
+              preparation: { ...m.preparation!, state: "dispatching" },
+              delivery: { route: "pending", why: "you", line: "Sending to this turn" },
+            }), { durable: true });
+            if (marked.length !== selectedIds.length) throw new Error("Could not retain all preparation inputs before dispatch.");
+            for (const m of marked) {
+              broadcast({ kind: "message.patch", threadId: attempt.laneId, message: m });
+              updatePreparationReceipt(attempt.laneId, m.id);
+            }
+          }
+          const text = selected.map(({ words }) => words).join("\n\n");
+          const names = codexSkillNames(selected.flatMap(({ m }) => m.namedSkills && m.text ? [m.text] : []));
+          const images = selected.flatMap(({ m }) => m.text && attachments.hasAttachedImage(m.text) ? attachments.attachedImages(m.text) : []);
+          return {
+            text, skillNames: names, images,
+            settle(outcome: "accepted" | "refused" | "uncertain") {
+              settlePreparationInput(attempt, selectedIds, outcome);
+            },
+          };
+        },
+      };
+    },
+    ready(turnId) {
+      if (!preparationCurrent(attempt)) return;
+      attempt.engineTurnId = turnId;
+      attempt.phase = "running";
+      void drainPreparation(attempt);
+    },
+    withoutSteering() { if (preparationCurrent(attempt)) attempt.unsupported = true; },
+    unavailable() { finishPreparation(attempt); },
+  };
+}
+
+function settlePreparationInput(attempt: PreparationAttempt, ids: readonly string[], outcome: "accepted" | "refused" | "uncertain"): void {
+  const bot = store.bot(attempt.botId);
+  if (!bot) return;
+  const eligible = ids.filter((id) => {
+    const p = store.messagesFor(attempt.laneId).find((m) => m.id === id)?.preparation;
+    return p?.attempt === attempt.id && (p.state === "dispatching" || p.state === "uncertain");
+  });
+  if (!eligible.length) return;
+  const state = outcome === "accepted" ? "joined" : outcome === "refused" ? "next" : "uncertain";
+  const route = state === "joined" ? "steered" : state === "next" ? "queued" : "uncertain";
+  const delivery: Delivery = { route, why: "you", line: state === "joined" ? "Joined this turn" : deliveryLine(route, "you", bot.name) };
+  const deliveredAt = Date.now();
+  const patch = (m: Message): Partial<Message> => ({
+    preparation: { ...m.preparation!, state }, delivery,
+    ...(state === "next" && preparationFallbackReply(attempt.botId, m) ? { telegramReply: preparationFallbackReply(attempt.botId, m) } : {}),
+    ...(state === "joined" ? { queued: false, midTurn: true, deliveredAt, queuedAt: m.queuedAt ?? m.at,
+      ...(attempt.phase !== "ended" ? { at: deliveredAt } : {}),
+      ...(attempt.driverKind === "codex" && attempt.engineTurnId ? { joinedTurnId: attempt.engineTurnId } : {}) } : {}),
+  });
+  const changed = state === "joined" && attempt.phase !== "ended"
+    ? store.moveToEnd(attempt.laneId, eligible, patch, { durable: true })
+    : store.patchMessages(attempt.laneId, eligible, patch, { durable: true });
+  if (state === "next") {
+    const queue = steerQueues.get(attempt.laneId) ?? { botId: attempt.botId, items: [] };
+    const missing = changed.filter((m) => !queue.items.some((item) => item.messageId === m.id));
+    queue.items.unshift(...missing.map((m) => ({ messageId: m.id })));
+    steerQueues.set(attempt.laneId, queue);
+  }
+  for (const m of changed) {
+    if (state !== "next") removePreparationQueueItem(attempt.laneId, m.id);
+    broadcast({ kind: "message.patch", threadId: attempt.laneId, message: m, ...(state === "joined" && attempt.phase !== "ended" ? { moved: true } : {}) });
+    updatePreparationReceipt(attempt.laneId, m.id);
+  }
+  if (state === "next" && attempt.phase === "ended") drainSteer(attempt.laneId);
+  if (state === "uncertain") finishPreparation(attempt);
+}
+
+/** Later arrivals after the initial snapshot wait for this attempt's
+ * first supported steer. One lane drains in order; no lane waits for
+ * another and a lost receipt cannot authorize a second write. */
+async function drainPreparation(attempt: PreparationAttempt): Promise<void> {
+  if (attempt.draining || attempt.phase !== "running" || !attempt.engineTurnId) return;
+  attempt.draining = true;
+  let retryChanged = false;
+  try {
+    const earlier = steerAttempts.get(attempt.laneId);
+    if (earlier) {
+      const safeToFollow = (message: Message | null) => Boolean(message &&
+        (message.agent || message.preparation?.state === "joined" ||
+          (attempt.driverKind === "codex" && message.joinedTurnId === attempt.engineTurnId)));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const expired = new Promise<"deadline">((resolve) => {
+        timer = setTimeout(() => resolve("deadline"), 30_000);
+        timer.unref?.();
+      });
+      const settled = await Promise.race([earlier.then(safeToFollow, () => false), expired]);
+      if (timer) clearTimeout(timer);
+      if (settled === false) {
+        // The old boolean steering path cannot distinguish a refusal from
+        // a lost acknowledgement. Do not overtake that uncertain input.
+        attempt.blocked = true;
+        finishPreparation(attempt);
+        return;
+      }
+      if (settled === "deadline") {
+        attempt.blocked = true;
+        for (const id of attempt.messages) {
+          const m = store.messagesFor(attempt.laneId).find((row) => row.id === id);
+          if (m?.preparation?.state !== "pending") continue;
+          const patched = store.patchMessage(attempt.laneId, id, { delivery: { route: "pending", why: "you", line: "Waiting for an earlier input's receipt" } });
+          if (patched) broadcast({ kind: "message.patch", threadId: attempt.laneId, message: patched });
+          updatePreparationReceipt(attempt.laneId, id);
+        }
+        if (attempt.waitingFor !== earlier) {
+          attempt.waitingFor = earlier;
+          void earlier.then((message) => {
+            if (attempt.waitingFor !== earlier) return;
+            attempt.waitingFor = undefined;
+            attempt.blocked = !safeToFollow(message);
+            if (attempt.blocked) finishPreparation(attempt);
+            else void drainPreparation(attempt);
+          }, () => {
+            if (attempt.waitingFor !== earlier) return;
+            attempt.waitingFor = undefined;
+            attempt.blocked = true;
+            finishPreparation(attempt);
+          });
+        }
+        return;
+      }
+    }
+    for (const id of attempt.messages) {
+      if (!preparationCurrent(attempt) || attempt.phase !== "running") return;
+      if (beingEdited.has(attempt.laneId)) return;
+      const bot = store.bot(attempt.botId);
+      const lane = bot?.tasks.find((task) => task.id === attempt.laneId);
+      const message = store.messagesFor(attempt.laneId).find((m) => m.id === id);
+      if (!bot || !lane || !message?.preparation || message.preparation.state !== "pending") continue;
+      const words = steerWords(attempt.laneId, { messageId: id });
+      if (words === null || (message.preparation.source && !preparationReceiptCurrent(bot.id, message))) {
+        const removed = store.patchMessage(attempt.laneId, id, {
+          queued: false, unsent: true, preparation: { ...message.preparation, state: "not-sent" },
+          delivery: { route: "not-sent", why: "you", line: "Not sent" },
+        });
+        removePreparationQueueItem(attempt.laneId, id);
+        if (removed) broadcast({ kind: "message.patch", threadId: attempt.laneId, message: removed });
+        updatePreparationReceipt(attempt.laneId, id);
+        continue;
+      }
+      const adapter = laneInstance(bot, lane.id)?.adapter;
+      if (!lane.busy || !adapter?.steerPrepared) { finishPreparation(attempt); return; }
+      const queued = steerQueues.get(lane.id)?.items ?? [];
+      const position = queued.findIndex((item) => item.messageId === id);
+      const ahead = position < 0 ? [] : queued.slice(0, position);
+      const earlierPersonal = ahead.some((item) => {
+        const m = item.messageId ? store.messagesFor(lane.id).find((row) => row.id === item.messageId) : undefined;
+        return m?.queued && !m.deleted && !m.agent && !m.via && m.delivery?.route !== "queued" &&
+          sameTelegramDelegate(m.telegramDelegate, message.telegramDelegate) &&
+          telegramAudience(m.telegramPerson ?? m.telegramGroup) === attempt.audience &&
+          (m.telegramPerson?.requester ?? m.telegramGroup?.requester ?? "owner") === attempt.requester;
+      });
+      if (earlierPersonal) { finishPreparation(attempt); return; }
+      let dispatched = false;
+      let changed = false;
+      const operation = (async (): Promise<Message | null> => {
+        let expired = false;
+        const native = adapter.steerPrepared!(lane.id, attempt.engineTurnId!, words, {
+          ...(message.namedSkills && message.text ? { skillNames: codexSkillNames([message.text]) } : {}),
+          onAcceptedLate: () => settlePreparationInput(attempt, [id], "accepted"),
+          onDispatch() {
+            const now = store.messagesFor(lane.id).find((m) => m.id === id);
+            if (expired || !preparationCurrent(attempt) || attempt.phase !== "running" || beingEdited.has(lane.id) ||
+                !now?.preparation || now.preparation.attempt !== attempt.id || now.preparation.state !== "pending" ||
+                steerWords(lane.id, { messageId: id }) !== words ||
+                (now.preparation.source && !preparationReceiptCurrent(bot.id, now))) {
+              changed = true;
+              throw new Error("The waiting input changed before dispatch.");
+            }
+            const saved = store.patchMessage(lane.id, id, {
+              preparation: { ...now.preparation, state: "dispatching" },
+              delivery: { route: "pending", why: "you", line: "Sending to this turn" },
+            }, { durable: true });
+            if (!saved) throw new Error("Could not retain the input before dispatch.");
+            dispatched = true;
+            broadcast({ kind: "message.patch", threadId: lane.id, message: saved });
+            updatePreparationReceipt(lane.id, id);
+          },
+        }).catch(() => dispatched ? "uncertain" as const : "refused" as const);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<"deadline">((resolve) => {
+          timer = setTimeout(() => { expired = true; resolve("deadline"); }, 30_000);
+          timer.unref?.();
+        });
+        const answer = await Promise.race([native, deadline]);
+        if (timer) clearTimeout(timer);
+        if (answer === "deadline") {
+          void native.then((late) => {
+            if (dispatched && late === "accepted") settlePreparationInput(attempt, [id], "accepted");
+          }).catch(() => {});
+        }
+        const result = answer === "deadline" ? (dispatched ? "uncertain" : "refused") : answer;
+        if (changed) return null;
+        const outcome = result === "accepted" && !dispatched ? "uncertain" : result;
+        if (!dispatched && outcome === "refused") {
+          finishPreparation(attempt);
+          return null;
+        }
+        settlePreparationInput(attempt, [id], outcome);
+        return store.messagesFor(lane.id).find((m) => m.id === id) ?? null;
+      })();
+      steerAttempts.set(lane.id, operation);
+      try { await operation; } finally {
+        if (steerAttempts.get(lane.id) === operation) steerAttempts.delete(lane.id);
+      }
+      if (changed) {
+        // An edit may have completed while this drain was awaiting the
+        // engine's setup. Its close could not start another drain while
+        // this one was active, so re-read the saved words once it exits.
+        retryChanged = true;
+        return;
+      }
+      if (!preparationCurrent(attempt) || attempt.phase !== "running") return;
+      const current = store.messagesFor(lane.id).find((m) => m.id === id);
+      if (current?.preparation?.state !== "joined") { finishPreparation(attempt); return; }
+    }
+    finishPreparation(attempt);
+  } finally {
+    attempt.draining = false;
+    if (retryChanged && preparationCurrent(attempt) && attempt.phase === "running" && !beingEdited.has(attempt.laneId)) {
+      queueMicrotask(() => void drainPreparation(attempt));
+    }
+  }
+}
+
+function preparationReceiptText(state: NonNullable<Message["preparation"]>["state"], line?: string): string {
+  if (state === "pending") return line === "Waiting for an earlier input's receipt" ? `${line}.` : "Waiting for this turn to start.";
+  if (state === "dispatching") return "Sending to this turn.";
+  if (state === "joined") return "Joined this turn.";
+  if (state === "next") return "For the next turn.";
+  if (state === "uncertain") return "Delivery could not be confirmed. It will not be sent again automatically.";
+  return "Not sent.";
+}
+
+function preparationFallbackReply(botId: string, message: Message): TelegramReply | undefined {
+  const source = message.preparation?.source;
+  if (!source || message.telegramPerson || message.telegramGroup || !preparationReceiptCurrent(botId, message)) return undefined;
+  return queuedTelegramReply(source.chatId, { botId, generation: source.generation }, message.telegramDelegate);
+}
+
+function preparationReceiptCurrent(botId: string, message: Message): boolean {
+  const source = message.preparation?.source;
+  const state = telegramBinding(botId);
+  if (!source || !state || !telegramConnectionCurrent({ botId, generation: source.generation })) return false;
+  if (message.telegramPerson) return message.telegramPerson.userId === source.senderId &&
+    message.telegramPerson.chatId === source.chatId && telegramSenderCurrent(state, message.telegramPerson);
+  if (message.telegramDelegate) return message.telegramDelegate.userId === source.senderId &&
+    message.telegramDelegate.chatId === source.chatId && telegramDelegateCurrent(state, message.telegramDelegate);
+  if (message.telegramGroup) return message.telegramGroup.userId === source.senderId &&
+    message.telegramGroup.chatId === source.chatId && telegramOwnerGroupCurrent(state, message.telegramGroup);
+  return state.ownerUserId === source.senderId && state.ownerChatId === source.chatId;
+}
+
+/** Serialize updates to one physical receipt. A late pending send cannot
+ * overwrite a newer result, and failure here never changes engine delivery. */
+function updatePreparationReceipt(laneId: string, messageId: string): void {
+  const key = `${laneId}\0${messageId}`;
+  const working = preparationReceipts.get(key);
+  if (working) { working.again = true; return; }
+  // A burst may have more physical messages than the native input limit.
+  // Coalesce their latest states while bounding concurrent network work.
+  if (preparationReceipts.size >= MAX_WEBHOOK_QUEUE_ITEMS) {
+    preparationReceiptQueue.set(key, { laneId, messageId });
+    return;
+  }
+  preparationReceiptQueue.delete(key);
+  const task = { again: false };
+  preparationReceipts.set(key, task);
+  void (async () => {
+    do {
+      task.again = false;
+      const bot = store.botByThread(laneId);
+      const message = store.messagesFor(laneId).find((m) => m.id === messageId);
+      const prep = message?.preparation, source = prep?.source;
+      const runtime = bot && liveTelegram(bot.id);
+      if (!bot || !message || !prep || !source || !runtime || !preparationReceiptCurrent(bot.id, message)) return;
+      const current = () => {
+        const latest = store.messagesFor(laneId).find((m) => m.id === messageId);
+        return Boolean(latest?.preparation?.attempt === prep.attempt && preparationReceiptCurrent(bot.id, latest));
+      };
+      if (!prep.receiptId) {
+        if (prep.receiptState) return;
+        const marked = store.patchMessage(laneId, messageId, { preparation: { ...prep, receiptState: "sending" } }, { durable: true });
+        if (!marked) return;
+        let receiptId: number | undefined;
+        try {
+          receiptId = await telegram.postReceipt(runtime.token, source.chatId, source.messageId, preparationReceiptText(prep.state, message.delivery?.line), current, source.topicId);
+        } catch { /* It may have arrived. Do not make another receipt. */ }
+        const latest = store.messagesFor(laneId).find((m) => m.id === messageId);
+        if (!latest?.preparation || latest.preparation.attempt !== prep.attempt) return;
+        store.patchMessage(laneId, messageId, { preparation: { ...latest.preparation,
+          receiptState: receiptId ? "sent" : "unconfirmed", ...(receiptId ? { receiptId } : {}) } });
+        if (receiptId && (latest.preparation.state !== prep.state || latest.delivery?.line !== message.delivery?.line)) task.again = true;
+      } else if (current()) {
+        await telegram.edit(runtime.token, source.chatId, prep.receiptId, preparationReceiptText(prep.state, message.delivery?.line)).catch(() => {});
+      }
+    } while (task.again);
+  })().catch(() => {}).finally(() => {
+    if (preparationReceipts.get(key) === task) preparationReceipts.delete(key);
+    const next = preparationReceiptQueue.entries().next().value;
+    if (next) {
+      preparationReceiptQueue.delete(next[0]);
+      queueMicrotask(() => updatePreparationReceipt(next[1].laneId, next[1].messageId));
+    }
+  });
+}
+
+/** Revocation cannot prove that an earlier physical dispatch failed. */
+function preserveUncertainPreparation(laneId: string, message: Message): boolean {
+  const prep = message.preparation;
+  if (!prep || (prep.state !== "dispatching" && prep.state !== "uncertain")) return false;
+  if (prep.state === "dispatching") {
+    const patched = store.patchMessage(laneId, message.id, {
+      preparation: { ...prep, state: "uncertain" },
+      delivery: { route: "uncertain", why: "you", line: "Delivery could not be confirmed" },
+    });
+    if (patched) broadcast({ kind: "message.patch", threadId: laneId, message: patched });
+  }
+  removePreparationQueueItem(laneId, message.id);
+  return true;
+}
+
+/** Ending an attempt never makes an in-flight input ordinary queued work.
+ * A pending one was not sent and can wait for the next turn. */
+function finishPreparation(attempt: PreparationAttempt): void {
+  if (attempt.phase === "ended") return;
+  attempt.phase = "ended";
+  if (preparations.get(attempt.laneId) === attempt) preparations.delete(attempt.laneId);
+  const bot = store.bot(attempt.botId);
+  if (!bot) return;
+  let blocked = Boolean(attempt.blocked);
+  for (const id of attempt.messages) {
+    const message = store.messagesFor(attempt.laneId).find((m) => m.id === id);
+    if (!message?.preparation || message.preparation.attempt !== attempt.id) continue;
+    const state = message.preparation.state;
+    if (state === "dispatching" || state === "uncertain") blocked = true;
+    if (state !== "pending" && state !== "dispatching") continue;
+    const valid = state !== "pending" || (!message.deleted && !message.unsent &&
+      steerWords(attempt.laneId, { messageId: id }) !== null &&
+      (!message.preparation.source || preparationReceiptCurrent(attempt.botId, message)));
+    const next = state === "dispatching" ? "uncertain" : blocked || !valid ? "not-sent" : "next";
+    const route = next === "next" ? "queued" : next;
+    const delivery: Delivery = { route, why: "you", line: deliveryLine(route, "you", bot.name) };
+    const patched = store.patchMessage(attempt.laneId, id, {
+      preparation: { ...message.preparation, state: next }, delivery,
+      ...(next === "next" && preparationFallbackReply(attempt.botId, message) ? { telegramReply: preparationFallbackReply(attempt.botId, message) } : {}),
+      ...(next === "not-sent" ? { queued: false, unsent: true } : {}),
+    });
+    if (patched) broadcast({ kind: "message.patch", threadId: attempt.laneId, message: patched });
+    updatePreparationReceipt(attempt.laneId, id);
+    if (next !== "next") removePreparationQueueItem(attempt.laneId, id);
+  }
+}
+
+function removePreparationQueueItem(laneId: string, messageId: string): void {
+  const entry = steerQueues.get(laneId);
+  if (!entry) return;
+  entry.items = entry.items.filter((item) => item.messageId !== messageId);
+  if (!entry.items.length) steerQueues.delete(laneId);
 }
 
 /** Each lane's latest steer still asking its engine, the next in line
@@ -16191,11 +16775,39 @@ function recoverQueued(now = Date.now(), joining = new Set<string>()) {
     for (const lane of bot.tasks) {
       const flagged = store.messagesFor(lane.id).filter((m) => m.queued && m.role === "user" && !m.deleted && m.text);
       const fresh = (m: Message) => typeof m.queuedAt === "number" && now - m.queuedAt <= MAX_QUEUED_RECOVERY_MS && m.queuedAt <= now;
-      for (const m of flagged.filter((m) => !fresh(m))) {
-        const patched = store.patchMessage(lane.id, m.id, { queued: false, unsent: true });
+      const uncertainAttempts = new Set<string>();
+      for (const m of flagged) {
+        if (!m.preparation) continue;
+        if (m.preparation.state === "uncertain") { uncertainAttempts.add(m.preparation.attempt); continue; }
+        if (!["pending", "dispatching"].includes(m.preparation.state)) continue;
+        // An in-flight marker was saved before the native effect. A crash
+        // can have occurred on either side of it, so absence of a receipt
+        // cannot authorize replay. A merely pending input was not sent.
+        const state = m.preparation.state === "dispatching" ? "uncertain" : uncertainAttempts.has(m.preparation.attempt) ? "not-sent" : "next";
+        if (state === "uncertain") uncertainAttempts.add(m.preparation.attempt);
+        const route = state === "next" ? "queued" : state;
+        const patched = store.patchMessage(lane.id, m.id, {
+          preparation: { ...m.preparation, state },
+          delivery: { route, why: "you", line: deliveryLine(route, "you", bot.name) },
+          ...(state === "next" && preparationFallbackReply(bot.id, m) ? { telegramReply: preparationFallbackReply(bot.id, m) } : {}),
+          ...(state === "not-sent" ? { queued: false, unsent: true } : {}),
+        });
         if (patched) broadcast({ kind: "message.patch", threadId: lane.id, message: patched });
+        updatePreparationReceipt(lane.id, m.id);
       }
-      const waiting = flagged.filter(fresh);
+      const eligible = flagged.filter((m) => {
+        const current = store.messagesFor(lane.id).find((row) => row.id === m.id);
+        return current?.queued && !["dispatching", "uncertain"].includes(current.preparation?.state ?? "");
+      });
+      for (const m of eligible.filter((m) => !fresh(m))) {
+        const current = store.messagesFor(lane.id).find((row) => row.id === m.id);
+        const patched = store.patchMessage(lane.id, m.id, { queued: false, unsent: true,
+          ...(current?.preparation ? { preparation: { ...current.preparation, state: "not-sent" as const }, delivery: { route: "not-sent" as const, why: "you" as const, line: "Not sent" } } : {}),
+        });
+        if (patched) broadcast({ kind: "message.patch", threadId: lane.id, message: patched });
+        updatePreparationReceipt(lane.id, m.id);
+      }
+      const waiting = eligible.filter(fresh);
       if (!waiting.length) continue;
       steerQueues.set(lane.id, {
         botId: bot.id,
@@ -16376,6 +16988,7 @@ async function sendWaitingNow(bot: BotRecord, lane: TaskRecord): Promise<"steere
     // This bulk action is private app input. Telegram senders and group
     // audiences retain their own queued provenance and delivery path.
     return m && m.role === "user" && m.queued && !m.deleted && !m.agent && !m.via &&
+      (!m.preparation || m.preparation.state === "next") &&
       !m.telegramPerson && !m.telegramDelegate && !m.telegramGroup && m.text;
   });
   if (!lane.busy || !yours.length) return "nothing";
@@ -16497,6 +17110,22 @@ async function sendUserMessage(
   // lane, shown as waiting for the pause, as they would behind a turn.
   const paused = pauseHolding(bot, lane.id);
   if (laneWaits(lane) || paused) {
+    // Before the input boundary the person is still adding to the
+    // request. Respect an explicit later choice and the existing queue
+    // setting, without asking a model to classify a preparation follow-up.
+    if (yours && options.steer && !paused && preparations.has(lane.id)) {
+      const mode = resolveMode(bot.delivery, cfg.delivery?.mode);
+      const choice = options.delivery === "answer" ? "now" : options.delivery;
+      const read = deliveryPlan(mode, text, {}, choice);
+      const later = read.route === "queue" && (read.why !== "other" || mode === "queue");
+      if (!later && read.route !== "stop") {
+        const pending = prepareFollowup(bot, lane, text, { replyTo: options.replyTo, personal: options.personal });
+        if (pending) {
+          if (!pending.unsent) heard();
+          return { ok: !pending.unsent, queued: Boolean(pending.queued), taskId: lane.id, lane: lane.title, note: pending.delivery!.line, delivery: pending.delivery };
+        }
+      }
+    }
     // The person's own words meeting a turn in progress: read for whether
     // they belong in it now, or after it (server/delivery.ts). Anything
     // else that holds a lane (a pause, a restart, a burst held for an
@@ -21690,6 +22319,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       if (!existing) return json(res, 404, { error: "no such message" });
 
       if (method === "DELETE") {
+        if (existing.preparation && ["dispatching", "uncertain"].includes(existing.preparation.state)) {
+          return json(res, 409, { error: "These words may have reached the turn. Their delivery is unresolved, so they cannot be taken back here." });
+        }
         // A tombstone, not a hole. Replies that point at this message
         // still make sense, the transcript keeps its shape, and the
         // words themselves are gone from disk and from every engine.
@@ -21714,6 +22346,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         return json(res, 403, { error: "only your own messages can be edited" });
       }
       if (existing.deleted) return json(res, 409, { error: "that message was taken back" });
+      if (existing.preparation && ["dispatching", "uncertain", "joined"].includes(existing.preparation.state)) {
+        return json(res, 409, { error: "These words were already submitted or their delivery is unknown. Send a new message to change them." });
+      }
       const body = await readBody(req);
       const text = typeof body.text === "string" ? body.text.trim() : "";
       if (!text) return json(res, 400, { error: "an edited message still needs words" });
@@ -21740,7 +22375,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       }
       const message = store.messagesFor(m[1]).find((msg) => msg.id === m![2]);
       const waiting = steerQueues.get(m[1])?.items.some((item) => item.messageId === m![2]);
-      if (!message || message.role !== "user" || message.deleted || !message.queued || !waiting) {
+      if (!message || message.role !== "user" || message.deleted || !message.queued || !waiting ||
+          (message.preparation && !["pending", "next"].includes(message.preparation.state))) {
         return json(res, 200, { holding: false });
       }
       editOpened(m[1], m[2]);
