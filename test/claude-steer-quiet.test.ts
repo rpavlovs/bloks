@@ -112,6 +112,67 @@ function stoppedFirst(timeline: string[]) {
   assert.ok(stop >= 0 && over > stop, `the process was not stopped before its turn was over: ${timeline.join(", ") || "nothing"}`);
 }
 
+test("preparation receipts require Claude's matching input UUID", async (t) => {
+  const f = await fixture(t, "2.1.300 (Claude Code)");
+  const initial: string[] = [], ready: string[] = [];
+  const started = await f.instance.adapter.sendTurn({
+    threadId: THREAD, text: "FIRST", stallMs: 0,
+    preparation: {
+      freeze: () => ({
+        hasInputs: true, skillNames: [],
+        commit: () => ({ text: "READY_A", skillNames: [], images: [], settle: (status) => initial.push(status) }),
+      }),
+      ready: (turnId) => ready.push(turnId),
+      unavailable: () => {},
+    },
+  });
+  assert.match(f.inputs()[0].message.content, /FIRST\n\nREADY_A/);
+  assert.deepEqual(initial, []);
+  const initialId = f.inputs()[0].uuid;
+  f.send({ type: "system", subtype: "status", status: "requesting", user_message_uuids: ["foreign"] });
+  await f.flush();
+  assert.deepEqual(initial, []);
+  f.send({ type: "system", subtype: "status", status: "requesting", user_message_uuids: [initialId] });
+  await f.flush();
+  assert.deepEqual(initial, ["accepted"]);
+  assert.deepEqual(ready, [started.turnId]);
+
+  let dispatched = 0;
+  const steering = f.instance.adapter.steerPrepared!(THREAD, started.turnId, "READY_B", { onDispatch: () => { dispatched++; } });
+  await f.flush();
+  const nextId = f.inputs()[1].uuid;
+  assert.equal(dispatched, 1);
+  f.send({ type: "command_lifecycle", command_uuid: "foreign", state: "started" });
+  await f.flush();
+  f.send({ type: "command_lifecycle", command_uuid: nextId, state: "started" });
+  assert.equal(await steering, "accepted");
+  assert.equal(f.inputs().filter((input) => input.message.content === "READY_B").length, 1);
+});
+
+for (const version of ["2.1.299 (Claude Code)", "unknown"]) test(`${version}: preparation waits for the next turn and ordinary steering still works`, async (t) => {
+  const f = await fixture(t, version);
+  const initial: string[] = [], ready: string[] = [];
+  let unavailable = 0;
+  await f.instance.adapter.sendTurn({
+    threadId: THREAD, text: "FIRST", stallMs: 0,
+    preparation: {
+      freeze: () => ({
+        hasInputs: true, skillNames: [],
+        commit: () => ({ text: "READY_A", skillNames: [], images: [], settle: (status) => initial.push(status) }),
+      }),
+      ready: (turnId) => ready.push(turnId),
+      unavailable: () => { unavailable++; },
+    },
+  });
+  assert.equal(f.inputs()[0].uuid, undefined);
+  assert.equal(f.inputs()[0].message.content, "FIRST");
+  assert.deepEqual(initial, []);
+  assert.deepEqual(ready, []);
+  assert.equal(unavailable, 1);
+  assert.equal(await f.instance.adapter.steerTurn!(THREAD, "NORMAL_STEER"), true);
+  assert.equal(f.inputs()[1].message.content, "NORMAL_STEER");
+});
+
 const LONG_COMMAND = { type: "assistant", message: { content: [{ type: "tool_use", id: "bash-36s", name: "Bash", input: { command: "./sync-records.sh" } }] } };
 const COMMAND_DONE = { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "bash-36s", content: "synced" }] } };
 
