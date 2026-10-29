@@ -7,9 +7,10 @@
 // Kept apart from the component so the wording and the remembering can
 // be tested without a DOM.
 //
-// The title is the server's own words; what this adds around it is in
-// the reader's language.
+// Plan window identity is localized when the server reports it; other
+// titles remain in the server's own words.
 import { formatLocale, t } from "./i18n.ts";
+import { planWindowLabel } from "./contextCard.ts";
 
 /** How much a notice asks for: worth knowing, near a limit, at one. */
 export type UsageLevel = "info" | "warn" | "stop";
@@ -25,6 +26,8 @@ export interface UsageNotice {
   usedPercent: number;
   /** Epoch milliseconds, when known. */
   resetsAt: number | null;
+  /** Present only for a plan window on a newer server. */
+  planWindow?: { id: string; minutes: number | null };
   /** "spend" for a spending limit on the person's own key, whose month
    * tops up rather than a window resetting. */
   kind?: "spend";
@@ -61,6 +64,65 @@ export function noticeSource(notice: Pick<UsageNotice, "source" | "kind">, engin
   return notice.kind === "spend" ? t("libUsageNotice.spendingLimit", { name }) : t("libUsageNotice.planUsage", { name });
 }
 
+/** Treat optional metadata from an older or malformed server as absent. */
+function reportedWindow(notice: Pick<UsageNotice, "planWindow">): UsageNotice["planWindow"] {
+  const window = notice.planWindow;
+  if (!window || typeof window !== "object" || typeof window.id !== "string" || !window.id.trim()) return undefined;
+  if (window.minutes !== null && (!Number.isSafeInteger(window.minutes) || window.minutes <= 0)) return undefined;
+  return window;
+}
+
+/** Localize a known window without rounding a nonstandard duration. */
+function noticeWindowLabel(window: NonNullable<UsageNotice["planWindow"]>): string {
+  const { id } = window;
+  const minutes = window.minutes ?? (id === "five_hour" ? 300 : id === "seven_day" ? 10_080 : null);
+  const special = ["seven_day_opus", "seven_day_sonnet", "seven_day_overage_included"].includes(id);
+  let label: string;
+  if (special || minutes === null || minutes === 24 * 60 || minutes === 7 * 24 * 60) {
+    label = planWindowLabel({ id, minutes });
+  } else if (minutes % (24 * 60) === 0) {
+    label = t("contextCard.dayLimit", { count: minutes / (24 * 60) });
+  } else if (minutes % 60 === 0) {
+    label = t("contextCard.hourLimit", { count: minutes / 60 });
+  } else {
+    label = t("contextCard.minuteLimit", { count: minutes });
+  }
+  const known = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included"];
+  if (known.includes(id)) return label;
+  const name = id === "primary" ? t("libUsageNotice.primaryWindow")
+    : id === "secondary" ? t("libUsageNotice.secondaryWindow")
+      : id.replace(/[\x00-\x1f\x7f]/g, "").slice(0, 80).trim();
+  return name ? t("libUsageNotice.namedWindow", { window: label, name }) : label;
+}
+
+/** The old title remains the fallback for other notices and older servers. */
+export function noticeTitle(notice: UsageNotice, now: number): string {
+  if (notice.kind === "spend" || notice.source === "bloks-ai") return notice.title;
+  const window = reportedWindow(notice);
+  if (!window) return notice.title;
+  const status = notice.level === "stop" ? t("contextCard.limitReached") : t("libUsageNotice.approachingLimit");
+  const title = t("libUsageNotice.windowTitle", { window: noticeWindowLabel(window), status });
+  return notice.resetsAt !== null && Number.isFinite(notice.resetsAt) && notice.resetsAt <= now
+    ? t("libUsageNotice.lastReported", { title }) : title;
+}
+
+/** Remaining time for a reported plan reset, never zero before it arrives. */
+export function planResetLine(resetsAt: number | null, now: number): string | null {
+  if (resetsAt === null || !Number.isFinite(resetsAt) || !Number.isFinite(now) || !Number.isFinite(new Date(resetsAt).getTime())) return null;
+  const left = resetsAt - now;
+  if (left <= 0) return t("libUsageNotice.resetPassed");
+  if (left < 60_000) return t("libUsageNotice.resetsWithinMinute");
+  if (left < 24 * 60 * 60_000) {
+    const minutes = Math.ceil(left / 60_000);
+    if (minutes < 60) return t("contextCard.resetsInMinutes", { minutes });
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest ? t("contextCard.resetsInHoursMinutes", { hours, minutes: rest }) : t("contextCard.resetsInHours", { hours });
+  }
+  const hours = Math.floor(left / (60 * 60_000));
+  return t("libUsageNotice.resetsInDaysHours", { days: Math.floor(hours / 24), hours: hours % 24 });
+}
+
 /** A day as a count, for telling today from tomorrow in one time zone. */
 function dayNumber(at: number, timeZone?: string): number {
   // read as numbers, never shown, so the locale here is fixed
@@ -91,11 +153,14 @@ export function resetLine(resetsAt: number | null, now: number, format: { locale
 }
 
 /** Reported usage and reset/top-up timing; never invent an unavailable value. */
-export function noticeLine(notice: Pick<UsageNotice, "kind" | "usedPercent" | "resetsAt">, now: number, format: { locale?: string; timeZone?: string } = {}): string {
+export function noticeLine(notice: Pick<UsageNotice, "kind" | "usedPercent" | "resetsAt" | "planWindow">, now: number, format: { locale?: string; timeZone?: string } = {}): string {
   const used = Number.isFinite(notice.usedPercent) && notice.usedPercent >= 0 && notice.usedPercent <= 100
     ? t("libUsageNotice.percentUsed", { percent: Math.round(notice.usedPercent) })
     : t("libUsageNotice.usageUnknown");
-  if (notice.kind !== "spend") return t("libUsageNotice.line", { used, when: resetLine(notice.resetsAt, now, format) ?? t("libUsageNotice.resetUnknown") });
+  if (notice.kind !== "spend") {
+    const when = reportedWindow(notice) ? planResetLine(notice.resetsAt, now) : resetLine(notice.resetsAt, now, format);
+    return t("libUsageNotice.line", { used, when: when ?? t("libUsageNotice.resetUnknown") });
+  }
   if (notice.resetsAt === null || !Number.isFinite(notice.resetsAt) || notice.resetsAt <= now || !Number.isFinite(new Date(notice.resetsAt).getTime())) {
     return t("libUsageNotice.line", { used, when: t("libUsageNotice.topUpUnknown") });
   }

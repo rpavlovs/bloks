@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { X } from "@/components/icons";
 import { api, openLaneWorking, useStore, type Bot } from "@/state/store";
 import { usePageVisible } from "@/lib/pageVisible";
-import { noticeLine, noticeSource, noticeToShow, readDismissed, readNotices, saveDismissed, withDismissed, type UsageNotice as Said } from "@/lib/usageNotice";
+import { noticeLine, noticeSource, noticeTitle, noticeToShow, readDismissed, readNotices, saveDismissed, withDismissed, type UsageNotice as Said } from "@/lib/usageNotice";
 import { t } from "@/lib/i18n";
 
 const EVERY_MS = 60_000;
@@ -46,7 +46,8 @@ export function UsageNotice({ bot }: { bot: Bot }) {
 
   const notice = heard?.laneId === laneId ? noticeToShow(heard.notices, dismissed) : null;
   if (!notice) return null;
-  const details = noticeLine(notice, Date.now());
+  const now = Date.now();
+  const details = noticeLine(notice, now);
   const source = noticeSource(notice, state.instances);
   const dismiss = () =>
     setDismissed((was) => {
@@ -65,8 +66,7 @@ export function UsageNotice({ bot }: { bot: Bot }) {
     >
       <p className="min-w-0 basis-48 flex-1 leading-snug [overflow-wrap:anywhere]">
         <span className={notice.level === "stop" ? "font-semibold text-destructive" : "font-medium text-foreground"}>
-          {/* the title is the server's own words */}
-          {t("composerUsageNotice.title", { source, title: notice.title })}
+          {t("composerUsageNotice.title", { source, title: noticeTitle(notice, now) })}
         </span>
         <span className="text-muted-foreground">{` · ${details}`}</span>
       </p>

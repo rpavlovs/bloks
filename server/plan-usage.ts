@@ -125,11 +125,35 @@ const PACE_FROM = 0.25;
 /** Worst first, for sorting. */
 export const LEVEL_ORDER: Record<UsageLevel, number> = { stop: 0, warn: 1, info: 2 };
 
+/** A readable fallback for clients which do not yet understand planWindow. */
+function noticeWindow(window: PlanWindow): string {
+  const { id } = window;
+  const minutes = window.minutes ?? (id === "five_hour" ? 300 : id === "seven_day" ? 10_080 : null);
+  if (id === "seven_day_opus") return "Weekly limit, Opus";
+  if (id === "seven_day_sonnet") return "Weekly limit, Sonnet";
+  if (id === "seven_day_overage_included") return "Weekly limit, with extra usage";
+  const valid = typeof minutes === "number" && Number.isSafeInteger(minutes) && minutes > 0;
+  let label = "Limit";
+  if (valid) {
+    if (minutes === 7 * 24 * 60) label = "Weekly limit";
+    else if (minutes === 24 * 60) label = "Daily limit";
+    else if (minutes % (24 * 60) === 0) label = `${minutes / (24 * 60)}-day limit`;
+    else if (minutes % 60 === 0) label = `${minutes / 60}-hour limit`;
+    else label = `${minutes}-minute limit`;
+  }
+  if (!["five_hour", "seven_day", "primary", "secondary"].includes(id)) {
+    const name = id.replace(/[\x00-\x1f\x7f]/g, "").slice(0, 80).trim();
+    if (name) return `${label} (${name})`;
+  }
+  if (id === "primary" || id === "secondary") return `${label} (${id})`;
+  return label;
+}
+
 /**
  * What one engine's plan should say in the composer, worst first, at
  * most one per window, in the few words Bloks AI's own notices use:
- * "Limit reached", or "Approaching limit" for near it and on pace alike.
- * When it resets says which window it is; the card has the rest.
+ * a window label plus "Limit reached", or "Approaching limit" for near
+ * it and on pace alike. Clients can also localize the reported window.
  *
  * At the limit is the engine's own "rejected" or a share used up; near
  * it is the engine's warning or past 80%; on pace is a share used ahead
@@ -160,9 +184,10 @@ export function planNotices(instanceId: string, usage: PlanUsage | null | undefi
       id: `${instanceId}:${window.id}:${level}:${window.resetsAt}`,
       source: instanceId,
       level,
-      title: level === "stop" ? "Limit reached" : "Approaching limit",
+      title: `${noticeWindow(window)}: ${level === "stop" ? "Limit reached" : "Approaching limit"}`,
       usedPercent: Math.min(100, Math.max(0, Math.round(window.used * 100))),
       resetsAt: window.resetsAt,
+      planWindow: { id: window.id, minutes: window.minutes },
     });
   }
   return sortNotices(notices);
