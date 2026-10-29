@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { X } from "@/components/icons";
 import { api, openLaneWorking, useStore, type Bot } from "@/state/store";
 import { usePageVisible } from "@/lib/pageVisible";
-import { noticeLine, noticeSource, noticeToShow, readDismissed, readNotices, saveDismissed, withDismissed, type UsageNotice as Said } from "@/lib/usageNotice";
+import { noticeLine, noticeSource, noticeTitle, noticeToShow, readDismissed, readNotices, saveDismissed, withDismissed, type UsageNotice as Said } from "@/lib/usageNotice";
 import { t } from "@/lib/i18n";
 
 const EVERY_MS = 60_000;
@@ -46,7 +46,8 @@ export function UsageNotice({ bot }: { bot: Bot }) {
 
   const notice = heard?.laneId === laneId ? noticeToShow(heard.notices, dismissed) : null;
   if (!notice) return null;
-  const details = noticeLine(notice, Date.now());
+  const now = Date.now();
+  const details = noticeLine(notice, now);
   const source = noticeSource(notice, state.instances);
   const dismiss = () =>
     setDismissed((was) => {
@@ -57,16 +58,12 @@ export function UsageNotice({ bot }: { bot: Bot }) {
   const viewUsage = () => dispatch({ type: "openUsage", botId: bot.id, section: "limits" });
 
   return (
-    <div
-      // Read the complete changed status, urgently only when work is blocked.
-      role={notice.level === "stop" ? "alert" : "status"}
-      aria-atomic="true"
-      className="flex flex-wrap items-center gap-x-2 gap-y-1 px-1.5 pt-1.5 text-small"
-    >
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-1.5 pt-1.5 text-small">
       <p className="min-w-0 basis-48 flex-1 leading-snug [overflow-wrap:anywhere]">
-        <span className={notice.level === "stop" ? "font-semibold text-destructive" : "font-medium text-foreground"}>
-          {/* the title is the server's own words */}
-          {t("composerUsageNotice.title", { source, title: notice.title })}
+        {/* The changing clock is readable beside the live title, but does not
+            announce an urgent alert again on every minute tick. */}
+        <span role={notice.level === "stop" ? "alert" : "status"} aria-atomic="true" className={notice.level === "stop" ? "font-semibold text-destructive" : "font-medium text-foreground"}>
+          {t("composerUsageNotice.title", { source, title: noticeTitle(notice, now) })}
         </span>
         <span className="text-muted-foreground">{` · ${details}`}</span>
       </p>
