@@ -13,7 +13,7 @@ test("built plan notices identify windows and update their countdown", { timeout
   const output = result.stdout + result.stderr;
   assert.equal(result.status, 0, output);
   for (const language of ["en", "es"]) {
-    for (const caseName of ["short across midnight", "distinct simultaneous limits", "unknown reset", "under one minute", "keyboard View usage"]) {
+    for (const caseName of ["short across midnight", "distinct simultaneous limits", "new client with a legacy notice", "unknown reset", "under one minute", "keyboard View usage"]) {
       assert.ok(output.includes(`PASS ${language} ${caseName}`), output);
     }
   }
