@@ -18,7 +18,7 @@ export async function until<T>(read:()=>T|Promise<T>,why='fixture did not settle
 // The fake may still be appending a long call. A complete JSONL record ends
 // in a newline, so the unfinished last one waits for the next read; a
 // malformed complete record still fails.
-const recorded=(file:string)=>existsSync(file)?readFileSync(file,'utf8').split('\n').slice(0,-1).filter(Boolean).map(x=>JSON.parse(x)):[];
+export const recorded=(file:string)=>existsSync(file)?readFileSync(file,'utf8').split('\n').slice(0,-1).filter(Boolean).map(x=>JSON.parse(x)):[];
 export async function reporting(t:TestContext){
  const home=mkdtempSync(join(tmpdir(),'rr-')),host=join(dirname(server),'.report-test-'+randomUUID()+'.ts');
  mkdirSync(join(home,'.bloks'));
