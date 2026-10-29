@@ -17,6 +17,6 @@ test("built plan notices identify windows and update their countdown", { timeout
       assert.ok(output.includes(`PASS ${language} ${caseName}`), output);
     }
   }
-  assert.match(output, /PASS no external requests, write requests or renderer errors/);
+  assert.match(output, /PASS no external requests, accepted writes or renderer errors/);
   console.log(output);
 });

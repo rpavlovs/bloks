@@ -34,7 +34,10 @@ const server = createServer(async (req, res) => {
   }
   if (url.pathname.startsWith("/api/")) {
     requests.push({ path: url.pathname, query: url.search, method: req.method });
-    if (req.method !== "GET") return json(res, { error: "Fixture forbids writes" }, 403);
+    if (req.method !== "GET") {
+      console.log(`DENIED synthetic fixture request ${req.method} ${url.pathname}`);
+      return json(res, { error: "Fixture forbids writes" }, 403);
+    }
     if (url.pathname === "/api/bots") return json(res, { bots: [bot] });
     if (url.pathname === "/api/bloks") return json(res, { bloks: [] });
     if (url.pathname === "/api/config") return json(res, { setupDone: true });
@@ -109,6 +112,8 @@ try {
     assert.ok(await area.evaluate((e) => e === document.activeElement));
     await page.waitForFunction((name) => [...document.querySelectorAll('[role="alert"]')].some((el) => el.textContent?.includes("Opus") && el.textContent?.includes(name)), button);
     assert.match(await text(), language === "en" ? /Weekly limit, Opus.*about 2 d 2 h/ : /Límite semanal, Opus.*aproximadamente 2 d 2 h/);
+    const weeklyBounds = await notice().evaluate((e) => ({ width: e.clientWidth, scroll: e.scrollWidth, right: e.getBoundingClientRect().right, bottom: e.getBoundingClientRect().bottom, viewport: innerWidth, height: innerHeight, page: document.documentElement.scrollWidth }));
+    assert.ok(weeklyBounds.scroll <= weeklyBounds.width + 1 && weeklyBounds.right <= weeklyBounds.viewport && weeklyBounds.bottom <= weeklyBounds.height && weeklyBounds.page <= weeklyBounds.viewport, JSON.stringify(weeklyBounds));
     console.log(`PASS ${language} distinct simultaneous limits, dismissal and phone layout: ${await text()}`);
 
     const missing = { id: "unknown_model", minutes: null, used: 1, resetsAt: null };
@@ -135,8 +140,12 @@ try {
     console.log(`PASS ${language} keyboard View usage opens Limits`);
     await context.close();
   }
-  assert.deepEqual(blocked, []); assert.deepEqual(errors, []); assert.ok(requests.every((r) => r.method === "GET"));
-  console.log("PASS no external requests, write requests or renderer errors");
+  assert.deepEqual(blocked, []); assert.deepEqual(errors, []);
+  const denied = requests.filter((r) => r.method !== "GET");
+  // ChatView's normal viewing heartbeat is denied by this read-only fixture.
+  // Anything else remains a failure, and no write is accepted by the server.
+  assert.ok(denied.every((r) => r.method === "POST" && r.path === "/api/viewing"), JSON.stringify(denied));
+  console.log(`PASS no external requests, accepted writes or renderer errors; denied viewing reports: ${denied.length}`);
 } finally {
   await browser?.close();
   if (server.listening) { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); }
