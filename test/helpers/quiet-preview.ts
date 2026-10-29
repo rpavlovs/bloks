@@ -122,6 +122,9 @@ export async function nativePreviewFixture(t: TestContext) {
   // Registered before codexCommands' cleanup: close readers before it
   // kills the real harness, so teardown cannot mask a failed assertion.
   t.after(async () => { streams.forEach(stream => stream.abort.abort()); await Promise.all(streams.map(stream => stream.reading)); });
+  // Capture the synthetic state before codexCommands removes its files.
+  let diagnostic: () => Promise<void> = async () => {};
+  t.after(async () => diagnostic());
   // Codex currently emits whole assistant items. This labelled synthetic
   // token seam wraps only its normalized onEvent contract: the real HTTP
   // intake, native start/steer receipts, storage and terminal path stay
@@ -156,15 +159,27 @@ CodexDriver.create = async function(input) {
   const anchor = '  if(spec.hold||text.includes("HOLD")){';
   const original = readFileSync(cli, "utf8");
   assert.ok(original.includes(anchor), "generated CLI hook changed");
+  const stateAnchor = 'let thread, turn, ended=false, total=0, skillsCount=0;';
+  const replyAnchor = 'const startReply=()=>reply({turn:spec.missingStartId?{}:{id:spec.wrongStartId?"other-turn":turn}});';
+  const doneAnchor = '  out({method:"turn/completed",params:{threadId:thread,turn:{id:turn,status:"completed"}}});';
+  for (const needle of [stateAnchor, replyAnchor, doneAnchor]) assert.equal(original.split(needle).length, 2, "diagnostic hook changed");
   writeFileSync(file, "[]");
-  writeFileSync(cli, original.replace('import { appendFileSync, existsSync, readFileSync }', 'import { appendFileSync, existsSync, readFileSync, writeFileSync }').replace(anchor, `
+  writeFileSync(cli, original.replace('import { appendFileSync, existsSync, readFileSync }', 'import { appendFileSync, existsSync, readFileSync, writeFileSync }')
+    .replace(stateAnchor, `${stateAnchor}
+const previewTrace=(event,extra={})=>{try{appendFileSync(root+"/preview-trace.jsonl",JSON.stringify({event,pid:process.pid,...extra})+"\\n");}catch{}};
+process.on("exit",(code)=>previewTrace("exit",{code}));
+process.on("uncaughtExceptionMonitor",(error)=>previewTrace("uncaught",{name:error instanceof SyntaxError?"SyntaxError":"Other"}));`)
+    .replace(replyAnchor, 'const startReply=()=>{reply({turn:spec.missingStartId?{}:{id:spec.wrongStartId?"other-turn":turn}});previewTrace("start-replied");};')
+    .replace(doneAnchor, `${doneAnchor}\n  previewTrace("completion-emitted");`)
+    .replace(anchor, `
   if(spec.previewStream){
+    previewTrace("action-timer-ready");
     let seen=0;
     const timer=setInterval(()=>{
       const actions=JSON.parse(readFileSync(root+"/preview-actions.json","utf8"));
       while(seen<actions.length){
         const action=actions[seen++];
-        if(action.kind==="finish"){clearInterval(timer);writeFileSync(root+"/preview-actions.json","[]");finish();return;}
+        if(action.kind==="finish"){previewTrace("finish-consumed",{alreadyEnded:ended});clearInterval(timer);writeFileSync(root+"/preview-actions.json","[]");finish();return;}
         const item=action.item??"answer";
         if(action.kind==="delta")out({method:"item/started",params:{threadId:thread,turnId:turn,item:{type:"commandExecution",id:"preview-token-"+seen,command:"preview-token:"+JSON.stringify({item,text:action.text})}}});
         if(action.kind==="complete")out({method:"item/completed",params:{threadId:thread,turnId:turn,item:{type:"agentMessage",id:item,text:action.text}}});
@@ -177,8 +192,30 @@ CodexDriver.create = async function(input) {
   const spec = (change: Record<string, unknown>) => { Object.assign(config, change); s.spec(config); };
   spec({});
   let actions: any[] = [];
+  const parentEvents: string[] = [];
   const add = (action: any) => { actions.push(action); writeFileSync(file, JSON.stringify(actions)); };
   const observed = () => { try { return readFileSync(join(seam, "observed.jsonl"), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)); } catch { return []; } };
+  diagnostic = async () => {
+    const bounded = <T>(promise: Promise<T>) => Promise.race([promise, new Promise<null>((resolve) => setTimeout(() => resolve(null), 2_000))]);
+    const allowed = (value: unknown, values: string[]) => typeof value === "string" && values.includes(value) ? value : "other";
+    let calls: unknown = "unavailable", trace: unknown = "unavailable", waitingActions: unknown = "unavailable";
+    let tasks: unknown = "unavailable", messages: unknown = "unavailable";
+    try { calls = s.calls().filter((c: any) => ["turn/start", "turn/steer", "thread/start", "thread/resume"].includes(c.method)).slice(-24).map((c: any) => ({ method: c.method, pid: Number.isInteger(c.pid) ? c.pid : null })); } catch { /* partial or absent trace */ }
+    try { trace = readFileSync(join(s.root, "preview-trace.jsonl"), "utf8").split("\n").filter(Boolean).slice(-32).flatMap((line) => {
+      try {
+        const row = JSON.parse(line);
+        return [{ event: allowed(row.event, ["start-replied", "action-timer-ready", "finish-consumed", "completion-emitted", "exit", "uncaught"]), pid: Number.isInteger(row.pid) ? row.pid : null,
+          ...(typeof row.alreadyEnded === "boolean" ? { alreadyEnded: row.alreadyEnded } : {}), ...(Number.isInteger(row.code) ? { code: row.code } : {}),
+          ...(row.name === "SyntaxError" || row.name === "Other" ? { name: row.name } : {}) }];
+      } catch { return []; }
+    }); } catch { /* no fake trace */ }
+    try { waitingActions = JSON.parse(readFileSync(file, "utf8")).slice(-16).map((a: any) => allowed(a.kind, ["finish", "delta", "complete"])); } catch { /* absent or partial file */ }
+    try { const bot: any = await bounded(s.current()); if (bot) tasks = bot.tasks.slice(-16).map((task: any) => ({ state: allowed(task.state, ["idle", "running", "working", "waiting", "error"]), busy: Boolean(task.busy) })); } catch { /* harness unavailable */ }
+    try { const rows = await bounded(s.messages()); if (rows) messages = rows.slice(-16).map((m: any) => ({ role: allowed(m.role, ["user", "bot", "system"]), queued: Boolean(m.queued), unsent: Boolean(m.unsent), preparation: allowed(m.preparation?.state, ["pending", "next", "dispatching", "uncertain", "joined", "not-sent"]), delivery: allowed(m.delivery?.route, ["pending", "queued", "steered", "uncertain", "not-sent"]) })); } catch { /* harness unavailable */ }
+    const log = s.h.logs();
+    const serverLog = { lines: Math.min(log.split("\n").length, 100_000), flags: ["SyntaxError", "EADDRINUSE", "ECONNRESET", "EPIPE", "exit_before_result", "runtime.error", "timed out"].filter((flag) => log.includes(flag)) };
+    console.log("PREVIEW_DIAGNOSTIC " + JSON.stringify({ parentEvents: parentEvents.slice(-24), calls, trace, waitingActions, tasks, messages, serverLog }));
+  };
   async function stream(path = "/api/events") {
     const frames: any[] = [], abort = new AbortController();
     const response = await s.h.fetch(path, { signal: abort.signal }); assert.ok(response.ok);
@@ -200,14 +237,14 @@ CodexDriver.create = async function(input) {
   }
   const { webhook } = await s.post("/api/webhooks", { botId: s.bot.id, name: "Neutral native preview" });
   return { ...s, spec, stream,
-    reset() { actions = []; writeFileSync(file, "[]"); },
+    reset() { actions = []; writeFileSync(file, "[]"); parentEvents.push("reset"); },
     async delta(text: string, item = "answer") {
       const before = observed().length;
       add({ kind: "delta", text, item });
       assert.ok(await waitFor(() => observed().length > before), "synthetic normalized token did not pass through the actual bus");
     },
     complete(text: string, item = "answer") { add({ kind: "complete", text, item }); },
-    finish(text: string) { spec({ answer: text }); add({ kind: "finish" }); },
+    finish(text: string) { spec({ answer: text }); add({ kind: "finish" }); parentEvents.push("finish-written"); },
     async fire() {
       const response = await s.h.fetch(`/hook/${webhook.token}`, post({ event: "Inspect neutral native fixture" }));
       assert.equal(response.status, 202, await response.text());
