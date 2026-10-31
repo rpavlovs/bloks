@@ -16,7 +16,7 @@ const CHAT = 10101;
 async function fixture(t: TestContext, options: { crashOn?: string; crashStage?: "joined" | "fail-dispatch" | "dismissed" | "fail-dismiss"; extraEnv?: Record<string, string> } = {}) {
   const updates: any[] = [], sends: any[] = [], edits: any[] = [];
   const polled = new Set<number>();
-  const heldTranscriptions: Array<() => void> = [];
+  const heldTranscriptions: Array<(text?: string) => void> = [];
   let next = 1;
   const server = createServer((req, res) => {
     if (req.url?.startsWith("/file/")) {
@@ -27,7 +27,7 @@ async function fixture(t: TestContext, options: { crashOn?: string; crashStage?:
       req.resume();
       req.on("end", () => {
         res.setHeader("content-type", "application/json");
-        heldTranscriptions.push(() => res.end(JSON.stringify({ text: "SLOW_VOICE" })));
+        heldTranscriptions.push((text = "SLOW_VOICE") => res.end(JSON.stringify({ text })));
       });
       return;
     }
@@ -646,6 +646,76 @@ for (const outcome of ["dispatching", "joined", "uncertain"] as const) {
     await s.settled();
   });
 }
+
+test("two ready Telegram voices precede later text across Codex startup", async (t) => {
+  const s = await fixture(t);
+  await s.h.json("/api/config", { method: "PATCH", body: JSON.stringify({ speech: { openaiKey: "fixture-only" } }) });
+  s.spec({ hold: true, holdThread: true, holdSkills: true });
+  s.push("FIRST $selected");
+  await s.called("thread/start", 1);
+
+  for (const [index, words] of ["VOICE_ALPHA", "VOICE_BETA"].entries()) {
+    s.voice();
+    await waitFor(() => s.heldTranscriptions.length > index, "the synthetic voice was not transcribed");
+    s.heldTranscriptions[index]!(words);
+    await waitFor(async () => (await s.messages()).some((m) => m.text?.includes(words) && m.preparation?.state === "pending"), "the ready voice was not retained");
+  }
+  s.threadGate();
+  await s.called("skills/list", 1);
+  s.skillsGate();
+  await s.called("turn/start", 1);
+  const start = s.calls().find((c) => c.method === "turn/start");
+  const initial = JSON.stringify(start.params.input);
+  assert.ok(initial.includes("VOICE_ALPHA") && initial.includes("VOICE_BETA"));
+  assert.ok(initial.indexOf("VOICE_ALPHA") < initial.indexOf("VOICE_BETA"));
+
+  s.push("LATER_TEXT");
+  await s.called("turn/steer", 1);
+  const calls = s.calls().filter((c) => ["turn/start", "turn/steer"].includes(c.method));
+  assert.match(JSON.stringify(calls[1].params.input), /LATER_TEXT/);
+  for (const words of ["VOICE_ALPHA", "VOICE_BETA", "LATER_TEXT"]) {
+    assert.equal(calls.filter((c) => JSON.stringify(c.params.input).includes(words)).length, 1, words);
+  }
+  s.gate();
+  await s.settled();
+  assert.equal(s.count("turn/start"), 1);
+});
+
+test("a Telegram voice after the startup snapshot stays ahead of later text", async (t) => {
+  const s = await fixture(t);
+  await s.h.json("/api/config", { method: "PATCH", body: JSON.stringify({ speech: { openaiKey: "fixture-only" } }) });
+  s.spec({ hold: true, holdThread: true, holdSkills: true });
+  s.push("FIRST $selected");
+  await s.called("thread/start", 1);
+  s.voice();
+  await waitFor(() => s.heldTranscriptions.length === 1);
+  s.heldTranscriptions[0]!("VOICE_ALPHA");
+  await waitFor(async () => (await s.messages()).some((m) => m.text?.includes("VOICE_ALPHA") && m.preparation?.state === "pending"));
+
+  s.threadGate();
+  await s.called("skills/list", 1);
+  s.voice();
+  await waitFor(() => s.heldTranscriptions.length === 2);
+  s.heldTranscriptions[1]!("VOICE_BETA");
+  await waitFor(async () => (await s.messages()).some((m) => m.text?.includes("VOICE_BETA") && m.preparation?.state === "pending"));
+  s.push("LATER_TEXT");
+  await waitFor(async () => (await s.messages()).some((m) => m.text === "LATER_TEXT" && m.preparation?.state === "pending"));
+
+  s.skillsGate();
+  await s.called("turn/start", 1);
+  await s.called("turn/steer", 2);
+  const calls = s.calls().filter((c) => ["turn/start", "turn/steer"].includes(c.method));
+  assert.match(JSON.stringify(calls[0].params.input), /VOICE_ALPHA/);
+  assert.doesNotMatch(JSON.stringify(calls[0].params.input), /VOICE_BETA|LATER_TEXT/);
+  assert.match(JSON.stringify(calls[1].params.input), /VOICE_BETA/);
+  assert.match(JSON.stringify(calls[2].params.input), /LATER_TEXT/);
+  for (const words of ["VOICE_ALPHA", "VOICE_BETA", "LATER_TEXT"]) {
+    assert.equal(calls.filter((c) => JSON.stringify(c.params.input).includes(words)).length, 1, words);
+  }
+  s.gate();
+  await s.settled();
+  assert.equal(s.count("turn/start"), 1);
+});
 
 test("a later Telegram text waits for the preceding voice transcription", async (t) => {
   const s = await fixture(t);
