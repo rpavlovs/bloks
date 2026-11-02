@@ -17,6 +17,7 @@ import { spawn } from "node:child_process";
 import { accessSync, chmodSync, constants, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
+import { installCommand, windowsUpdateCommand } from "./engine-commands.ts";
 import { widenPath } from "./path.ts";
 import { shellFor } from "./terminal.ts";
 
@@ -42,13 +43,50 @@ export const ENGINE_SETUP: Record<string, EngineSetup> = {
   claudeAgent: { install: "curl -fsSL https://claude.ai/install.sh | bash", signIn: "claude" },
   codex: { install: npmUser("@openai/codex"), signIn: "codex login" },
   geminiCli: { install: npmUser("@google/gemini-cli"), signIn: "gemini" },
+  opencode: { install: npmUser("opencode-ai"), signIn: "opencode auth login" },
   pi: { install: npmUser("--ignore-scripts @earendil-works/pi-coding-agent pi-acp") },
   antigravity: { install: "curl -fsSL https://antigravity.google/cli/install.sh | bash" },
   grokCli: { install: "curl -fsSL https://x.ai/cli/install.sh | bash" },
   // Cursor's own installer, which writes cursor-agent into ~/.local/bin
   cursor: { install: "curl https://cursor.com/install -fsS | bash", signIn: "cursor-agent login" },
   cline: { install: npmUser("cline"), signIn: "cline auth" },
+  commandcode: { install: npmUser("command-code"), signIn: "command-code login" },
+  // Devin's installer writes devin into ~/.local/bin, then starts its
+  // login wizard, which exits 1 without a terminal: the binary decides.
+  // The app does not run installs on Windows, so there this is only the
+  // command shown: Devin's PowerShell installer, not the bash one.
+  devin: {
+    install:
+      process.platform === "win32"
+        ? "irm https://static.devin.ai/cli/setup.ps1 | iex"
+        : 'curl -fsSL https://cli.devin.ai/install.sh | bash || [ -x "$HOME/.local/bin/devin" ]',
+    signIn: "devin auth login",
+  },
 };
+
+/** What a window on this computer is told it can set up. On Windows the
+ * app runs none of it (the scripts are POSIX shell), so `runs` is false,
+ * and each engine's line is the one its maker gives for PowerShell, to
+ * copy: install, and update where the engine does not update itself
+ * (server/engine-commands.ts). Elsewhere the buttons run ENGINE_SETUP and
+ * ENGINE_PACKAGES, and the lines shown are theirs. */
+export function engineSetupView(platform: string = process.platform): {
+  setup: Record<string, EngineSetup>;
+  runs: boolean;
+  updates: Record<string, string>;
+} {
+  if (platform !== "win32") return { setup: ENGINE_SETUP, runs: true, updates: {} };
+  const setup: Record<string, EngineSetup> = {};
+  const updates: Record<string, string> = {};
+  for (const [kind, entry] of Object.entries(ENGINE_SETUP)) {
+    setup[kind] = { ...entry, install: installCommand(kind, platform) ?? entry.install };
+  }
+  for (const kind of ["opencode", ...Object.keys(ENGINE_SETUP)]) {
+    const update = windowsUpdateCommand(kind);
+    if (update) updates[kind] = update;
+  }
+  return { setup, runs: false, updates };
+}
 
 /** Long enough for a slow download, short enough that a hung installer
  * does not hold the button forever. */
@@ -104,7 +142,7 @@ export function runSetupScript(script: string): Promise<InstallResult> {
   if (process.platform === "win32") {
     return Promise.resolve({
       ok: false,
-      problem: "Installing from the app works on macOS and Linux. On Windows, run the command below in a terminal.",
+      problem: "Installing from the app works on macOS and Linux. On Windows, run the command below in PowerShell.",
       log: "",
     });
   }
@@ -175,7 +213,7 @@ const MAX_ENGINE_PATH = 1_024;
 const NOT_THE_CLI: Record<string, { names: RegExp; say: string }> = {
   cursor: {
     names: /^cursor(?:\.exe|\.cmd)?$/i,
-    say: "That is the Cursor editor. Bloks needs the Cursor CLI, cursor-agent, which curl https://cursor.com/install -fsS | bash installs.",
+    say: `That is the Cursor editor. Bloks needs the Cursor CLI, cursor-agent, which ${installCommand("cursor")} installs.`,
   },
 };
 

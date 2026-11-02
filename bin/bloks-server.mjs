@@ -8,11 +8,17 @@
 // on your laptop, and the people you share rooms with. No port is opened
 // and nothing new is exposed to the internet.
 //
+// Or it is reached your own way, with no Bloks Cloud at all: behind your
+// reverse proxy, tunnel or VPN, at the address BLOKS_PUBLIC_URL gives,
+// with BLOKS_CLOUD=off to send nothing to bloks.dev (server/self-host.ts,
+// docs/SELF_HOSTING.md).
+//
 //   bloks-server                 run it (keep it running: systemd, Docker,
 //                                tmux, whatever the machine already uses)
 //   bloks-server activate KEY    turn on Bloks Cloud with a licence key
 //   bloks-server pair            print a link that pairs a phone or the
-//                                desktop app, from anywhere
+//                                desktop app, from anywhere, or at the
+//                                address BLOKS_PUBLIC_URL gives
 //   bloks-server status          is it up, and is Cloud connected
 //   bloks-server drain [--minutes 20]
 //                                before restarting it: start nothing new,
@@ -28,8 +34,9 @@
 //                                backed up and moved aside first, never deleted
 //   bloks-server update [--check]
 //                                install the latest release beside this one,
-//                                switch to it and restart, or go back if it
-//                                does not start; --check only says if there is
+//                                switch to it and restart (through systemd
+//                                when it runs this), or go back if it does
+//                                not start; --check only says if there is
 //                                one. The app's About page does the same
 //   bloks-server import [TOOL] --dry-run [--json]
 //                                what Bring your setup would find from Claude
@@ -68,7 +75,27 @@
 // This file, run from here, then hands over to that version, so the way
 // it was started before keeps working. A newer release unpacked over this
 // folder by hand wins over an older one an update put there.
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+//
+// Under systemd the update leaves a trial beside the link, and the start
+// systemd makes next is this file's: the new version gets two minutes to
+// end the trial, and a start that finds it already tried switches back
+// (trialStart below). This folder may be root's; versions/ is the only
+// part the account Bloks runs as needs to write.
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -106,11 +133,28 @@ function updatedCopy() {
       }
     }
     if (!there.startsWith(realpathSync(join(root, "versions")) + sep)) return null;
+    if (!trusted(join(root, "versions"))) return null;
     const theirs = read(there);
     const entry = join(there, "bin", "bloks-server.mjs");
     return theirs.name === "bloks-server" && newer(theirs.version, own.version) && existsSync(entry) ? entry : null;
   } catch {
     return null;
+  }
+}
+/** Whether code in versions/ may be run as this account: a folder only
+ * this account or root can change. Run as root, only root's; never one
+ * anybody may write. Anything else could hand this account code another
+ * one put there. */
+function trusted(dir) {
+  if (typeof process.getuid !== "function") return true;
+  try {
+    const st = statSync(dir);
+    const me = process.getuid();
+    if (st.mode & 0o002) return false;
+    if (me === 0) return st.uid === 0 && !(st.mode & 0o020);
+    return st.uid === me || st.uid === 0;
+  } catch {
+    return false;
   }
 }
 /** The data folder, the way the server decides it (server/config.ts
@@ -264,8 +308,32 @@ function intoBackups(code, file, sealed) {
   return name;
 }
 
+/** How the running server says it is reached (server/self-host.ts), or
+ * null from a server too old to say, which is Bloks Cloud alone. */
+async function reachOf() {
+  try {
+    const res = await fetch(`${BASE}/api/config`);
+    return res.ok ? ((await res.json())?.deployment?.reach ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function status(waitMs = 0) {
   let relay = await call("GET", "/api/relay");
+  // reached at an address of the owner's own (server/self-host.ts), with
+  // or without Bloks Cloud beside it
+  const reach = await reachOf();
+  const own = reach?.direct === true ? (reach.publicUrls ?? []) : null;
+  if (own) {
+    console.log(own.length ? `Bloks is running, for your devices at ${own.join(", ")}.` : "Bloks is running, and listens beyond loopback for your paired devices.");
+  }
+  if (relay.cloud === "off") {
+    console.log(own ? "Bloks Cloud is turned off here (BLOKS_CLOUD=off), so nothing goes to it." : "Bloks is running. Bloks Cloud is turned off here (BLOKS_CLOUD=off), and no address of your own is set, so nothing outside this machine can reach it.");
+    if (!own) console.log("Give it one with BLOKS_PUBLIC_URL (see docs/SELF_HOSTING.md), then restart it.");
+    return;
+  }
+  if (own && !relay.enabled) return;
   // just started: give the line to Cloud a moment before calling it down
   for (let waited = 0; relay.enabled && !relay.connected && waited < waitMs; waited += 500) {
     await new Promise((r) => setTimeout(r, 500));
@@ -289,6 +357,114 @@ async function status(waitMs = 0) {
   );
 }
 
+/** Where a trial is kept, beside versions/current
+ * (server/server-update.ts TRIAL_FILE). Its shape never changes: this
+ * file reads it as an older release unpacked it. */
+const TRIAL = join(root, "versions", ".trial.json");
+/** What a server stops with to be started again (EXIT_RESTART). */
+const EXIT_RESTART = 75;
+
+/** Points versions/current at `version`, or at nothing, in one rename. */
+function pointBack(version) {
+  const link = join(root, "versions", "current");
+  if (!version) {
+    try {
+      unlinkSync(link);
+    } catch (e) {
+      if (e.code !== "ENOENT") throw e;
+    }
+    return;
+  }
+  const temp = join(root, "versions", `.current-back-${process.pid}`);
+  rmSync(temp, { force: true });
+  symlinkSync(version, temp);
+  renameSync(temp, link);
+}
+
+/** Writes what happened for the app to say, where the server keeps it. */
+function recordTrial(trial, error) {
+  const record = {
+    from: trial.from?.version,
+    to: trial.to,
+    at: Date.now(),
+    ok: false,
+    rolledBack: true,
+    error,
+    log: trial.manager === "systemd" ? `journalctl ${trial.user ? "--user " : ""}-u ${trial.unit ?? "bloks"}` : `${trial.manager}'s log`,
+    manager: trial.manager,
+    ...(trial.unit ? { unit: trial.unit } : {}),
+  };
+  try {
+    const file = join(dataDir(), "server-update.json");
+    writeFileSync(`${file}.tmp`, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    renameSync(`${file}.tmp`, file);
+  } catch {
+    /* the app says the version that answers, at least */
+  }
+}
+
+/** Switches back to the version a trial came from, and says why. */
+function goBack(trial, why) {
+  const from = trial.from?.version ?? "the version before";
+  console.error(`[bloks update] ${why} Going back to ${from}.`);
+  try {
+    pointBack(typeof trial.from?.pointer === "string" ? trial.from.pointer : null);
+  } catch (e) {
+    console.error(`[bloks update] switching back failed: ${e.message}`);
+  }
+  recordTrial(trial, why);
+  rmSync(TRIAL, { force: true });
+}
+
+/**
+ * A start under a trial: the first start of the version an update
+ * switched to gets its window to end the trial, which that version does
+ * once it has stayed up a moment; a start that finds the trial already
+ * tried means the last one fell over, and goes back. Only the install
+ * folder's own start does this, never a version handed over to.
+ */
+function trialStart() {
+  if (command !== "start" || process.env.BLOKS_SERVER_HOME) return;
+  let trial;
+  try {
+    trial = JSON.parse(readFileSync(TRIAL, "utf8"));
+  } catch {
+    return;
+  }
+  let pointer = null;
+  try {
+    pointer = readlinkSync(join(root, "versions", "current"));
+  } catch {
+    /* pointing nowhere */
+  }
+  // switched by hand since: nothing of the trial's to judge
+  if (!trial || typeof trial.to !== "string" || pointer !== trial.to) {
+    rmSync(TRIAL, { force: true });
+    return;
+  }
+  if ((Number(trial.tries) || 0) >= 1) {
+    goBack(trial, `Bloks ${trial.to} stopped while starting.`);
+    return;
+  }
+  trial.tries = 1;
+  try {
+    writeFileSync(`${TRIAL}.tmp`, `${JSON.stringify(trial, null, 2)}\n`, { mode: 0o600 });
+    renameSync(`${TRIAL}.tmp`, TRIAL);
+  } catch {
+    // a trial that can't be counted can't be trusted to end: go back now
+    goBack(trial, `Bloks ${trial.to} couldn't be tried, since its trial couldn't be written.`);
+    return;
+  }
+  const within = Math.max(1_000, Math.min(Number(trial.withinMs) || 120_000, 30 * 60_000));
+  setTimeout(() => {
+    if (!existsSync(TRIAL)) return;
+    goBack(trial, `Bloks ${trial.to} did not answer within ${Math.round(within / 1000)} seconds.`);
+    // for the service manager to start the version switched back to
+    process.exit(EXIT_RESTART);
+  }, within).unref();
+}
+
+trialStart();
 // From the folder the release was unpacked into, a newer version an
 // update put beside it runs instead of this one; otherwise this one does.
 const handOver = updatedCopy();
@@ -297,8 +473,12 @@ if (handOver) {
   await import(pathToFileURL(handOver).href);
 } else switch (command) {
   case "start": {
-    // Loopback, always: a server on a public machine must not be the one
-    // place Bloks listens on the network.
+    // Loopback, unless whoever runs it says otherwise where it runs: a
+    // server on a public machine must not be the one place Bloks listens
+    // on the network by surprise. BLOKS_LISTEN=0.0.0.0 is for a container,
+    // whose published port decides who reaches it, and even then nothing
+    // but a paired device's token gets past /api/health
+    // (server/self-host.ts).
     process.env.BLOKS_LOOPBACK_ONLY = "1";
     process.env.BLOKS_PORT = String(PORT);
     // which folder this version is, and the folder updates go beside, so
@@ -317,7 +497,8 @@ if (handOver) {
     // stale copy of
     const source = join(root, "server", "index.ts");
     const entry = existsSync(source) ? source : join(root, "dist-server", "index.js");
-    console.log(`Starting Bloks on this computer (loopback port ${PORT}). Data lives in ~/.bloks.`);
+    const wide = ["0.0.0.0", "::", "[::]"].includes(process.env.BLOKS_LISTEN?.trim() ?? "");
+    console.log(`Starting Bloks on this computer (${wide ? `port ${PORT} on every interface` : `loopback port ${PORT}`}). Data lives in ${dataDir()}.`);
     await import(pathToFileURL(entry).href);
     // once it answers, say what to do next
     for (let i = 0; i < 100; i++) {
@@ -338,14 +519,39 @@ if (handOver) {
     break;
   }
   case "pair": {
-    const { link, expiresAt } = await call("POST", "/api/pair/link");
-    console.log("Open this link on the phone or computer you want to pair. It works once, for 15 minutes:\n");
-    console.log(`  ${link}\n`);
     // a QR code for the phone, when the terminal library is to hand
-    try {
-      const qr = await import("qrcode");
-      console.log(await qr.default.toString(link, { type: "terminal", small: true }));
-    } catch {}
+    const drawn = async (link) => {
+      try {
+        const qr = await import("qrcode");
+        console.log(await qr.default.toString(link, { type: "terminal", small: true }));
+      } catch {}
+    };
+    // At an address of the owner's own first (server/self-host.ts), where
+    // the device talks to this server directly from then on; then through
+    // Bloks Cloud, when it is on, for a device that is somewhere else.
+    const reach = await reachOf();
+    const relay = await call("GET", "/api/relay");
+    const own = reach?.direct === true;
+    if (own) {
+      const started = await call("POST", "/api/pair/start");
+      const links = started.links ?? [];
+      if (links.length) {
+        console.log("Open one of these on the phone or computer you want to pair, the one for the address it reaches this server at:\n");
+        for (const { url, link } of links) console.log(`  ${url}\n  ${link}\n`);
+        await drawn(links[0].link);
+      } else {
+        console.log("No address is set for your devices to reach this server at. Set BLOKS_PUBLIC_URL and restart it for a link, or trade the code below for a token in a terminal:");
+        console.log(`  bloks-server token --server https://your.address --code ${started.code}\n`);
+      }
+      console.log(`The code is ${started.code}. It works once, until ${new Date(started.expiresAt).toLocaleTimeString()}. Whoever has it first becomes one of your devices, so keep it to yourself.`);
+      if (!relay.enabled) break;
+      console.log("\nFrom anywhere else, through Bloks Cloud:\n");
+    }
+    if (!own && relay.cloud === "off") fail("Bloks Cloud is turned off here (BLOKS_CLOUD=off), so pairing goes to an address of your own: set BLOKS_PUBLIC_URL to it (see docs/SELF_HOSTING.md) and restart Bloks.");
+    const { link, expiresAt } = await call("POST", "/api/pair/link");
+    if (!own) console.log("Open this link on the phone or computer you want to pair. It works once, for 15 minutes:\n");
+    console.log(`  ${link}\n`);
+    await drawn(link);
     console.log(`Anyone who opens it before ${new Date(expiresAt).toLocaleTimeString()} becomes one of your devices, so keep it to yourself.`);
     break;
   }
@@ -531,7 +737,11 @@ if (handOver) {
       const last = now?.last;
       if (!last || last.to !== latest.version || last.pending) continue;
       if (last.ok) {
-        console.log(`Bloks ${last.to} is running. Its output goes to ${last.log}.`);
+        console.log(
+          last.manager
+            ? `Bloks ${last.to} is running, started by ${last.manager}. Read its output with ${last.log}.`
+            : `Bloks ${last.to} is running. Its output goes to ${last.log}.`,
+        );
         break;
       }
       fail(`${last.error}${last.rolledBack ? ` Bloks ${last.from} is running again.` : ""}`);

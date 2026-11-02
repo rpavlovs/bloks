@@ -61,13 +61,17 @@ tool calls and permission requests.
 **CLI over the Agent Client Protocol.** `acp.ts` is generic: ACP is a
 JSON-RPC protocol that agent CLIs speak so editors can drive them, so one
 implementation serves any agent that speaks it. Gemini CLI was the first;
-OpenCode, the Grok CLI, Pi, Cursor (`cursor-agent acp`) and Cline (`cline
---acp`) followed. Adding another is an entry in `ACP_SPECS`, which can
-also say how the CLI reports its sign-in (`signInCheck`, a command, for
-Cursor's keychain login), which ACP auth method to call before a session
-(`authMethod`, Cursor's `cursor_login`), and the oldest release that
-works (`minVersion`, 3.0.68 for Cline; an older one is unavailable with
-that reason, and its row offers an update). Every CLI engine can be
+OpenCode, Command Code (`command-code acp`), Devin (`devin acp`), the Grok
+CLI, Pi, Cursor (`cursor-agent acp`) and Cline (`cline --acp`) followed.
+Adding another is an entry in `ACP_SPECS`, which can also say how the CLI
+reports its sign-in (`signInCheck`, a command, for Cursor's keychain login
+and Devin's `devin auth status`), which ACP auth method to call before a
+session (`authMethod`, Cursor's `cursor_login`), which session mode every
+turn selects (`permissionModes`: Command Code's `default` or `bypass`,
+Devin's `accept-edits` or `bypass`; a mode the session does not list, or
+one it does not confirm, stops the turn before the prompt), and the oldest
+release that works (`minVersion`, 3.0.68 for Cline; an older one is
+unavailable with that reason, and its row offers an update). Every CLI engine can be
 started from a path of the person's choosing (`enginePaths` in
 `config.json`, set with `PUT /api/engines/:kind/path` from this computer
 only), which applies to each instance of that driver that names no CLI
@@ -270,11 +274,29 @@ the safety floor all read it from that one place, and
 The desktop app keeps the list (`electron/workspaces.mjs`, pure and
 tested in `test/workspaces.test.ts`) in `workspaces.json` in its own user
 data folder: each workspace's id, kind (`personal`, `business`, `custom`
-or `joined`, and `hosted` for the managed hosting that is coming), name,
+or `joined`, `hosted` for the managed hosting that is coming, and
+`remote` for one on a server of the person's own), name,
 whether it is a team's, mark or logo, data folder, mute, notification
 level, order, last port and accent, and the person's own preferences
-(theme, the accent shared by every workspace when that is on, and the
-name they go by). The order is the person's: holding a workspace in the
+(theme, the accent shared by every workspace when that is on, the
+name they go by, and `local`, "Run workspaces on this computer").
+
+A `remote` workspace is a `bloks-server` the app is paired with as one of
+the owner's devices (`remote:connect` with a link from `bloks-server
+pair`). There may be any number; each pairing is kept in the keychain as
+`joined-<id>.bin`, and each opens through its own `electron/remote.mjs`
+stand-in on loopback, like a hosted or a joined one. A server is known by
+the Bloks Cloud space its pairing goes through, so pairing the same one
+again keeps its entry (`addRemote` with `same`) and pairing another adds
+one. One added without a name takes its computer's name from
+`/api/config`. With `local` off, `shownWorkspaces` lists only the kinds
+elsewhere, `launch` refuses to start a local one by any route, the local
+servers are stopped, and the window opens a server; it can't be turned
+off with no server listed, and the last server can't be removed while
+it is off, so the app always has somewhere to open. Before 3.2 a pairing
+made the whole app one server's window and restarted it, kept in
+`remote.bin`; the next start lists it as a `remote` workspace on the same
+port, with `local` off, and removes the file. The order is the person's: holding a workspace in the
 switcher and dragging it, or Option and the arrow keys, rewrites it
 (`reorder`), and every list of workspaces follows it. The first launch
 with workspaces finds no list and writes one with the folder Bloks always
@@ -348,7 +370,7 @@ children (`process.parentPort`), never the network:
 
 A workspace joined on somebody else's computer has no folder here. It
 opens through the remote proxy (`electron/remote.mjs`) with the member's
-credentials, kept in the keychain like `remote.bin`, and the window
+credentials, kept in the keychain like a server's, and the window
 draws a member's app from the member routes (see People in a
 workspace). One joined without Bloks Cloud is reached on the owner's own
 network only, through `startLanProxy`, a loopback stand-in like the
@@ -382,7 +404,17 @@ minutes; the window asks for the next just before one runs out while the
 panel is open and visible, and `POST /api/pair/cancel` closes it the
 moment the panel closes. `POST /api/pair/claim` takes either credential
 and counts every try, and five checked tries close the code. The QR
-carries the server's own addresses, wherever the card is drawn.
+carries the server's own addresses, wherever the card is drawn: the home
+network's first, then IPv6 unique local addresses (Tailscale's first),
+then a Tailscale IPv4 address, and the card lets the person pick which
+one the code carries when there is more than one. On the network the
+server listens on IPv4 and IPv6 both (`::`), so a phone can come over a
+Tailscale IPv6 address, which iOS talks plain HTTP to as it does to the
+home network; it refuses Tailscale's IPv4 range, and the phone says to
+use the IPv6 address instead. Of IPv6 peers only loopback, unique local
+and link-local ones may connect (`reachablePeer`); a global IPv6 peer is
+dropped before a byte is read, so listening on IPv6 reaches no network
+the IPv4 bind did not. A machine without IPv6 listens on IPv4 alone.
 bloks-server never listens on the network, so there `GET /api/pair` says
 so (loopback, no restart pending, no addresses), `start` refuses, and the
 card shows the Bloks Cloud link (`POST /api/pair/link`) as a QR instead.
@@ -508,6 +540,23 @@ any of the person's screens shows that conversation: windows and phones
 say what they have in front of the person with `POST /api/viewing`
 (feature `viewing`), again every thirty seconds while they do and null
 when they stop, and a word older than 75 seconds no longer counts.
+
+While the owner is actively using Bloks on a computer, their phones stay
+quiet altogether (`server/presence.ts`, feature `presence`): no wake of
+any reason reaches the owner's own phones (a wake that also names a
+member still reaches the member), no new Live Activity starts on them,
+and the activities already there end, in silence, the moment the person
+sits down. The owner's own windows say it with `POST /api/presence`
+`{window, active, seq}` (`src/lib/presence.ts`): active is a window that
+is shown and focused, on a computer with a fine pointer, with the
+person's own input in it in the last two minutes, said again every
+thirty seconds and said to be over the moment it is not. A word older
+than 75 seconds no longer counts, so a computer that sleeps or locks
+releases the phone soon after. A turn still running when the person
+leaves gets its phone activity then; nothing held back is ever replayed,
+and a turn that ended meanwhile gets nothing. The word is a yes and a
+time, kept in memory only; agents and members are refused, and a device
+that is unpaired says nothing more.
 The tokens are kept per paired device, swept against the pairing every
 minute (which also ends what a restart left behind), and dropped when the
 device is unpaired. Without Bloks Cloud there is no way to push, and the
@@ -568,6 +617,28 @@ and the server asks it before anything leaves:
   lists them for the owner, to read only.
 - A solo agent is its maker's alone: not listed for anyone else, its
   conversations theirs, and only they can put it in a room.
+- A private conversation is private past its transcript (GitHub 431).
+  The agent keeps a memory of that member's own there (`memoryOf`), at a
+  desk of theirs with the agent, `people/<id>/agents/<botId>/`, which is
+  also where it works unless the owner gave the agent a folder. The
+  standing prompt loads that memory, not the agent's own; `memory_read`
+  and `memory_write` reach it; the owner's Memory place and the nightly
+  tidy never do. On Claude Code the turn's file tools may not read or
+  change any agent's workspace or anybody else's folder, even with a yes
+  (`SendTurnInput.deniedDirs`), and Claude Code's own per-folder memory is
+  off. A conversation from before desks starts a new session at the desk
+  once, told the conversation (`TaskRecord.desk`).
+- Looking back is held to the same line (`mayRecall`): from a member's
+  private conversation, that conversation and the team conversation they
+  are on; from the team conversation, itself; from the owner's own, never
+  a member's private conversation, whatever the reading setting, which
+  lets the owner read and does not hand the words to an agent. The
+  owner's own `GET /api/search` and recall from their device reach a
+  member's private conversation only while reading them is on, and a
+  member's solo agent never.
+- A member's own apps and keys (`server/personal.ts`, below) are used by
+  a turn they asked for in their private conversation or their solo
+  agent (`personalAccountsFor`), and by nothing else.
 - Approvals in a team conversation or a room are answered by the person
   whose message started the work, the owner or an admin; in a private
   conversation or a solo agent, by its person.
@@ -587,11 +658,35 @@ routes (`/api/member/...`) give the workspace as a member sees it, the
 agents they reach and their own solo agents (made within their cap, on
 the engines they are allowed, and deleted by them alone), each agent's
 `team` and `private` messages and cards, their usage, their own notes
-about themselves (kept apart in `people/<id>/profile-notes.json`), their
-read positions, and leaving (`POST /api/member/leave`, which revokes
-every device, closes their streams, archives their solo agents and drops
-their private conversations, and tells the owner with a
-`workspace.left` frame). The event stream reaches a member only through
+about themselves (kept apart in `people/<id>/profile-notes.json`), what
+each agent remembers of them (`GET /api/member/memory`, and
+`DELETE /api/member/memory/:botId` to forget it), their own apps and keys
+(below), whether they have seen the welcome (`you.welcomed` on
+`GET /api/member/workspace`, set by `POST /api/member/welcomed`, so one
+device's welcome is every device's), their read positions, and leaving
+(`POST /api/member/leave`, which revokes every device, closes their
+streams, archives their solo agents, drops their private conversations
+and removes their folder with its desks, apps and keys, and tells the
+owner with a `workspace.left` frame).
+
+A member's own apps and keys (`server/personal.ts`,
+`people/<id>/own.json`, 0600) are theirs to manage from their own
+device and nobody else's: `GET /api/member/connections` (their Composio
+key by its last four characters, the apps offered, their keys by name;
+never a value), `PUT` and `DELETE /api/member/connections/apps` (a
+Connect key, `ck_`, checked with Composio before it is kept),
+`GET .../apps/services`, `POST` and `DELETE .../apps/:slug` (a sign-in
+link to open, or every account of that app removed, all under the
+member's key), and `PUT` and `DELETE .../secrets/:NAME` (the owner's
+reserved names refused the same way). A turn that uses them gets the
+member's key as its Composio access and their keys in its environment
+on an engine with a shell, and is told so by name. In that turn
+`request_secret` and `request_connection` plant no card: the agent is
+told, and a line in the conversation tells the member, to add it under
+Your connections. The owner's own card routes refuse a card in a
+member's private conversation, so nothing there is ever saved into the
+owner's keys or signed in under the owner's account. The values are in
+`redactSecrets`. The event stream reaches a member only through
 `memberFrame()`, which strips what is the owner's (tool arguments,
 screenshots of the owner's screen, file paths, the buttons on
 approvals); a reply's words stream to whoever may read its
@@ -642,9 +737,13 @@ the tries left, `already_member`, `full`, `rate_limited`. An approved
 claim answers with the person's id and role, the relay to use (or none,
 and the owner's network address instead), and a welcome naming the
 agents. The device token never leaves the joiner's computer; the host
-keeps its sha256, as with pairing. On a Mac, `server/join-client.ts` is
-the joiner's half, behind `/api/joining/...` for the window, and the app
-keeps the result as a joined workspace.
+keeps its sha256, as with pairing. On a desktop, `server/join-client.ts`
+is the joiner's half, behind `/api/joining/...` for the window, and the app
+keeps the result as a joined workspace. It says what it runs on as the
+kind of device (`mac`, `pc` or `computer`, from `server/this-machine.ts`),
+so the owner's request card and Members page name it. A desktop older
+than 3.2 says `mac` whatever it runs on; a kind the page does not know
+reads as a computer.
 
 `GET /api/workspace/members` gives the Members page everything at once:
 the workspace, who is asking, each member's role, devices, solo agents,
@@ -736,8 +835,25 @@ written to a hidden file and renamed in once complete. The route never
 opens a path it is handed, so sharing cannot become a way to read the
 disk. Only this computer can share in. The answer carries the card's
 `href` and a markdown link to write in the reply, and the shared file's
-fingerprint goes into the turn's baseline so the sweep does not card it
-twice.
+fingerprint goes into the baselines of the conversation it went to and
+of the turn that shared it, so the sweep does not card it twice, and
+every other turn of the agent running at the time leaves that version
+alone.
+
+Every conversation of an agent saves into the one folder, so two of them
+running at once both see a new file between their two snapshots
+(GitHub 460). `server/artifact-turns.ts` knows which turns of an agent
+overlapped, kept while both run, the way the change card does for a
+shared working folder. A turn that ran alone cards everything that
+changed, as before. One that overlapped others cards a file only on the
+strongest evidence any of them has for it: its engine named the file in
+a write or edit (or brought it back from its outbox elsewhere), then it
+said the file's name in a command or its reply, then one of its calls
+that may write without naming files (a shell command) was running when
+the file was last written. Two turns tied at either of the first two
+both card it, in their own conversations; a tie at the third, or no
+evidence at all, cards it nowhere rather than under the wrong reply, and
+the file stays in the agent's files to share on purpose.
 
 A link in a reply that is the file route, a path or a `file:` URL is a
 `file` token in `src/lib/inlineMarkdown.ts`, never an `<a>`. Clicking it
@@ -861,6 +977,64 @@ agent gave up) opens with one line in its own words saying what failed,
 when, on which engine and model, and what Bloks did (`failureNotes`).
 All of this is in memory: after a restart the own engine is simply tried
 again.
+
+### More than one account of an engine
+
+Claude Code and Codex can have accounts besides their own sign-in
+(`server/engine-accounts.ts`, GitHub 465). An account belongs to one
+engine instance and to the workspace, never to an agent. The engine's own
+sign-in is always the first (`MAIN_ACCOUNT`); each added one is a folder
+under `engine-accounts/` in the data folder, signed in with the engine's
+own login in Terminal (`CLAUDE_CONFIG_DIR=<folder> claude`,
+`CODEX_HOME=<folder> codex login`). Bloks never reads what the engine
+writes there. The person's setup in the main folder (Claude Code's
+`settings.json`, `CLAUDE.md`, agents, commands, skills, plugins and output
+styles; Codex's `config.toml`, `AGENTS.md`, skills, prompts and rules) is
+linked into each added folder, so a turn has the same settings,
+permissions and skills on any account; the credential, `.claude.json` and
+the sessions are never linked. User MCP servers that Claude Code keeps in
+`.claude.json` stay with the main sign-in.
+
+The account is chosen as the turn is dispatched (`engineAccounts.pick`),
+only on this computer (not working elsewhere, not on a cloud computer),
+and is kept for the whole turn: the driver sets `CLAUDE_CONFIG_DIR` or
+`CODEX_HOME` from `SendTurnInput.account`, after the turn's own
+environment, and Claude Code's turn drops `CLAUDE_CODE_OAUTH_TOKEN` and
+`ANTHROPIC_AUTH_TOKEN` so the main sign-in's token cannot run it. The
+workspace has one account in use per engine. It moves, to the next account
+in the list that can take a turn, only when the one in use cannot: it
+rests after a turn on it ran out (a usage limit or a lapsed sign-in, read
+as for an engine, in a table keyed by instance and account), its plan
+windows say it is spent (`planBlockedUntil`, from the plan usage the
+drivers now keep per account), or its CLI said it is signed out. It never
+moves back on its own when the first account resets. With no account
+able, the turn goes to the one back soonest.
+
+A session lives in its account's folder, so a lane records the account
+each engine's session was made on (`TaskRecord.sessionAccounts`). A lane
+whose account changes leaves that engine's session (`store.moveTaskAccount`:
+its cursor goes and `lastInstanceId` is emptied) and its next turn is told
+the bounded story with an opening that says it is a new session on
+another account of the same engine and model (`freshTurnText`, `why:
+"account"`). The chat says so once. A command stays on the account that
+made the session it names.
+
+In `recoverTurn` a usage limit or a lapsed sign-in on an account rests
+the account, not the engine. While another account can take it, a solo
+turn is asked again at once on the next one, with the same model, before
+any retry or backup (step 0), and the next turn's opening line says
+where it went. Only when every account is out does the engine rest, until
+the first account is back, and the turn goes on as for an engine with one
+account: to the backup the person chose, said as out on all of its
+accounts, or it stops and says so. Turns record their account in
+`usage.json` and the engine report's turn log; the Usage page has an
+Account breakdown once an engine has run on more than one.
+
+Accounts are the owner's: never an agent's token or a member's. Seeing
+them and choosing the one in use work from the owner's devices; adding,
+signing in and removing (which runs the engine's own sign-out first, then
+deletes the folder) are this computer only. The folders are left out of
+backups and workspace moves, like a sign-in in the macOS Keychain.
 
 A Fast Codex turn that cannot have Fast (see Codex speed) is refused
 before any words reach the model, and its end carries `preInputRefusal`.
@@ -1008,8 +1182,9 @@ window, which Claude Code gives per message (`promptSize`) and in its
 result (`modelUsage[model].contextWindow`), Codex in
 `thread/tokenUsage/updated` (`last.inputTokens` against
 `modelContextWindow`), an ACP agent in `usage_update` (`used`, `size`),
-and an OpenAI-compatible provider in each response's `prompt_tokens`, one
-reading per request of a tool loop. The lane keeps the latest as
+an OpenAI-compatible provider in each response's `prompt_tokens`, one
+reading per request of a tool loop, and Antigravity in each
+`agent_response` step's usage, whose window comes from the table. The lane keeps the latest as
 `reading`, with the engine and model that made it (`store.noteReading`),
 and `laneFill` uses it only while the agent is on that engine and model,
 with the table in `server/context.ts` as the fallback window, which the
@@ -1062,6 +1237,16 @@ which is 15% of the window and never more than 16k tokens. When that
 leaves messages out and the agent's engine can summarise, the older part
 is folded into the summary first; otherwise the message says how many
 were left out. The thread itself keeps every message.
+
+A fold reads every message it covers, in order (`summaryPasses`). Up to
+40,000 characters is one summary request; a longer stretch is read in
+several, each carrying the summary so far, and a message too long for
+one is read in labelled parts. Past eight such requests they grow
+instead of multiplying, up to half the window of the model that writes
+the summary (counted a character to a token), so a long fold costs about
+the length of what it reads once, not dozens of waits. Nothing is saved
+until the last request is done, and nothing at all if one fails or the
+conversation changes under it.
 
 The same cache is why a resumed Claude Code session keeps its system
 prompt byte for byte (`server/standing-prompt.ts`). The agent's
@@ -1137,11 +1322,16 @@ A `bloks-server` on a computer of its own is updated by its owner from
 Settings, About, on any of their own devices, or with
 `bloks-server update` (`server/server-update.ts`). The page says the
 app's version and the server's apart, since neither update touches the
-other. Only an install that `bloks-server` started from the release's
+other. An install that `bloks-server` started from the release's
 folder, which the account it runs as can write, and which nothing else
-starts (systemd, launchd, pm2, supervisord, a container, a hosted
-machine, a source checkout, the app itself) updates itself; every other
-one is shown the steps to do it by hand. The server takes GitHub's
+starts updates itself through a helper, as below. So does one systemd
+runs, when its `versions/` folder is writable by that account (the rest
+may be root's), its unit's `Restart=` (read with `systemctl show`) is
+`always` or `on-failure`, and the release folder's own launcher is
+3.2.0 or newer. Every other one (launchd, pm2, supervisord, a
+container, a hosted machine, a source checkout, the app itself) is
+shown the steps to do it by hand, and a systemd one is told which of the
+three it lacks. The server takes GitHub's
 latest stable release, downloads its tarball only once the checksum
 published beside it is there, keeps it only if it matches that and
 GitHub's own digest of the file, and unpacks it under `versions/` in
@@ -1156,6 +1346,23 @@ minutes, the helper stops it, points the link back and starts the old
 one. Either way it writes `server-update.json` in the data folder,
 which the page reads, and the started server's output goes to
 `server.log` beside it. The data folder itself is never touched.
+
+Under systemd a helper would die with the unit's cgroup, and a server it
+started would be nobody's to restart, so there is none. After the drain
+the server writes `versions/.trial.json` (where it switched from, how
+long the new version has), marks `server-update.json` pending, points
+`versions/current` at the new version and exits 75. systemd starts
+`bin/bloks-server.mjs` in the release folder again, which counts the
+try in the trial, arms a two minute timer and hands over. The new
+server, once it has been listening five seconds as the version the
+trial names, removes the trial, prunes `versions/` and writes the record
+ok (`confirmTrial`); if a different version started, it switches back
+and says so. A start that finds the trial already tried (the last one
+fell over), or a timer that fires with the trial still there (it never
+came up), points the link back, writes the record and, for the timer,
+exits 75 for systemd to start the old version. The launcher hands over
+to `versions/` only when that folder belongs to its account or root and
+not every account may write it (root's alone when it runs as root).
 
 Nothing that arrives meanwhile is turned away. `startTurn` is where every
 turn starts, so it is where a drain holds them: words for one of an
@@ -1310,13 +1517,40 @@ its chat is waiting on, and one answer covers both; a turn that did not
 start from Telegram takes the words too, or they wait, and either way
 the answer goes back to the chat instead of a refusal.
 
-Command/Ctrl+Enter in the app stops before submitting the follow-up
-(`src/lib/sendMessage.ts`). When a conversation is named, both requests
-name it. It waits for `/interrupt` to answer, then sends the message with
-`steer: false`. Stop acknowledges the request, not necessarily the engine's
-exit, so the message waits in the normal queue until that turn settles
-instead of joining the dying turn. Either request's failure uses the normal
-draft recovery; a failed Stop submits nothing. Plain Enter still steers.
+Words said while a turn is still getting ready, before its engine has
+the prompt, join that turn rather than waiting for its first answer.
+`prepareFollowup` admits only the requester, audience and delegate of
+the start that claimed the lane (`PreparationAttempt`), and the owner's
+Telegram chat joins only a turn that chat started, since that is where
+its answer goes. Each waiting row is its own record: at the engine's
+input boundary the driver commits the ready rows into the first input
+(`TurnPreparation` in `server/contracts.ts`), with their words, sender
+and grant read again then; later ones go in through `steerPrepared`,
+which tells a refusal from an outcome it cannot confirm. An engine that
+cannot tell (Claude Code below 2.1.300, or one in a workplace) is not
+offered this, and the rows go to the next turn as before. A row whose
+delivery could not be confirmed is never sent again on its own: it
+holds what was said after it, across a restart too, until the owner
+dismisses it in the strip. A file for a turn that runs elsewhere, or a
+picture past the turn's eight, waits for the next turn with everything
+said after it.
+
+Command/Ctrl+Enter in the app is one request (`src/lib/sendMessage.ts`):
+`stopFirst: true` on `POST /api/bots/:id/messages`, naming the
+conversation when one is named (GitHub 452). The server writes the words
+down ahead of everything already waiting, behind only earlier such words,
+as a turn of their own (`alone` on the queue item, read by
+`queuedSegment`), and only then stops the turn. However soon that turn
+ends, the next one is these words alone, and what waited before goes
+after it, in its order, once each. They never join the turn being
+stopped, nor one still getting ready, and a message whose delivery could
+not be confirmed does not hold them back, though it still holds what
+follows it. The answer says `stopped: true`. An older server ignores the
+field, and `steer: false` keeps the words out of the dying turn there;
+the client then stops the turn itself, as it used to. A failed request
+uses the normal draft recovery; a failed fallback Stop does not, since
+the words are in. The `alone` mark is kept in memory, so after a restart
+the waiting words go in transcript order. Plain Enter still steers.
 
 An empty composer receives failed text and attachments back immediately.
 If newer words or chips occupy it, `src/lib/drafts.ts` retains the failed
@@ -1356,6 +1590,52 @@ frame marked `moved`. So the stored order is the order the agent heard
 things in, and everything that reads it (a room's history, a replayed
 transcript, an export) agrees. A room's own queue behind its current
 round, and a pickup after a restart, deliver the same way.
+
+A burst that carries the person's own words alongside anybody else's
+(another agent, a webhook, a watcher, a note from Bloks) is theirs
+(`Burst`, `burstOf`). Their words go last, in the order they were
+written, both in the transcript and in the turn, so the answer sits
+right under them; each says whose it is, "(From the person. It waited
+for this turn.)", so it cannot read as the tail of the agent message
+before it; and another agent's words in it do not offer the bare quiet
+word. Another agent's words that join a running turn somebody is
+waiting on (`bloks say --now`) do not offer it either. A turn with
+another agent's words in it may still end on a bare QUIET, asked about
+it earlier or not (`agentWordsInTurn`); when somebody is waiting on that
+turn the word is kept out of the chat and the live preview all the
+same, and when the person's words are in it and it saved no reply, it
+ends with a notice that it finished without a reply to them (GitHub 461).
+A turn the person started on their own, with nobody else's words in it,
+shows QUIET like any reply.
+
+## Wakes from local services
+
+A scheduler or another program on this computer can start work in one
+exact conversation without posing as the person
+(`server/service-wakes.ts`). `POST /api/bots/:id/wakes` takes exactly
+`{taskId, wakeId, text}`, the two ids UUIDs and the text at most 64 KB,
+and admits it only to that agent's ordinary private conversation: not a
+shared room's lane, a team conversation, a member's, a guest's mail, a
+Signal person's, an imported one or a rehearsal, and never anywhere else
+when that one has gone. It answers only a direct request on loopback
+with a loopback Host, no Origin and no Authorization header, never one
+through the relay: the same trust the owner's local API already has,
+and nothing more. It is not tied to one program, so the wake is labelled
+for what it is. It is written durably as a queued message with
+`via: "service"` and `serviceWake` (the wake id and a hash of its
+words), waits behind a running turn like a webhook's event, at most 20
+and 100 KB a conversation, and every wake is a turn of its own
+(`queuedSegment`). The engine hears it framed as a local service's
+request, never the person's words or approval (`fromServicePrompt`);
+the app labels it "From a local service" and offers no edit. The turn is
+one nobody waits on, so a bare QUIET or `bloks quiet` ends it silently,
+and a real answer is said and notified like a reply. Sending the same
+wake again returns its record, the same id with other words is a 409,
+and `GET /api/bots/:id/wakes/:wakeId?taskId=` reads whether it is
+`queued`, `dispatched` (written before work can begin, not a claim that
+it finished), `unsent` or `unconfirmed` (no record: never a reason to
+send it blindly again). Ordinary messages, edits and imports can never
+carry service provenance.
 
 ## Agents writing to agents
 
@@ -2226,6 +2506,42 @@ routine with `briefOnly` sends no `reply.settled` for its runs while
 the brief is on (`briefOnlyTurn`), unless the person joined the turn;
 its turn is told its answer opens a card (`BRIEF_ASK`).
 
+### The person's list
+
+A report that finds something only the person can do (a disk to
+replace, a reply they owe) is counted, not read out of the report:
+the agent puts it on the person's list (`server/todos.ts`, GitHub 378
+and 430), kept in `todos.json`. A line is a title of what to do (140
+characters), an optional detail (500), the conversation it was said in
+(the turn's lane), and the routine whose run said it when one did
+(`openRuns`). Each agent keys its own lines: `POST /api/bots/:me/todos`
+with a key it already used refreshes that line (newest words, `times`
+counted) instead of adding one, so a daily report of the same disk is
+one line however many mornings say it. The person closes a line with
+`POST /api/todos/:id/done` or `/dismiss`; the agent clears its own with
+`DELETE /api/bots/:me/todos/:key` once it no longer needs doing, which
+is how a recovered failure leaves the count. A dismissed line stays
+dismissed when it is reported again, until its agent clears it; a line
+marked done and reported again is a new line, since it did not hold.
+An agent has at most 20 open lines; a closed line goes thirty days
+after it was last said, and an agent forgotten for good takes its lines
+with it, while an archived one's wait with it.
+
+`waitingOnYou` lists the open lines after the live cards, as
+`BriefWaiting` with kind `todo` (`messageId` is the todo's id and
+`threadId` its conversation, so a client that knows only questions and
+approvals opens the conversation), so the brief's headline, its
+`quiet`, its notification and `/api/waiting` count them with the rest:
+two reports and two lines read "2 reports in, 2 things waiting on you."
+`GET /api/briefs` adds `todos`, the list as it stands (open, then
+closed in the last week), which the newest brief shows live and an
+older one reads to say how each of its lines ended. A routine's run
+with the agent's own credential is told about the list in its origin
+line (`todoAsk`); the agent's command line has `todo`, `todos` and
+`untodo`. `/api/todos` is on the agent guard's never list, and the
+routes under `/api/bots/:me/todos` refuse anything but that agent's own
+turn credential.
+
 ## Routines and check-ins
 
 `server/routines.ts` keeps routines in `routines.json` and a thirty
@@ -2269,6 +2585,25 @@ ends (`reply.settled`, see Desktop banners). The chat folds a run of quiet messa
 quiet check-ins, last at 10:30", `quietRunAt`), which opens to show
 them; the sidebar's line and a lane's `lastAt` read past them.
 
+A turn that holds the agent's own credential is told to say the same
+thing with `bloks quiet` (`QUIET_COMMAND_ASK`, and the "command" wording
+of `fromAgentPrompt`), keeping the bare word for when the command is
+unavailable. That is `POST /api/bots/:me/tasks/:id/quiet`, accepted only
+from the turn's own credential (`seq`, the lane's turn count when it was
+minted), only for a check-in or a turn nobody waits on (`unaskedTurn`),
+and only while nothing of the turn has reached the person: no text
+previewed or saved, no card, file or open question, none of their words
+in it or on their way in (`SteerHolds`). A refusal is a 409 with a
+reason, and tells the agent to answer substantively. Once accepted
+(`QuietGate` in `server/quiet-finish.ts`), what the turn says is saved
+`quiet` and not previewed; a card, a file, a team proposal or a question
+from the same turn (`belongs`: the same runtime turn, or a request made
+with the same turn's credential) cancels it and gives back what it held,
+and so does a failure, a stop or a handover. Words that arrive after it
+wait for a turn of their own. A check-in finished this way folds like
+one that answered QUIET (`foldFinished`), and an agent's turn ends as
+one that said nothing.
+
 Each routine keeps what its last run that was not quiet said
 (`lastReport`, apart from the twenty `runs`, which quiet runs would
 otherwise push it out of), and its next turn carries it as a note before
@@ -2293,11 +2628,26 @@ times, compared), a page (its readable text, hashed, with the new lines
 as the change, optionally only when it mentions something) or a feed
 (RSS or Atom entries not seen before). Folders are watched with
 `fs.watch` and settle for twenty seconds; everything is also looked at on
-its `every`. A first look is a baseline. A change becomes a turn in the
+its `every`. A check (`kind: "check"`) runs a command on its `every`:
+exit 0 is a finding, passed on with what it printed, and exit 1 is
+nothing (`checkOutcome`). A first look is a baseline, and a check counts
+only a new finding, so one that always exits 0 the same way never acts;
+filing or changing a check to an obvious no-op (`true`, `:`, `exit 0`)
+answers with a note saying so and pointing at a check-in routine
+(`constantCheck`), since a watcher is not a timer. A change becomes a turn in the
 agent's first conversation or the one the watcher names (see Lanes), or a
 rehearsal (`openRehearsals`), with the message marked `via: "watcher"`.
 A look is skipped while the agent is busy, so its own edits are not news
 to it, and `mayFire` caps a watcher at six turns an hour.
+
+A workspace keeps fifty watchers (`MAX_WATCHERS`), finished ones
+included, so the list doubles as a history of what ran. At the limit,
+every way of filing one (the person, an agent, an admin's app watcher)
+lets the watcher that finished longest ago go to make room
+(`roomForWatcher`). A paused watcher is never taken, nor a finished one
+whose look or turn is still going, nor an app watcher whose trigger is
+still at Composio, which only Remove takes down. With none of those to
+spare, the new one is refused.
 
 A place watcher (`kind: "place"`) waits for the owner to arrive at a
 place or leave it, by a name as the phone gives it ("Toronto", "Paris,
@@ -2546,6 +2896,73 @@ the current version, and refused again when kept if the skill has moved
 on since, because kept on top of a newer version it would quietly undo
 it. The person may still keep their own edit of it.
 
+### A new skill an agent asks for
+
+Asked to make a skill and use it (GitHub 455), an agent sends the whole
+of it with `POST /api/agent/skills` (`bloks skill create`), and the
+person answers one card in the conversation (`server/skill-requests.ts`,
+`src/components/SkillRequestCard.tsx`). A SKILL.md the agent writes in a
+folder is only a file: no agent reads it as a skill and `bloks skills`
+does not list it until it is in the library. `--from <folder>` reads the
+folder's SKILL.md the way the catalogue reads one (its `name` is the id
+it keeps, its `metadata.title` or first heading the name people see) and
+every other plain text file beside it, skipping hidden files and tool
+folders; `--file` takes a single SKILL.md; flags win over the file. The
+request is checked whole before any card: a name and a one line
+description, instructions within the 16,000 character limit, the files
+within theirs, and an id said exactly (lowercase, digits and dashes).
+
+An id already in the library is never written over. The answer is 409
+with that skill's name, version and source, and the two ways on:
+`bloks skill revise` it, or choose another `--id`. The one exception is
+the very same skill, words and files, which is a retry of a request the
+person already answered: the answer is `added` with `already`, and the
+skill is given to the agent if it asked, which it may do with any
+library skill through its own settings anyway. The same request sent
+again while its card waits finds that card (matched by a fingerprint of
+the whole request); a different version of the agent's own waiting
+request replaces it, and the older card says so. Another agent's
+waiting request for the same id is refused. At most 50 wait at once.
+
+The card carries what the person decides on (name, id, description,
+length, files by name and size, whether the agent wants it, why); the
+words themselves wait in `skill-requests/<id>.json` until the answer
+and are fetched when the card is opened (`GET
+/api/skill-requests/:lane/:message`). Add (`POST .../add`) judges the id
+again, writes the files, installs the skill as version 1 credited to
+the agent with `from: 0` (so a skill that appeared meanwhile is refused,
+not replaced), appends it to that agent's skills without touching the
+rest, and records `skill.installed`. Not now (`.../decline`) changes
+nothing. Both routes are the person's: on NEVER for an agent, and
+refused to a member. The command waits a while for the answer
+(`BLOKS_SETTINGS_WAIT_MS`, as for a proposed setting), and otherwise
+answers `waiting` with the request id; `bloks skill request <id>` waits
+again, and the agent's next turn in that conversation is told the
+outcome once. Statuses are `waiting`, `added`, `declined`, `failed` and
+`replaced`.
+
+### Supporting files
+
+The 16,000 character limit stays on a skill's instructions, because
+those may be sent whole on every turn. What does not belong in every
+prompt (an API reference, a helper script, a table) goes in supporting
+files beside it (`server/skill-files.ts`), under `skill-files/<id>/`:
+plain UTF-8 text, at most 40 files, 128 KB each and 768 KB in all,
+relative paths at most four folders deep with nothing hidden and never
+a root `SKILL.md`. A set is written to a folder of its own and swapped
+in whole, and removing a skill removes its files; they are not
+versioned with the skill's text. They are read only on demand: `GET
+/api/skills/:id/files` lists them and `?path=` reads one, opened inside
+the skill's folder (`server/open-inside.ts`) so a planted link leads
+nowhere. `bloks skill <id>` names them, `bloks skill <id> --file <path>`
+reads one and `--save <path>` writes it where the agent can run it. A
+short skill sent whole in the prompt carries one line naming its files
+and that command. An engine with no command line gets the instructions
+alone, which is why they have to stand on their own. The Skills page
+lists a skill's files under its instructions, each opening in place.
+Importing a skill in the app still takes one markdown file; a skill
+with files arrives through an agent's `--from`.
+
 ## The nightly memory tidy
 
 `server/memory-tidy.ts` tidies each agent's memory once a night, between
@@ -2691,6 +3108,12 @@ stretch of speech is a segment. The renderer posts segments to
 turn in its Meetings lane with `notesPrompt`, and `actionItems` reads
 "- Owner: task" lines back out of the reply for one-press handoff.
 
+The helper is macOS only, while the preload offers `meetingStart` on
+every platform, so the window asks `meetingNotesHere` in
+`src/lib/thisComputer.ts`: the desktop app, on a Mac, not onto a hosted
+workspace. Anywhere else the chat header has no meeting button and the
+panel says meeting notes need the Bloks app on a Mac.
+
 ## The Bloks browser
 
 A browser in the desktop window, beside the chat, that agents drive and
@@ -2745,7 +3168,7 @@ the person watches and takes over. Three parts, each in its own place:
   driving agent's face, the address bar, back, forward, reload, the line
   saying who has the browser with Take over and Give back, and the
   downloads shelf. Anywhere without the app, the agent's conversation
-  shows "Browsing on the Mac" from the server's `browser.app` frames, with
+  shows "Browsing in the desktop app" from the server's `browser.app` frames, with
   the picture from `/api/browser/frame` every two seconds while visible.
 
 ## Terminals
@@ -2783,8 +3206,13 @@ its memory files (MEMORY.md and `memory/*.md`, each cut into pieces under
 their headings and named by file), words in any order, with the message
 before each hit. From a lane of a shared room it reaches only that room,
 and no memory; the lane that answers mail from anyone reaches nothing,
-and no other lane reaches it. Agents reach it with the CLI's `recall` and
-chat engines with the `search_history` tool.
+and no other lane reaches it. In a workspace with other people in it,
+the rest is `mayRecall` in `server/access.ts` (People in a workspace):
+a member's private conversation reaches itself, the team conversation
+they are on and their own memory with the agent; the team conversation
+reaches itself; the owner's own lanes never reach a member's private
+one. Agents reach it with the CLI's `recall` and chat engines with the
+`search_history` tool.
 
 Ranking is BM25 in plain TypeScript (`server/recall-index.ts`): a word
 counts for more the rarer it is in this agent's own past (its lanes,
@@ -2811,7 +3239,9 @@ answers in well under a second.
 
 The person's own search, the command palette and the MCP server's
 `search` (`GET /api/search`), reads the same indexes over every
-conversation of every agent still in the list and every room, ranked the
+conversation of every agent still in the list and every room (a member's
+private conversation only while the owner reads those, and a member's
+solo agent never), ranked the
 same way and wanting most of the words, so the message that answers comes
 before the one that happens to be newest. Nothing taken back, rewound or
 still waiting is in an index. A query of nothing but small words ("to be
@@ -3457,16 +3887,30 @@ being down (GitHub 251). A workspace that is not running answers
 
 ## Reasoning effort
 
-An agent's `effort` is `low`, `medium`, `high`, `xhigh` or `max` (Low,
-Medium, High, Extra high and Max on screen), or unset for the engine's
+An agent's `effort` is `off`, `low`, `medium`, `high`, `xhigh` or `max`
+(Off, Low, Medium, High, Extra high and Max on screen), or unset for the engine's
 own. Each driver lists the levels it passes on as
 `capabilities.efforts`, and `GET /api/instances` reports them per engine
-as `efforts`: Claude Code all five, as `--effort <level>` on every turn
+as `efforts`: Claude Code `low` to `max`, as `--effort <level>` on every turn
 (from 2.1.252, the oldest CLI checked; an older one is sent none);
-Codex all five as `turn/start.effort`, narrowed per model by the
+Codex `low` to `max` as `turn/start.effort`, narrowed per model by the
 `supportedReasoningEfforts` in its own `model/list` (reported as each
 model option's `efforts`); Grok CLI `low`, `medium` and `high`, as
-`--reasoning-effort`. The other engines have no dial and are sent none.
+`--reasoning-effort`. Command Code (its `effort` option) and Devin (its
+`thought_level` option) take their levels per model over ACP, one config
+option path for both (`effortOption` in `ACP_SPECS`): the catalog probe
+reads each model's choices in an empty session, and every turn, fresh or
+resumed, selects its model first and then the bot's level, nearest
+first, and stops before the prompt when either is not confirmed. Devin
+spells Off `none` (`effortValues`). Use engine setting on a resumed
+session restores the native default the probe read, rather than keep an
+override a turn left; Command Code's provider default (`default`) cannot
+be selected again once a level was, so there Bloks opens a new native
+session told the conversation, and without that handoff it refuses rather
+than lose the conversation. Devin's model names carry the lead's effort
+words, which the picker leaves out, since the separate selector decides;
+a Fusion sidekick keeps its level. The other engines have no dial and
+are sent no effort setting.
 
 A level being chosen (`PATCH /api/bots/:id`, `POST /api/bots`, which is
 `bloks hire --effort <level>`, or New agents with a model picked) has to
@@ -3624,6 +4068,15 @@ when there is one, is open to any agent with a shell; Settings says this
 beside the grants. Codex in its `workspace-write` sandbox has no network,
 so the address needs the same allowance a `bloks` command does.
 
+A connection here is the owner's, as the saved secrets and the Composio
+key in Settings are: used in the owner's own turns. A member's own apps
+and keys are kept apart, per person, and used in that member's private
+turns alone (People in a workspace). A member's own GitHub connection
+through this gateway is not built yet: a member's turn holds no
+credential of the agent's, and an address rides on one; giving a
+member's turn a credential that can do nothing but reach its own
+connection comes first.
+
 Not built yet: `gh` itself through a connection (gh will not talk to an
 address over plain HTTP for github.com, and teaching it to would need a
 certificate the system trusts), more than one connection per service,
@@ -3656,6 +4109,20 @@ with the installer's own output behind a disclosure. The routes answer
 only a window on this computer and never an agent. Claude Code and Codex
 report signed in or not (`claude auth status`, `codex login status`), and
 the first-run check counts an engine as ready only when it is both.
+
+What a person runs by hand comes from `server/engine-commands.ts`: one
+line per engine for macOS and Linux and one for Windows, each the line
+its maker documents (the native PowerShell installers for Claude Code,
+Antigravity, the Grok CLI and Cursor, plain `npm install -g` for the npm
+ones, which on Windows install into the person's own folder). The
+settings hint (`keyHint`), the catalog row's `install`, the first-run
+check and a driver's "not installed" error all read it. On Windows the
+install and update scripts, which are POSIX shell, do not run:
+`GET /api/engines/setup` answers `runs: false` with the PowerShell lines
+to install and, where the engine does not update itself, to update, and
+the app shows those to copy in place of the buttons. A workplace is
+reached with `sh`, so its install line is the POSIX one whatever this
+computer is.
 
 ## Where an agent works
 
@@ -3731,6 +4198,15 @@ Claude or ChatGPT plan has left comes from the engine itself, as its last
 turn said (`server/plan-usage.ts`), and Bloks AI's from its service, as
 shares.
 
+A turn its engine never ran is not usage (`turnRan`): the program is not
+there or could not start, or Bloks refused the turn before the words
+went. It is not counted unless the engine said it used something after
+all, and a day's bucket that holds only turns that failed with nothing
+to show (`carriesUsage`) is left out of the report and its menus. Limits
+shows a Claude Code or Codex plan only for an engine installed here, one
+with a plan reading, or one that answered a turn in the span in view, so
+a computer without either CLI shows neither.
+
 A cost is an engine's own price when it reports one (OpenRouter does, as
 `usage.cost`). Most API engines report tokens and no price, so a turn that
 comes back unpriced carries its model and tokens, cached input included,
@@ -3772,7 +4248,14 @@ going faster than it renews; Bloks AI's own notice from its balance; and
 a spending limit near (80%), on pace to run out, or reached. Each says
 "Approaching limit" or "Limit reached" and when it resets, and View usage
 opens the Usage page on that conversation's agent, at Limits. Dismissing
-one holds until it says something new.
+one holds until it says something new. A plan window's notice also
+carries `planWindow` (`id`, `minutes`), and its title names the window
+the way the Usage card does ("5-hour limit: Limit reached", "Weekly
+limit, Opus: Approaching limit"), so a client that does not read
+`planWindow` still says which one. The composer counts its reset down in
+hours and minutes while it is under a day away, and says the day and
+time after that; a reset already past is marked last reported, with the
+status unknown.
 
 ## Your plan
 
@@ -3931,6 +4414,19 @@ Claude Code marks as a failed sign-in keeps its words too, rather than
 signing in again changes.
 
 ## Hosted mode
+
+`server/deployment.ts` asks what kind of machine this is as separate
+questions: where it runs (`runs`: the app, or a `bloks-server` of its
+own), who looks after it (`managedBy`: the owner, or the provider when
+`BLOKS_HOSTED=1`), and what the owner's own paired devices may do there
+(`ownerTerminal`). `/api/config` says all of it as `deployment`, with
+`kind` (`app`, `self-hosted` or `managed`) for Settings, and
+`/api/health` says `managedBy` and `runs` beside `hosted`. The terminal
+routes take a paired owner device when `ownerTerminal` is on: always on
+a provider's machine, and on a server of the person's own only with
+`BLOKS_OWNER_TERMINAL=1`, never in the app. A refused device gets 403
+with code `terminal` and the reason. Everything below stays the
+provider's alone; docs/SELF_HOSTING.md says why for each.
 
 `BLOKS_HOSTED=1` says this workspace runs on a machine somebody runs for
 the person (`server/hosted.ts`). This is the server's side of managed

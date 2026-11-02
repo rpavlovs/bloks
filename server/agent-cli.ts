@@ -33,6 +33,9 @@ export interface AgentToken {
   expiresAt: number;
   /** Changes made so far on this credential. */
   spent: number;
+  /** Which of its lane's turns it was minted for (laneTurns), so a write
+   * made with it belongs to that turn and no later one. */
+  seq?: number;
   /** This credential can only reply to its turn's Telegram sender. */
   reply?: { sender: import("./telegram-people.ts").TelegramReplySender; turn: number; attempted?: Set<string> };
   /** Only the final direct submission, retained through normal renewal. */
@@ -190,6 +193,10 @@ export const RULES: Rule[] = [
   // between one agent and one person into a workspace.
   { method: "POST", path: "/api/bots/:id/messages", why: "say something to another agent" },
   { method: "POST", path: "/api/bots/:id/take-back", why: "take back its own messages still waiting for another agent" },
+  // Its own questions asked without waiting, and withdrawing one the
+  // person settled some other way. Never an approval, never another's.
+  { method: "GET", path: "/api/bots/:me/questions", why: "list the questions it asked without waiting that nobody has answered yet" },
+  { method: "DELETE", path: "/api/bots/:me/questions/:id", why: "withdraw a question of its own that the person settled some other way, with no answer given for them" },
   // A new conversation is only ever opened by saying something in it, to
   // itself or to an agent it may message, and the words go through every
   // check `say`'s do (GitHub 408). The person's own route for an empty
@@ -248,6 +255,11 @@ export const RULES: Rule[] = [
   { method: "POST", path: "/api/bots/:id/interrupt", why: "stop the current turn of an agent it hired or leads in a room" },
   { method: "POST", path: "/api/bots/:id/archive", why: "archive an agent it hired, once that agent has nothing left to do" },
   { method: "POST", path: "/api/bots/:me/notes", why: "suggest a short note about the person, for them to keep or not" },
+  // The person's list (server/todos.ts): its own lines only, by its own
+  // keys. The person closes a line through /api/todos, which stays shut.
+  { method: "GET", path: "/api/bots/:me/todos", why: "see what it put on the person's list, and whether each is still open, done or dismissed" },
+  { method: "POST", path: "/api/bots/:me/todos", why: "put something the person has to do themselves on their list, one line however often it is reported; it waits for them in the morning brief" },
+  { method: "DELETE", path: "/api/bots/:me/todos/:id", why: "clear something it put on the person's list once it no longer needs doing" },
   // The same secure field the request_secret tool plants, for an engine
   // that has no such tool. Asking is not a permission: the person still
   // types the value, and the agent never sees it in the chat.
@@ -294,6 +306,14 @@ export const RULES: Rule[] = [
   { method: "GET", path: "/api/skills/:id/history/:id", why: "read one earlier version of a skill in full" },
   { method: "GET", path: "/api/skills/:id/diff", why: "see what changed in a skill between two versions" },
   { method: "POST", path: "/api/skills/:id/revisions", why: "propose a revision of a skill against the version it read, for the person to keep, edit or dismiss; it never changes the skill by itself" },
+  { method: "GET", path: "/api/skills/:id/files", why: "list a skill's supporting files, or read one by its path, when the skill's instructions send it there" },
+  // A new skill, asked for whole: its instructions, its supporting files
+  // and whether it wants it for itself, on one card the person answers
+  // (server/skill-requests.ts). Asking is all it is: the route never
+  // writes over a skill already there, and nothing is added until the
+  // person presses Add, through a route on NEVER.
+  { method: "POST", path: "/api/agent/skills", why: "ask to add a new skill to the library, with its supporting files, and to use it itself, on one card the person answers; nothing is added until they press Add" },
+  { method: "GET", path: "/api/agent/skills/:id", why: "wait for the person's answer to a skill it asked to add" },
 
   // Answering with something other than a paragraph.
   { method: "POST", path: "/api/bots/:me/show", why: "answer with a chart, a table or another component" },
@@ -306,6 +326,7 @@ export const RULES: Rule[] = [
   { method: "PATCH", path: "/api/bots/:me/tasks/:id", why: "rename one of its own conversations" },
   { method: "DELETE", path: "/api/bots/:me/tasks/:id", why: "close one of its own conversations, once its turn there ends" },
   { method: "POST", path: "/api/bots/:me/tasks/:id/fresh", why: "start a fresh engine session in the conversation it is in, keeping the transcript" },
+  { method: "POST", path: "/api/bots/:me/tasks/:id/quiet", why: "finish the turn it is in quietly, when nothing in it needs the person" },
   { method: "GET", path: "/api/bots/:me/tasks/:id/summary", why: "read what the older messages of the conversation it is in were summarised into" },
   { method: "DELETE", path: "/api/bots/:me/tasks/:id/summary", why: "drop a stale summary of the conversation it is in, so the next turn replays and summarises again" },
 ];
@@ -336,6 +357,8 @@ export const NEVER = [
   "/api/ledger",
   "/api/relay",
   "/api/calls",
+  // turning the person's recorded speech into text, on their key
+  "/api/speech/transcribe",
   "/api/terminal",
   "/api/usage",
   // the person's plan and the way to their billing, which their own
@@ -375,6 +398,12 @@ export const NEVER = [
   // the person's answer to a setting an agent proposed: proposing is an
   // agent's, the Change is theirs
   "/api/settings-proposals",
+  // and to a skill an agent asked to add: asking is an agent's, the Add
+  // is theirs
+  "/api/skill-requests",
+  // the person's list as they see it, and closing a line on it: an agent
+  // adds to it and clears its own through /api/bots/:me/todos
+  "/api/todos",
 ];
 
 const PATH_PART = /^[\w.-]+$/;
@@ -485,7 +514,7 @@ export function capabilities(): string[] {
  * them rather than excluding the two obvious ones means a driver added
  * later gets nothing until somebody has decided it should.
  */
-export const CLI_DRIVERS = new Set(["claudeAgent", "codex", "antigravity", "opencode", "grokCli", "pi", "cursor", "cline"]);
+export const CLI_DRIVERS = new Set(["claudeAgent", "codex", "antigravity", "opencode", "commandcode", "devin", "grokCli", "pi", "cursor", "cline"]);
 
 export function runsAProcess(driverKind: string): boolean {
   return CLI_DRIVERS.has(driverKind);
@@ -497,20 +526,21 @@ export class AgentTokens {
   private byToken = new Map<string, AgentToken>();
 
   /** One turn, one credential. */
-  mint(botId: string, taskId: string, now: number): AgentToken {
+  mint(botId: string, taskId: string, now: number, seq?: number): AgentToken {
     const minted: AgentToken = {
       token: `blk_${randomBytes(24).toString("base64url")}`,
       botId,
       taskId,
       expiresAt: now + TOKEN_TTL_MS,
       spent: 0,
+      ...(seq !== undefined ? { seq } : {}),
     };
     this.byToken.set(minted.token, minted);
     return minted;
   }
 
   mintReply(botId: string, taskId: string, now: number, sender: import("./telegram-people.ts").TelegramReplySender, turn: number): AgentToken {
-    const minted: AgentToken = { token: `blr_${randomBytes(24).toString("base64url")}`, botId, taskId, expiresAt: now + TOKEN_TTL_MS, spent: 0, reply: { sender, turn } };
+    const minted: AgentToken = { token: `blr_${randomBytes(24).toString("base64url")}`, botId, taskId, expiresAt: now + TOKEN_TTL_MS, spent: 0, seq: turn, reply: { sender, turn } };
     this.byToken.set(minted.token, minted);
     return minted;
   }
@@ -518,8 +548,8 @@ export class AgentTokens {
   /** A credential for one thing: messaging a person on the asker's
    * behalf. For a turn the owner did not start but an admin did, which
    * must not carry the owner's whole workspace in its environment. */
-  mintMessenger(botId: string, taskId: string, now: number): AgentToken {
-    const minted: AgentToken = { token: `blm_${randomBytes(24).toString("base64url")}`, botId, taskId, expiresAt: now + TOKEN_TTL_MS, spent: 0, messenger: true };
+  mintMessenger(botId: string, taskId: string, now: number, seq?: number): AgentToken {
+    const minted: AgentToken = { token: `blm_${randomBytes(24).toString("base64url")}`, botId, taskId, expiresAt: now + TOKEN_TTL_MS, spent: 0, messenger: true, ...(seq !== undefined ? { seq } : {}) };
     this.byToken.set(minted.token, minted);
     return minted;
   }
@@ -542,6 +572,13 @@ export class AgentTokens {
     if (!alive?.(held.taskId)) return false;
     held.expiresAt = now + TOKEN_TTL_MS;
     return true;
+  }
+
+  /** Whether the turn running in a lane holds the agent's own full
+   * credential, so it can run the CLI as itself. */
+  heldFull(taskId: string): boolean {
+    for (const held of this.byToken.values()) if (held.taskId === taskId && !held.reply && !held.messenger) return true;
+    return false;
   }
 
   /** The turn ended. Whatever it was given stops working now rather than

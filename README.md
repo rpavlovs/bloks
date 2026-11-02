@@ -107,6 +107,16 @@ you: everything, only what needs you, or nothing.
 With Bloks Cloud, each workspace can also be **reachable online** on its
 own switch, for your phone and the people you invite.
 
+Workspaces on **servers you run** sit in the same switcher. Pair as many
+`bloks-server`s as you like from Settings, Phone and devices, Your
+servers (or Add a server in the switcher), name each, and switch with
+Cmd or Ctrl and a number. Each keeps its own pairing, so adding, pairing
+again or removing one never touches another, and one that can't be
+reached leaves the rest working. Turn off **Run workspaces on this
+computer** there and the app is only a window onto your servers: it
+starts no workspace and runs no agents of its own, and the ones on the
+computer wait, untouched, until you turn it back on.
+
 <p align="center">
   <img alt="The workspace switcher open at the top of the window: Personal, Brightwater with three members and Maple Street Bakery, then Join a workspace, New workspace, Workspace settings, Plan and Mute" src="docs/screenshots/workspaces.png" width="470">
   <img alt="New workspace: a name, Just me or Team, and the mark it will wear, with a button to draw another" src="docs/screenshots/new-workspace.png" width="350">
@@ -141,6 +151,21 @@ What they get is decided by you:
 - **Private one to ones.** Anyone who can reach an agent can also talk to
   it privately. Nobody else reads that, unless you turn on reading
   members' private conversations, and members are told which way it is.
+  What the agent remembers there is kept for that person alone, apart
+  from its memory everywhere else, and when it looks back it finds only
+  what that person could already read. Your own conversations, search
+  and recall never reach a member's private words either.
+- **Their own apps and keys.** Each member connects their own mail,
+  calendar and other apps (with a Composio key of their own) and saves
+  their own keys, under Your connections in their app. Their private
+  conversations and solo agents use them, so "pull my email" means the
+  inbox of whoever asked; a room, a team conversation, you and everyone
+  else never do. Your own apps and keys stay yours the same way.
+- **A welcome of their own.** Someone who joins is shown, once, who they
+  are signed in as, what is shared and what is theirs, and where to tell
+  agents about themselves, connect their apps or make their own agent.
+  A household works the same way: make a workspace for it beside
+  Personal, invite the family, and each of them keeps their own.
 - **On your behalf.** In a team conversation or a room, you or an admin
   can ask an agent to message someone ("message Sam about the draft"),
   and it writes in Sam's private conversation, marked as sent for you.
@@ -149,9 +174,15 @@ What they get is decided by you:
 - **Limits per person.** What each member may spend on your API keys a
   month, their share of Bloks AI, and how many solo agents they may
   make. A member at their limit is stopped; nobody else notices.
+- **Their own agents, never read.** You and your admins see the agents
+  members made for themselves, by name and maker, and can delete one:
+  it goes with its conversations, unread, and the record says who did
+  it.
 
-Every agent they talk to runs on your computer, with your keys, and they
-never reach your settings, your keys or your own conversations.
+Every agent they talk to runs on your computer, with your engines, and
+they never reach your settings, your keys or your own conversations.
+Whoever runs the computer can read what is kept on it, and the app says
+so to everyone who joins.
 Conversations with more than two people are drawn as bubbles, with faces
 under the latest message showing who has read how far. Members in a
 workspace come with [Bloks Team](https://bloks.dev); a single room can
@@ -180,7 +211,9 @@ Put a **monthly spending limit** on any engine that runs on a key of
 yours. At the line, new turns on it pause, or go to the agent's backup
 engine, until you raise it or the month turns. Before then, the message
 box says when a limit, a Claude or ChatGPT plan window, or Bloks AI is
-getting close, and on what day it resets.
+getting close, and when it resets. A plan's notice names its window
+("5-hour limit", "Weekly limit, Opus") and counts down the hours and
+minutes once the reset is under a day away.
 
 <p align="center">
   <img alt="Limits: Claude's five hour and weekly windows, Bloks AI's month and day, and a monthly spending limit on a Gemini key, most of it used" src="docs/screenshots/usage-limits.png" width="540">
@@ -250,8 +283,8 @@ not on your list asks on a card the first time an agent goes there;
 blocked sites are never opened; a password, a card number or a file to
 upload always asks you, whatever the mode. What a page says reaches an
 agent framed as untrusted data, never as instructions. On your phone the
-conversation says the agent is browsing on the Mac, with a small live
-picture of the page.
+conversation says the agent is browsing in the desktop app, with a small
+live picture of the page.
 
 ### Ready teams and skills
 
@@ -300,7 +333,15 @@ file or a `bloks://install?url=` link through the same review, and use
   cards; undo works on a mounted folder and is said to be off elsewhere.
 - **Messages while it works.** Say something mid-turn and Bloks reads it:
   a stop stops, a correction goes in now, a new request waits its turn.
-  One press changes its mind.
+  What you add while it is still getting ready joins the request it is
+  starting. One press changes its mind. When other agents' messages waited
+  too, yours go in last and marked as yours, so the answer sits right
+  under them.
+- **Questions that do not hold the turn.** A Codex agent can ask you
+  something and carry on. When you settle it some other way, the agent
+  takes its own question back (`bloks questions`, `bloks unask`) and the
+  card says it was withdrawn, with nothing answered for you. An answer you
+  gave first stands, and approvals and questions it waits on stay yours.
 - **A record you can check.** Consequential actions land in an
   append-only log, hash-chained and signed by the agent they are about.
 
@@ -334,10 +375,18 @@ who changed it and why, any two compared, any one restored, with how
 often each was used and then corrected. Agents can ask for a change too
 (`bloks skill revise`), against the version they read.
 
+Ask an agent to make a skill and use it, and it sends the whole skill
+(`bloks skill create`): one card in the conversation shows its
+instructions and files, and Add puts it in your library and gives it to
+that agent. A skill can keep supporting files beside its instructions,
+such as an API reference or a helper script, which agents read only
+when they need them. A skill already in your library is never written
+over.
+
 ### Work that runs without you
 
-- **Routines and check-ins** on a calendar you drag, that answer quietly
-  when nothing needs you.
+- **Routines and check-ins** on a calendar you drag, each one opened to
+  edit in place, that answer quietly when nothing needs you.
 - **Watchers** on a folder, a web page, a feed or a place: "when an
   invoice lands here, file it", "when I land, send me the hotel address".
 - **App watchers**: an agent starts when something happens in a
@@ -349,11 +398,17 @@ often each was used and then corrected. Agents can ask for a change too
   agent in or message one.
 - **Workflows** with a trigger, some steps and a person who says yes, kept
   on disk so quitting the app never loses a run. **Webhooks** turn any
-  outside event into a task.
+  outside event into a task, and a scheduler on your own computer can
+  wake one exact conversation, labelled as a local service, not as you.
 - **Goals.** Type `/goal`, say what done looks like, and an agent keeps
   going until it is done, stuck or out of turns.
 - **A morning brief** on Overview: what every agent did, what waits on
   you and what it cost, written from what is on disk, not by a model.
+  What waits on you includes your list: when a routine's report finds
+  something only you can do, its agent puts it there once, however many
+  mornings it reports it, and it stays until you mark it done or dismiss
+  it, or the agent says it no longer needs doing. The one morning
+  notification counts it.
 - **A terminal per agent**, up to eight shells each, docked on any side of
   the chat, side by side with it, filling the window or in a window of
   its own.
@@ -376,7 +431,10 @@ often each was used and then corrected. Agents can ask for a change too
   With the iPhone and Apple Watch update, watch an agent's browser or
   cloud computer live and take over with taps and typing, or see your
   Mac's own screen while an agent drives it, once Bloks has Screen
-  Recording.
+  Recording. While you are using Bloks on a computer, your phone stays
+  quiet: no notifications and no new Live Activities until you step away.
+  On Tailscale, pair over the computer's Tailscale IPv6 address: the
+  pairing card offers each of the computer's networks.
 - **Any browser.** With Bloks Cloud, the same app opens at
   [bloks.dev/web](https://bloks.dev/web), every request sealed in the
   browser for your computer alone.
@@ -384,7 +442,11 @@ often each was used and then corrected. Agents can ask for a change too
   can call it, or call a room. Voices come from ElevenLabs, OpenAI, Fish
   Audio or xAI with a key of yours (xAI's uses your Grok key if you have
   one), from a Chatterbox server you run on your own machine or network,
-  or from the Mac's own voices with no key at all.
+  or from the Mac's own voices with no key at all. What you say on a call
+  or in meeting notes is written down by a Whisper server of your own,
+  ElevenLabs or OpenAI, or the Mac's own recognizer in the Mac app:
+  Settings, Voices, Hearing says which, and calls and meeting notes then
+  work in the desktop app and in any browser. No audio is saved.
 - **Chat and email.** Talk to agents from Telegram or Signal, or carry a
   room into Slack, Discord, or a WhatsApp or Signal group. On Signal an
   agent answers on an account of its own, linked to signal-cli on your
@@ -404,9 +466,25 @@ often each was used and then corrected. Agents can ask for a change too
   delete, change settings or fill in a password.
 - **Always on.** `bloks-server` runs a workspace on a machine that stays
   on, and the desktop app, the phone and the browser reach it the same
-  way. Or let Bloks run one for you: managed hosting is a private machine
+  way. Settings calls it Self-hosted, your own paired devices can open
+  its terminal once you allow it there, and it updates from the app,
+  under systemd too, going back on its own if a new version doesn't
+  start. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md).
+  Or run it your own way: `docker compose up` with the `compose.yml` and
+  `.env` in this repository, behind your own reverse proxy, tunnel or
+  VPN, on your own models (a self-hosted Qwen on any OpenAI-compatible
+  server), with `BLOKS_CLOUD=off` sending nothing to Bloks Cloud or
+  bloks.dev; your desktop app pairs at your address and talks to it
+  directly. See [docs/DOCKER.md](docs/DOCKER.md). Open it in a browser at
+  an address of your own, too, signed in with Authentik, Keycloak, Google
+  or any OpenID Connect provider: you as the owner, your family or team
+  from an invite link or straight from a group, and the Members page
+  there to manage them.
+  Or let Bloks run one for you: managed hosting is a private machine
   of your own that stays on, and moves your agents over when you sign up
-  at [bloks.dev/pricing](https://bloks.dev/pricing).
+  at [bloks.dev/pricing](https://bloks.dev/pricing). On Windows, the
+  desktop app can keep running in the system tray when you close its
+  window: Settings, General, Window.
 - **Scripts, CI and a terminal.** `bloks-server run Ada "Review the open
   pull requests"` hands an agent a job, waits until it and every teammate
   it handed work to are done, and prints the answer, or one JSON document
@@ -481,8 +559,8 @@ workspace itself, as the installed app does (Personal is your real
 `~/.bloks`). `pnpm package` makes an unsigned build of your own.
 
 **Requirements:** Node 22+, pnpm, and at least one engine. macOS for
-computer use, meeting notes and the Mac's own voices; the rest runs
-anywhere Node does.
+computer use, the Mac's own voices and its on-device recognizer; the
+rest runs anywhere Node does.
 
 **Ports:** Personal listens on 8799 on this machine. If something else
 has it, the desktop app moves to 18799, 28799 or any free port, and
@@ -503,12 +581,15 @@ picks its own.
 </p>
 
 The first-run check, and Settings, Engines and keys, install Claude Code,
-Codex, Gemini CLI, Pi, Antigravity, the Grok CLI, Cursor and Cline with
-one button. They go into your own `~/.local`, so no admin password and no
+Codex, Gemini CLI, Pi, OpenCode, Command Code, Devin, Antigravity, the
+Grok CLI, Cursor and Cline with one button. They go into your own `~/.local`, so no admin password and no
 npm permission errors, and an engine that is installed but not signed in
 says so, with a button that opens Terminal at its sign-in. An engine
 installed somewhere else, or a build of your own, can be pointed at with
-**Use a different copy** under its row. To do it by hand:
+**Use a different copy** under its row. On Windows the app does not run
+installers: each row shows the engine maker's own PowerShell line to copy
+instead, such as `irm https://claude.ai/install.ps1 | iex`, and the same
+for an update. To do it by hand on a Mac or Linux:
 
 | Engine | How you connect | Works in your folders |
 | --- | --- | --- |
@@ -517,6 +598,8 @@ installed somewhere else, or a build of your own, can be pointed at with
 | Gemini CLI | `npm i -g --prefix ~/.local @google/gemini-cli`, then a Google sign-in or a Gemini key | yes |
 | Pi | `npm i -g --prefix ~/.local --ignore-scripts @earendil-works/pi-coding-agent pi-acp`, then `pi` | yes |
 | OpenCode | `npm i -g --prefix ~/.local opencode-ai`, then `opencode auth login` | yes |
+| Command Code | `npm i -g --prefix ~/.local command-code`, then `command-code login` | yes |
+| Devin | `curl -fsSL https://cli.devin.ai/install.sh \| bash` (or `brew install --cask devin-cli` on macOS, `irm https://static.devin.ai/cli/setup.ps1 \| iex` in PowerShell on Windows), then `devin auth login` | yes |
 | Grok CLI | `curl -fsSL https://x.ai/cli/install.sh \| bash`, then `grok login` | yes |
 | Cursor | `curl https://cursor.com/install -fsS \| bash`, then `cursor-agent login` (the Cursor CLI, not the editor) | yes |
 | Cline | `npm i -g --prefix ~/.local cline` (3.0.68 or newer), then `cline auth` | yes |
@@ -539,7 +622,21 @@ supports tool calls; if the host refuses them, the turn stops and says so.
 
 Give an agent a **backup engine** and a turn that hits a usage limit, a
 rate limit or an outage is picked up by the backup, with the conversation
-so far. **Engine scout** learns from what you undo, rewind and discard
+so far.
+
+To keep the same model through a plan limit instead, sign in to a second
+(or third) **account** of Claude Code or Codex under **Accounts** in
+Settings, Engines and keys. Each one signs in with the engine's own login
+in Terminal, into a folder of its own; Bloks never sees the password or
+the token. The workspace uses one account at a time. When that account
+reaches its limit, or its plan says it has, the next turn starts on the
+next account that can take it, with the same model, effort, tools and
+approvals, and the workspace stays there, even after the first one
+resets, until you choose another. A turn already running finishes where
+it started. A conversation that moves starts a new session on the new
+account, told the conversation so far, and the chat says so. When every
+account is out, the agent stops and says why, or goes to its backup
+engine if you gave it one. Usage shows which account ran what. **Engine scout** learns from what you undo, rewind and discard
 which engine does your work well, and says when a lighter model has been
 doing as well. Engines and keys belong to a workspace, so each workspace
 can run on different ones.
@@ -615,10 +712,13 @@ Inside each workspace's folder:
 | `messages-<id>.json` | One transcript per agent or room |
 | `config.json` | Connected engines and keys, spending limits, `0600` in a `0700` folder |
 | `people.json`, `joining.json` | The people in the workspace, and its invites |
-| `usage.json` | What each agent and engine used, by day |
+| `usage.json` | What each agent and engine used, by day, and on which account |
+| `engine-accounts.json`, `engine-accounts/` | The names of an engine's added accounts and which one is in use, and each one's own config folder with the sign-in the engine wrote there (left out of backups) |
 | `reads.json` | How far each person has read each conversation |
 | `skills/` | Installed skills, one markdown file each |
 | `skill-history/` | Every version of each of your skills, with who changed it and why |
+| `skill-files/` | The supporting files a skill keeps beside its instructions |
+| `skill-requests/` | New skills agents asked for, until you answer the card |
 | `catalog/`, `catalog-installs.json` | The Catalogue's index and items as last fetched, checked by sha256, and the teams installed from it |
 | `workspaces/` | Each agent's own home folder, with its `MEMORY.md` and topic files |
 | `checkpoints/` | Each turn's before and after, kept once per file version, for undo |
@@ -654,6 +754,9 @@ your conversations:
   listening, so a paired phone finds it again: the computer's name, the
   workspace's name unless it is Personal, the port and a random tag for
   the workspace.
+
+A `bloks-server` started with `BLOKS_CLOUD=off` makes none of the
+bloks.dev requests above (docs/SELF_HOSTING.md).
 
 If the app crashes, its report stays on your computer; Bloks sends it
 nowhere.

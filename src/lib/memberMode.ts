@@ -5,6 +5,7 @@ import { useEffect, useSyncExternalStore } from "react";
 import type { WorkspaceKind } from "@/types/bridge";
 import { isProgressText } from "@/lib/codexProgress";
 import { takeReadFrame } from "@/lib/readReceipts";
+import { noteSignedOut } from "@/lib/webDoor";
 import {
   foldRuntime,
   modeFrom,
@@ -13,6 +14,8 @@ import {
   type Conversation,
   type Frame,
   type MemberAgent,
+  type MemberConnections,
+  type MemberMemory,
   type MemberMessage,
   type MemberNote,
   type MemberRoom,
@@ -47,6 +50,7 @@ export async function detectMode(kind: WorkspaceKind | undefined | null): Promis
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
   const body = await res.json().catch(() => ({}));
+  if (!res.ok) noteSignedOut(res.status, (body as { code?: string }).code);
   if (!res.ok) throw Object.assign(new Error((body as { error?: string }).error ?? `${res.status} ${res.statusText}`), { status: res.status, code: (body as { code?: string }).code });
   return body as T;
 }
@@ -72,6 +76,17 @@ export const memberApi = {
   addNote: (text: string) => call<{ note: MemberNote }>("/api/member/notes", { method: "POST", body: JSON.stringify({ text }) }),
   keepNote: (id: string, text?: string) => call<{ note: MemberNote }>(`/api/member/notes/${id}/keep`, { method: "POST", body: JSON.stringify(text === undefined ? {} : { text }) }),
   dropNote: (id: string) => call<{ ok: true }>(`/api/member/notes/${id}`, { method: "DELETE" }),
+  connections: () => call<MemberConnections>("/api/member/connections"),
+  setAppsKey: (key: string) => call<MemberConnections>("/api/member/connections/apps", { method: "PUT", body: JSON.stringify({ key }) }),
+  dropAppsKey: () => call<MemberConnections>("/api/member/connections/apps", { method: "DELETE" }),
+  apps: () => call<{ connected: boolean; services: Record<string, { connected: boolean; status: string }> }>("/api/member/connections/apps/services"),
+  connectApp: (slug: string) => call<{ url: string }>(`/api/member/connections/apps/${slug}`, { method: "POST" }),
+  disconnectApp: (slug: string) => call<{ removed: number }>(`/api/member/connections/apps/${slug}`, { method: "DELETE" }),
+  saveSecret: (name: string, value: string) => call<MemberConnections>(`/api/member/connections/secrets/${name}`, { method: "PUT", body: JSON.stringify({ value }) }),
+  forgetSecret: (name: string) => call<MemberConnections>(`/api/member/connections/secrets/${name}`, { method: "DELETE" }),
+  memories: () => call<{ memories: MemberMemory[] }>("/api/member/memory"),
+  forgetMemory: (botId: string) => call<{ ok: true }>(`/api/member/memory/${botId}`, { method: "DELETE" }),
+  welcomed: () => call<{ ok: true }>("/api/member/welcomed", { method: "POST" }),
   read: (threadId: string, messageId: string) =>
     call<{ read: unknown }>(`/api/member/threads/${threadId}/read`, { method: "POST", body: JSON.stringify({ messageId }) }),
 };

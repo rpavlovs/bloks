@@ -19,7 +19,7 @@ import { formatDate, formatNumber, t, type MessageKey } from "./i18n.ts";
 
 export type UsageRange = "7d" | "30d" | "90d" | "month";
 export type UsageMetric = "cost" | "tokens" | "turns";
-export type BreakdownTab = "agent" | "engine" | "day";
+export type BreakdownTab = "agent" | "engine" | "account" | "day";
 
 /** One span's tally, as GET /api/usage/report sends it. */
 export interface UsageTotals {
@@ -55,6 +55,12 @@ export interface UsageReport {
   daily: UsageDay[];
   byAgent: UsageRow[];
   byEngine: UsageRow[];
+  /** Per account of an engine with more than one, id `engine/account`
+   * ("main" for the engine's own sign-in). Absent from an older server. */
+  byAccount?: UsageRow[];
+  /** The names the person gave those accounts, by row id. A removed
+   * account has none. */
+  accountLabels?: Record<string, string>;
   total: UsageTotals;
   previous: UsageTotals;
   priced: boolean;
@@ -138,7 +144,7 @@ export function readView(storage: Pick<Storage, "getItem"> | null = safeStorage(
       metric: one(saved.metric, METRICS.map((m) => m.value), DEFAULT_VIEW.metric),
       bot: id(saved.bot),
       engine: id(saved.engine),
-      tab: one(saved.tab, ["agent", "engine", "day"] as const, DEFAULT_VIEW.tab),
+      tab: one(saved.tab, ["agent", "engine", "account", "day"] as const, DEFAULT_VIEW.tab),
     };
   } catch {
     return DEFAULT_VIEW;
@@ -289,6 +295,26 @@ export const PLAN_KINDS: readonly string[] = ["claudeAgent", "codex"];
 
 export function onPlan(driverKind: string | null | undefined): boolean {
   return PLAN_KINDS.includes(driverKind ?? "");
+}
+
+/**
+ * The engines the Limits section shows a plan for, in the order given:
+ * those on a plan that are installed here, that have a reading of their
+ * plan, or that answered a turn in the span in view (`answered`, the
+ * report's engines; null before it is in). Claude Code and Codex are
+ * always set up, so listing every one on a plan showed both, saying
+ * nothing was heard, on a computer that has neither (GitHub 459). One
+ * that answered and has since gone keeps its card while its turns are in
+ * view.
+ */
+export function planEngines<T extends { instanceId: string; driverKind: string; snapshot: { state: string } }>(
+  instances: readonly T[],
+  plans: Record<string, PlanUsage> | null | undefined,
+  answered: readonly string[] | null | undefined,
+): T[] {
+  return instances.filter(
+    (i) => onPlan(i.driverKind) && (i.snapshot.state === "available" || Boolean(plans?.[i.instanceId]) || Boolean(answered?.includes(i.instanceId))),
+  );
 }
 
 /** Of those, the ones that never give a price. Claude Code gives a turn's

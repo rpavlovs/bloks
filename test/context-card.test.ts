@@ -30,7 +30,7 @@ test("a window that is the table's guess is said to be about that", () => {
   const guessed = { ...codex, window: "table" as const, limit: 272_000, fraction: 141_000 / 272_000 };
   assert.deepEqual(contextCard(guessed), { share: "About 52% full", tokens: "141k of about 272k tokens", summarised: null, compaction: null });
   assert.equal(ringLabel(guessed), "Context about 52% full");
-  assert.equal(contextTitle(guessed), "Context about 52% full");
+  assert.equal(contextTitle(guessed), "Context: about 52% full (141k of about 272k tokens)");
 });
 
 test("a line says so when Bloks summarised the earlier part", () => {
@@ -58,7 +58,8 @@ test("chips, rows and Activity read the same numbers, with their own thresholds"
   assert.equal(measuredContext({ ...codex, measured: false }), false);
   // an older server's fill stands on the chips, as it always did
   assert.equal(measuredContext({ used: 50_000, limit: 200_000, fraction: 0.25 }), true);
-  assert.equal(contextTitle({ ...codex, summarised: true }), "Context 55% full, earlier messages summarised");
+  assert.equal(contextTitle(codex), "Context: 55% full (141k of 258k tokens)");
+  assert.equal(contextTitle({ ...codex, summarised: true }), "Context: 55% full (141k of 258k tokens), earlier messages summarised");
   assert.equal(contextTitle({ used: 0, limit: 0, fraction: 0, measured: false, summarised: true }), "Earlier messages summarised");
   assert.equal(activityContext(codex), "context 55% full");
   assert.equal(activityContext({ ...codex, window: "table" }), "context about 55% full");
@@ -82,6 +83,15 @@ test("a plan's windows are named by their length", () => {
   assert.equal(planWindowLabel({ id: "secondary", minutes: 1_440 }), "Daily limit");
   assert.equal(planWindowLabel({ id: "secondary", minutes: 43_200 }), "30-day limit");
   assert.equal(planWindowLabel({ id: "primary", minutes: null }), "Limit");
+  // a length that is not whole hours or days is said as it is, not rounded
+  assert.equal(planWindowLabel({ id: "primary", minutes: 90 }), "90-minute limit");
+  assert.equal(planWindowLabel({ id: "secondary", minutes: 1_500 }), "25-hour limit");
+  assert.equal(planWindowLabel({ id: "secondary", minutes: 2_880 }), "2-day limit");
+  // a window Bloks has no name for says the engine's, cleaned and bounded
+  assert.equal(planWindowLabel({ id: "seven_day_haiku", minutes: null }), "Limit (seven_day_haiku)");
+  assert.equal(planWindowLabel({ id: "toString", minutes: null }), "Limit (toString)");
+  assert.equal(planWindowLabel({ id: "\u202eseven_day_opus", minutes: 10_080 }), "Weekly limit (seven_day_opus)");
+  assert.equal(planWindowLabel({ id: "x".repeat(200), minutes: 300 }), `5-hour limit (${"x".repeat(80)})`);
 });
 
 const NOW = Date.UTC(2026, 9, 9, 12, 0); // a Friday, at noon

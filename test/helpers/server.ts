@@ -84,6 +84,8 @@ export async function startHarness(extraEnv: Record<string, string> = {}): Promi
         // no inherited credentials: a test must never reach a real provider
         ...NO_PROVIDER_KEYS,
         XAI_API_KEY: "",
+        COMMAND_CODE_API_KEY: "",
+        WINDSURF_API_KEY: "",
         GEMINI_API_KEY: "",
         COMPOSIO_KEY: "",
         BOX_TOKEN: "",
@@ -98,6 +100,11 @@ export async function startHarness(extraEnv: Record<string, string> = {}): Promi
         CURSOR_API_KEY: "",
         CURSOR_AUTH_TOKEN: "",
         CLINE_API_KEY: "",
+        // nor the engines' own sign-in folders: an engine's added accounts
+        // link the person's setup from there (server/engine-accounts.ts)
+        CLAUDE_CONFIG_DIR: "",
+        CODEX_HOME: "",
+        CLAUDE_CODE_OAUTH_TOKEN: "",
         // a test run from inside a Bloks agent would otherwise act as it
         BLOKS_TOKEN: "",
         // the throwaway HOME is the whole point: a data folder named by the
@@ -116,15 +123,42 @@ export async function startHarness(extraEnv: Record<string, string> = {}): Promi
         // ones; a test that wants one serves its own
         BLOKS_FISH_AUDIO_URL: "http://127.0.0.1:9",
         BLOKS_XAI_SPEECH_URL: "http://127.0.0.1:9",
+        BLOKS_ELEVENLABS_URL: "http://127.0.0.1:9",
+        BLOKS_OPENAI_SPEECH_URL: "http://127.0.0.1:9",
         // the catalogue of teams and skills (server/catalog.ts): never the
         // repository's own; a test that browses one serves it
         BLOKS_CATALOG_URL: "http://127.0.0.1:9/catalog/index.json",
         BLOKS_HOSTED: "",
+        // the owner's devices opening a server's terminal (server/deployment.ts)
+        BLOKS_OWNER_TERMINAL: "",
         // the platform a test stands the server in for (server/hosted.ts);
         // a test that wants Windows or Linux says so itself
         BLOKS_TEST_PLATFORM: "",
         BLOKS_HOSTED_VNC: "",
         BLOKS_PUBLIC_URL: "",
+        // a server of the person's own, reached their own way
+        // (server/self-host.ts): a test that wants one says so
+        BLOKS_LISTEN: "",
+        BLOKS_CLOUD: "",
+        BLOKS_MODEL_URL: "",
+        BLOKS_MODEL_KEY: "",
+        // the web door and its identity provider (server/web-door.ts): off,
+        // whatever the shell says; a test that wants one brings its own
+        BLOKS_WEB_URL: "",
+        BLOKS_WEB_LISTEN: "",
+        BLOKS_OIDC_ISSUER: "",
+        BLOKS_OIDC_CLIENT_ID: "",
+        BLOKS_OIDC_CLIENT_SECRET: "",
+        BLOKS_OIDC_REDIRECT_URL: "",
+        BLOKS_OIDC_SCOPES: "",
+        BLOKS_OIDC_ALLOWED_GROUPS: "",
+        BLOKS_OIDC_ALLOWED_EMAILS: "",
+        BLOKS_OIDC_PERSON_CLAIM: "",
+        BLOKS_OIDC_GROUPS_CLAIM: "",
+        BLOKS_OIDC_AUTO_CREATE: "",
+        BLOKS_OIDC_ADMIN_GROUP: "",
+        BLOKS_OIDC_OWNER: "",
+        BLOKS_OIDC_NAME: "",
         // tests speak as the dev UI (origin :5199), which a server serving
         // its own page does not trust
         BLOKS_STATIC_DIR: "",
@@ -188,10 +222,10 @@ export async function startHarness(extraEnv: Record<string, string> = {}): Promi
   return {
     url,
     home,
-    fetch: (path, init) => request("http://localhost:5199", path, init),
+    fetch: (path, init) => request(extraEnv.BLOKS_STATIC_DIR ? url : "http://localhost:5199", path, init),
     fetchAs: (origin, path, init) => request(origin, path, init),
     async json(path, init) {
-      const res = await request("http://localhost:5199", path, init);
+      const res = await request(extraEnv.BLOKS_STATIC_DIR ? url : "http://localhost:5199", path, init);
       return res.json();
     },
     logs: () => io.out + io.err,

@@ -41,7 +41,8 @@ import { join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 import { readSaved, isRecord, writeFileAtomic } from "./atomic-write.ts";
-import { cleanName, joinPhrase, type DeviceKind, type WorkspaceRole } from "./people.ts";
+import { cleanName, joinPhrase, type WorkspaceRole } from "./people.ts";
+import { DEVICE_KINDS, type DeviceKind } from "./this-machine.ts";
 
 // ── codes ──────────────────────────────────────────────────────────────
 
@@ -214,8 +215,9 @@ export interface WorkspaceInvite {
     password: "correct" | "none";
     /** The key the joiner sealed for, for the words. */
     hostKey: string;
-    /** How the request arrived: through Bloks Cloud, or on this network. */
-    via: "relay" | "lan";
+    /** How the request arrived: through Bloks Cloud, on this network, or
+     * from a browser that signed in at this server (server/web-door.ts). */
+    via: "relay" | "lan" | "web";
     /** sha256 of the relay client token the joiner asked through, when it
      * said; whoever came through the invite's own token keeps it. */
     relayClient?: string;
@@ -520,8 +522,6 @@ export type ClaimResult =
   | { ok: true; invite: WorkspaceInvite; fresh: boolean }
   | { ok: false; error: JoinError; invite?: WorkspaceInvite; triesLeft?: number; locked?: boolean };
 
-const DEVICES: readonly DeviceKind[] = ["iphone", "mac", "browser"];
-
 /**
  * Somebody with the code asks to join. Checks run in the order a person
  * would want to hear about them: the invite itself first (its state is
@@ -536,7 +536,7 @@ const DEVICES: readonly DeviceKind[] = ["iphone", "mac", "browser"];
 export function claim(
   inv: WorkspaceInvite | null,
   input: ClaimInput,
-  ctx: { hostKey: string; via?: "relay" | "lan"; isMember: (tokenHash: string) => boolean; full: () => boolean },
+  ctx: { hostKey: string; via?: "relay" | "lan" | "web"; isMember: (tokenHash: string) => boolean; full: () => boolean },
 ): ClaimResult {
   if (!inv) return { ok: false, error: "wrong_code" };
   const tokenHash = typeof input.tokenHash === "string" ? input.tokenHash.toLowerCase() : "";
@@ -573,7 +573,7 @@ export function claim(
     password = "correct";
   }
   if (ctx.full()) return { ok: false, error: "full", invite: inv };
-  const device = DEVICES.includes(input.device as DeviceKind) ? (input.device as DeviceKind) : "iphone";
+  const device = DEVICE_KINDS.includes(input.device as DeviceKind) ? (input.device as DeviceKind) : "iphone";
   const relayClient = typeof input.relayClient === "string" && /^[0-9a-f]{64}$/.test(input.relayClient) ? input.relayClient : undefined;
   inv.claim = { name, tokenHash, device, at: Date.now(), password, hostKey: ctx.hostKey, via: ctx.via ?? "relay", ...(relayClient ? { relayClient } : {}) };
   inv.status = "waiting";
