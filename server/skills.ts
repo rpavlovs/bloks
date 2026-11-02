@@ -28,6 +28,7 @@ import { join } from "node:path";
 import { DATA_DIR, SKILLS_DIR } from "./config.ts";
 import { closeHeld, openInside, readHeld } from "./open-inside.ts";
 import { SkillHistory, sameText, type Author, type Revision } from "./skill-history.ts";
+import { removeSupportingFiles } from "./skill-files.ts";
 
 export interface Skill {
   id: string;
@@ -114,6 +115,23 @@ export function disclose(skills: Skill[], canFetch: boolean, under: number = INL
     else indexed.push(skill);
   }
   return { inline, indexed };
+}
+
+/**
+ * A skill sent whole, with the names of its supporting files after it
+ * (server/skill-files.ts), for an agent that can read them: its text names
+ * them as paths, which mean nothing until the agent knows how to open
+ * one. An indexed skill needs none of this; reading it lists them.
+ */
+export function noteSupportingFiles(disclosure: Disclosure, filesOf: (id: string) => string[], howToRead: (id: string) => string): Disclosure {
+  return {
+    ...disclosure,
+    inline: disclosure.inline.map((skill) => {
+      const files = skill.source === "user" ? filesOf(skill.id) : [];
+      if (!files.length) return skill;
+      return { ...skill, body: `${skill.body}\n\nIts supporting files, read one when the steps above send you there with ${howToRead(skill.id)}: ${files.join(", ")}.` };
+    }),
+  };
 }
 
 /**
@@ -343,8 +361,8 @@ Approval: required before categorizing anything as personal or writing to an acc
   {
     id: "page-design",
     name: "Page design",
-    description: "Read before making a page, report, dashboard or deck someone will open as a file. How to make it clear at a glance and finished on a phone and a Mac, light and dark",
-    body: `Use this before you make a file a person will look at: a web page, a report, a comparison, a dashboard, a one pager, a slide deck. It opens in Bloks on a Mac and on an iPhone, so it has to read at 390 pixels wide and in dark mode, and it is judged in the first two seconds.
+    description: "Read before making a page, report, dashboard or deck someone will open as a file. How to make it clear at a glance and finished on a phone and a computer, light and dark",
+    body: `Use this before you make a file a person will look at: a web page, a report, a comparison, a dashboard, a one pager, a slide deck. It opens in Bloks on a computer and on an iPhone, so it has to read at 390 pixels wide and in dark mode, and it is judged in the first two seconds.
 
 Not for: a reply in the chat. A short answer, or one with some structure, belongs in the chat, drawn as interface when you can.
 
@@ -437,11 +455,11 @@ Approval: none needed.`,
   {
     id: "using-bloks",
     name: "Using Bloks",
-    description: "Read before acting on Bloks itself for the person: hiring, a new conversation tab or a handoff, rooms, routines, watchers, sharing files, and what only the person can do",
+    description: "Read before acting on Bloks itself for the person: hiring, a new conversation tab or a handoff, rooms, routines, watchers, their list of things to do, sharing files, and what only the person can do",
     // Every command `bloks help` lists is named here, which
     // test/agent-tab.test.ts holds it to, so a command added to the CLI
     // without a line here fails the build rather than going unmentioned.
-    body: `Use this when the person asks you to do something in Bloks itself: hire or brief an agent, open a new conversation tab, hand work on, set up a room, schedule or watch for something, share a file, or arrange the sidebar. You do it with the bloks command line. Run \`bloks help\` for the exact flags of the version installed; this says which command fits.
+    body: `Use this when the person asks you to do something in Bloks itself: hire or brief an agent, open a new conversation tab, hand work on, set up a room, schedule or watch for something, put something on their list to do, share a file, or arrange the sidebar. You do it with the bloks command line. Run \`bloks help\` for the exact flags of the version installed; this says which command fits.
 
 Not for: the work itself. Do what was asked; reach for these only when Bloks has to change.
 
@@ -459,16 +477,20 @@ Not for: the work itself. Do what was asked; reach for these only when Bloks has
 
 ## Work that comes back
 - \`routine\` files a time of day or a check-in for you; \`routines\` lists them, \`unroutine\` drops one.
-- \`watch\` looks at a folder, a page, a feed, a command or a place and acts on a change; \`watchers\`, \`edit-watch\`, \`unwatch\`. \`watch-app\` (see \`app-events\`) only proposes: nothing listens until the person says yes.
+- \`watch\` looks at a folder, a page, a feed, a command or a place and acts on a change; \`watchers\`, \`edit-watch\`, \`unwatch\`. Its first look is a baseline and the same finding again is not a change, so it is no timer: to be woken every so often, file a check-in with \`routine --every\`. \`watch-app\` (see \`app-events\`) only proposes: nothing listens until the person says yes.
 - \`intent\` proposes a standing intent for the person to approve; \`intents\`, \`unintent\`.
 - \`post\` puts work on the job board for whoever takes it; \`jobs\` reads it.
 - \`pause\`, \`pauses\` and \`unpause\` hold an engine for your own work, up to a day.
 - \`incident\` reads a failure you lead and retries it once, hands it on, or tells the person.
+- \`todo "<what to do>" --key <name>\` puts something only the person can do on their list, which waits for them in the morning brief and is counted there: a routine's report that finds a disk to replace or a reply they owe. Use the same --key every time you report the same thing, so it stays one line; \`untodo <name>\` clears it once it no longer needs doing, and \`todos\` shows where each stands (open, done, dismissed). Never for what is only information or already recovered, and never to ask a question you can ask in the chat.
 
 ## Files, answers and the person
+- \`quiet\` accepts a quiet finish for the current eligible turn when nothing needs the person. Run it before writing text, then let the turn finish. A refused or uncertain call requires a substantive reply; use the legacy QUIET word only if the command is unavailable.
 - \`share <file>\` puts a file in the chat as a card and gives a link; \`telegram\` sends one to their Telegram chat with your bot; \`show\` answers with a chart or a table.
 - \`secret\` asks for a key through a secure field; never ask for one in the chat. \`note\` suggests a fact about the person for them to keep or not.
+- \`questions\` lists the questions you asked without waiting that nobody has answered. Once the person settles one some other way, \`unask <id>\` withdraws it, so it stops asking for them; nothing is answered for them.
 - \`memory\` and \`recall\` are your own notes and past conversations. \`skills\` and \`skill\` read the library; \`skill revise\` only proposes a change.
+- A skill of your own, when the person asks for one: \`skill create\` asks to add it to the library and give it to you, on one card they answer. A SKILL.md you write in a folder is only a file until then: no agent reads it as a skill, and \`skills\` does not list it. Keep its instructions under 16,000 characters, saying what to do and when, and put references and scripts in files beside it: \`skill create --from <folder>\` brings the folder's SKILL.md and its files, and an agent with the skill reads one with \`skill <id> --file <path>\` when the instructions send it there. An id already in the library is never replaced: \`skill revise\` that skill instead. Sending the same request again is safe; the answer's status says where it stands.
 - \`settings\`, \`goal\` and \`location\` only read; \`settings propose\` only proposes. \`browser\` drives the Bloks browser while the person watches. \`home\` asks Home Assistant, and a change waits for their yes unless they marked it auto. \`reply\` answers the group message that started this turn.
 
 ## What only the person can do
@@ -483,7 +505,7 @@ Say so plainly, and show them where rather than naming a page from memory:
 Every command answers JSON. Report what it said: the tab's title and id, whether it started or is queued, an engine warning, a card waiting. A refusal means nothing happened: say why in a sentence and what the person can do, and do not look for another way around it.
 
 Return: a sentence or two on what changed, or on what the person needs to do.
-Approval: anything that waits on a card (an app watcher, an intent, a skill revision, a change to the home, a secret) is not done until the person says yes; say it is waiting.`,
+Approval: anything that waits on a card (an app watcher, an intent, a skill revision, a new skill, a change to the home, a secret) is not done until the person says yes; say it is waiting.`,
   },
   {
     id: "how-bloks-works",
@@ -530,7 +552,7 @@ In a room agents take turns and the lead speaks last. Who answers a message nami
 Something that fails for good goes to its lead, which retries once, hands it on or tells the person on a card. Where: Settings, Behaviour, Incident desk and Who leads incidents (\`behaviour\`). You: \`incident\` when you lead.
 
 ## Routines, check-ins and watchers
-A routine runs at a time on chosen days, or once; a check-in every 15 minutes to 24 hours within hours, answering QUIET when nothing needs the person. A watcher looks at a folder, a page, a feed, a command or a place and starts a turn on a change, at most six an hour. An app watcher starts work on an event in a connected app (it needs the Composio project key in \`apps\`); an agent only proposes one, and the event reaches it as data. Where: Automations on the rail (\`automations\`), Schedules (\`automations:schedules\`) and Watchers (\`automations:watchers\`). You: \`routine\`, \`routines\`, \`unroutine\`, \`watch\`, \`watchers\`, \`edit-watch\`, \`unwatch\`, \`watch-app\`, \`app-events\`. Only the person: starting an app watcher.
+A routine runs at a time on chosen days, or once; a check-in every 15 minutes to 24 hours within hours, answering QUIET when nothing needs the person. A watcher looks at a folder, a page, a feed, a command or a place and starts a turn on a change, at most six an hour; its first look is a baseline, and the same finding again is not a change. An app watcher starts work on an event in a connected app (it needs the Composio project key in \`apps\`); an agent only proposes one, and the event reaches it as data. Where: Automations on the rail (\`automations\`), Schedules (\`automations:schedules\`) and Watchers (\`automations:watchers\`). You: \`routine\`, \`routines\`, \`unroutine\`, \`watch\`, \`watchers\`, \`edit-watch\`, \`unwatch\`, \`watch-app\`, \`app-events\`. Only the person: starting an app watcher.
 
 ## Intents, workflows, webhooks and jobs
 An intent is up to twelve phrases; when one comes up in a conversation it posts a note, brings an agent in or messages one. Agents propose, the person approves. A workflow is a trigger, steps and a person who says yes; a webhook turns an outside event into a task; the job board holds work for whoever takes it. Where: Automations, Intents (\`automations:intents\`), Workflows (\`automations:workflows\`), Webhooks (\`automations:webhooks\`), Job board (\`automations:jobs\`). You: \`intent\`, \`intents\`, \`unintent\`, \`post\`, \`jobs\`. Only the person: approving intents, workflows, webhooks.
@@ -539,16 +561,16 @@ An intent is up to twelve phrases; when one comes up in a conversation it posts 
 \`/goal\` in the chat gives a conversation a goal: what done looks like, a check that must exit 0, and up to a hundred turns (twenty unless said). It keeps going until done, stuck or out of turns. You: \`goal\` reads it. Only the person sets, pauses or clears one.
 
 ## The morning brief
-On Overview, written each morning from what is on disk, with no model call: what each agent did, what waits on the person and what it cost. They choose the time, the notification, whether a quiet morning notifies, and the sections. Where: Overview (\`overview\`), Customize the brief. You: \`settings propose\` brief.enabled, brief.time, brief.notify, brief.allClear, brief.section.<name>.
+On Overview, written each morning from what is on disk, with no model call: what each agent did, what waits on the person and what it cost. What waits on them is their open questions and approvals, and their list of things to do, which agents add to with \`todo\` and the person marks done or dismisses there; the morning notification counts all of it. They choose the time, the notification, whether a quiet morning notifies, and the sections. Where: Overview (\`overview\`), Customize the brief. You: \`settings propose\` brief.enabled, brief.time, brief.notify, brief.allClear, brief.section.<name>; \`todo\`, \`todos\` and \`untodo\` for your own lines on their list.
 
 ## Skills and their versions
-Skills are instructions agents pick up. With suggestions on, Bloks offers a new skill after a turn that worked something out, or a change after a skill was corrected. Every version is kept: who, why, compare, restore. Where: Plugins, Skills (\`plugins:skills\`); Settings, Behaviour, Suggest skills (\`behaviour\`); Settings, Plugins (\`plugins\`). You: \`skills\`, \`skill\`, \`skill revise\` (a proposal); \`settings propose skills.learn\`. Only the person: keeping, editing, restoring, installing.
+Skills are instructions agents pick up, from the library; a SKILL.md sitting in a folder is not one until it is added. A skill can keep supporting files beside its instructions (references, scripts), read only when needed. With suggestions on, Bloks offers a new skill after a turn that worked something out, or a change after a skill was corrected. An agent asked to make a skill sends it whole on a card in the conversation, and Add puts it in the library and gives it to that agent. Every version is kept: who, why, compare, restore. Where: Plugins, Skills (\`plugins:skills\`); Settings, Behaviour, Suggest skills (\`behaviour\`); Settings, Plugins (\`plugins\`). You: \`skills\`, \`skill\`, \`skill revise\` (a proposal), \`skill create\` (a request); \`settings propose skills.learn\`. Only the person: keeping, editing, restoring, installing, adding a skill you asked for.
 
 ## The catalogue
 Ready teams and skills, installed only after a review that names what each creates; routines start paused. Where: Plugins, Catalogue (\`plugins:catalog\`). Only the person installs.
 
 ## Engines and keys
-Each agent picks an engine. Engines that run a program (Claude Code, Codex, Gemini CLI and others) work in folders; API engines get a smaller set of tools from Bloks. A backup engine takes a turn that hit a limit or outage. Engines and keys belong to a workspace. Where: Settings, Engines and keys (\`engines\`); an agent's engine in its settings (\`agent\`); defaults in Settings, New agents (\`new-agents\`); voices in Settings, Voices (\`voices\`). You: \`pause\` your own engine up to a day; \`settings propose agent.model\`, \`agent.effort\`, \`newAgents.effort\`. Only the person: installing, signing in, keys, endpoints.
+Each agent picks an engine. Engines that run a program (Claude Code, Codex, Gemini CLI and others) work in folders; API engines get a smaller set of tools from Bloks. A backup engine takes a turn that hit a limit or outage. Claude Code and Codex can have more than one account signed in; when the one in use reaches its plan limit, the next turn starts on another with the same model, in a new session told the conversation so far. Engines and keys belong to a workspace. Where: Settings, Engines and keys (\`engines\`); an agent's engine in its settings (\`agent\`); defaults in Settings, New agents (\`new-agents\`); voices in Settings, Voices (\`voices\`). You: \`pause\` your own engine up to a day; \`settings propose agent.model\`, \`agent.effort\`, \`newAgents.effort\`. Only the person: installing, signing in, accounts, keys, endpoints.
 
 ## Bloks AI, plan and spending
 Bloks AI is a monthly allowance on their Bloks plan: no key or sign-in. Usage shows cost, tokens and turns by agent and engine; a monthly spending limit on an engine with their own key pauses new turns there, or hands them to a backup. Members have limits of their own. Where: Settings, Plan (\`plan\`); Usage (\`usage\`); Members (\`workspace:members\`). Only the person.
@@ -943,6 +965,8 @@ export function deleteSkill(id: string): boolean {
   try {
     unlinkSync(join(SKILLS_DIR, `${slug}.md`));
     if (skillObservation) skillObservation.invalidatedAt = Date.now();
+    // its supporting files are part of it, and go with it
+    removeSupportingFiles(slug);
     // its versions stay: removing a skill is not forgetting what it said
     try {
       skillHistory().removed(slug);

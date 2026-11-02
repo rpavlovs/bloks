@@ -10,6 +10,7 @@ import type { BlokColor, BlokExpression, BlokShape } from "@/lib/mascot";
 import type { LaneContext } from "@/lib/contextCard";
 import type { CodexSpeed, CodexSpeedStatus } from "@/lib/codexSpeed";
 import type { Effort } from "@/lib/effort";
+import type { HearingStatus } from "@/lib/hearing";
 import type { RoomAnswers, RoomRoute } from "@/lib/roomRoute";
 import type { Workplace, WorkplaceStatus } from "@/lib/workplace";
 import { resolveSettingsPage } from "../lib/settingsPages.ts";
@@ -52,6 +53,9 @@ export interface OptionCardData {
   cutOff?: boolean;
   /** Why it closed before anyone answered, in the server's words. */
   closed?: string;
+  /** The agent that asked withdrew the question, the person having
+   * settled it some other way; said in the reader's language. */
+  withdrawn?: boolean;
   dismissed?: boolean;
   /** Set when the agent is genuinely blocked on this card. Its absence
    * means a setup question, which is safe to ignore. */
@@ -74,6 +78,9 @@ export interface OptionCardData {
   /** Present when an agent proposed changing a setting
    * (server/settings-proposals.ts). Answered through its own route. */
   settingsProposal?: SettingsProposalPlan;
+  /** Present when an agent asked to add a new skill to the library and
+   * use it (server/skill-requests.ts). Answered through its own route. */
+  skillRequest?: SkillRequestPlan;
 }
 
 /** A place an agent's card opens, as server/where.ts writes it. */
@@ -108,6 +115,32 @@ export interface SettingsProposalPlan {
   told?: boolean;
   outcome?: "changed" | "kept" | "failed";
   error?: string;
+}
+
+/** A new skill an agent asked to add and use (server/skill-requests.ts). */
+export interface SkillRequestPlan {
+  id: string;
+  laneId: string;
+  botId: string;
+  agentName: string;
+  skillId: string;
+  name: string;
+  description: string;
+  chars: number;
+  files: SkillFileInfo[];
+  attach: boolean;
+  why?: string;
+  told?: boolean;
+  outcome?: "added" | "declined" | "failed" | "replaced";
+  attached?: boolean;
+  error?: string;
+  replacedBy?: string;
+}
+
+/** One of a skill's supporting files, by name and size in bytes. */
+export interface SkillFileInfo {
+  path: string;
+  size: number;
 }
 
 /** An app watcher an agent proposed, as its card shows it. */
@@ -191,7 +224,8 @@ export interface Message {
   midTurn?: boolean;
   /** Sent while a turn ran: whether it went in, stopped the turn, or
    * waited, and the quiet line that says so (server/delivery.ts). */
-  delivery?: { route: "steered" | "stopped" | "queued"; why: string; line: string };
+  delivery?: { route: "steered" | "stopped" | "queued" | "pending" | "uncertain" | "not-sent"; why: string; line: string };
+  preparation?: { state: "pending" | "dispatching" | "joined" | "next" | "uncertain" | "not-sent"; dismissed?: boolean };
   /** In a room set to Auto: who a message naming nobody went to and why,
    * or that the lead took it (server/room-route.ts). */
   route?: RoomRoute;
@@ -214,7 +248,7 @@ export interface Message {
   /** Came in some other way than you typing it here. "goal" is Bloks
    * starting the next turn toward the conversation's goal; "incident" is
    * the incident desk handing a lead something that failed. */
-  via?: "slack" | "discord" | "whatsapp" | "signal" | "watcher" | "email" | "webhook" | "routine" | "goal" | "intent" | "incident";
+  via?: "slack" | "discord" | "whatsapp" | "signal" | "watcher" | "email" | "webhook" | "routine" | "goal" | "intent" | "incident" | "service";
   /** Posted or sent by a standing intent (server/intents.ts). */
   intent?: { id: string; name: string };
   /** The incident desk (server/incidents.ts): the note on a lead's quiet
@@ -506,6 +540,8 @@ export interface ConfigStatus {
     /** A Chatterbox server of the person's own, and where it is. */
     chatterbox?: boolean;
     chatterboxUrl?: string;
+    /** Who turns speech into text (src/lib/hearing.ts). */
+    hearing?: HearingStatus;
   };
   /** Shared context for every agent, not a secret, so it round-trips;
    * `name` is what the owner is called, empty until they say. */
@@ -552,6 +588,18 @@ export interface ConfigStatus {
     desktop: boolean;
     computers: Array<{ id: "cloud" | "sandbox" | "local" | "off"; label: string }>;
   };
+  /** The same machine asked apart (server/deployment.ts): the app on this
+   * computer, a server the person runs, or managed hosting, and whether
+   * the owner's own devices may open its terminal. Absent on a server
+   * from before 3.2, which said only `hosted`. */
+  deployment?: {
+    kind: "app" | "self-hosted" | "managed";
+    runs: "app" | "server";
+    managedBy: "owner" | "provider";
+    computer: string;
+    ownerTerminal: boolean;
+    ownerTerminalFrom: "provider" | "setting" | null;
+  };
 }
 
 /** What the server says about Bloks AI on the stream and with the rest
@@ -596,6 +644,33 @@ export function pingedLane(bot: LanedBot): string | null {
     .filter((t) => t.unread && t.id !== open)
     .sort((a, b) => (b.lastAt ?? b.createdAt) - (a.lastAt ?? a.createdAt));
   return waiting[0]?.id ?? null;
+}
+
+/** The conversation a click on the agent's row opens, as `select` picks
+ * it: the one that pinged you, else the open one. The row's mark and line
+ * describe this one, so the row, the click and what opens agree. */
+export function rowLane<L extends Lane>(bot: { activeTaskId?: string; threadId: string; tasks?: L[] }): L | undefined {
+  const id = pingedLane(bot) ?? bot.activeTaskId ?? bot.threadId;
+  return bot.tasks?.find((t) => t.id === id);
+}
+
+/** What an agent's row says, its mark and its line alike: the state of
+ * the conversation a click opens (rowLane), and whether that one is
+ * unread. When it has nothing to say, the agent working in another of
+ * its conversations still shows: one busy behind a quiet open
+ * conversation read as idle in the list, with nothing anywhere else in
+ * the sidebar to say otherwise. */
+export function rowState<L extends Lane>(bot: {
+  activeTaskId?: string;
+  threadId: string;
+  unread?: boolean;
+  busy?: boolean;
+  tasks?: L[];
+}): { lane: L | undefined; state: string; unread: boolean } {
+  const lane = rowLane(bot);
+  const unread = lane && lane.id !== (bot.activeTaskId ?? bot.threadId) ? Boolean(lane.unread) : openLaneUnread(bot);
+  const says = lane?.state === "working" || lane?.state === "needs-you" || unread;
+  return { lane, state: !says && bot.busy ? "working" : (lane?.state ?? "idle"), unread };
 }
 
 /** The same agent with its open lane read. Its own flag follows as "any
@@ -663,7 +738,7 @@ export function laneHasMessages(lane: { lastAt?: number; createdAt: number; usag
  * Picking fields out of it by name drops whatever was added later, and
  * the card reading a dropped field vanishes until the next reload. */
 export function configFromFrame(frame: Record<string, unknown>): ConfigStatus {
-  const { kind: _kind, _seq, ...status } = frame;
+  const { kind: _kind, _seq, _serverSeq, ...status } = frame;
   return status as unknown as ConfigStatus;
 }
 
@@ -795,6 +870,9 @@ export interface ProviderRow {
   signInHint?: string;
   /** For CLI engines: the name it is looked up by on PATH. */
   command?: string;
+  /** For CLI engines: the line that installs it on the computer Bloks
+   * runs on, PowerShell's on Windows. */
+  install?: string;
   keyPrefix?: string;
   docsUrl: string;
   connected: boolean;
@@ -823,6 +901,9 @@ export interface Skill {
   uses?: number;
   corrected?: number;
   lastUsed?: number | null;
+  /** Files it keeps beside its instructions (server/skill-files.ts),
+   * read on demand and never part of a prompt. */
+  files?: SkillFileInfo[];
 }
 
 /** The tabs of the Automations page (src/components/AutomationsPanel.tsx). */

@@ -102,6 +102,7 @@ contextBridge.exposeInMainWorld("bloks", {
   prefsAccent: (accent) => ipcRenderer.invoke("prefs:accent", accent),
   prefsSameAccent: (on, showing) => ipcRenderer.invoke("prefs:same-accent", on, showing),
   prefsNotch: (on) => ipcRenderer.invoke("prefs:notch", on),
+  prefsTray: (on) => ipcRenderer.invoke("prefs:tray", on),
   // the island in the notch (electron/notch.mjs)
   notchHover: (over) => ipcRenderer.invoke("notch:hover", over),
   notchOpen: (target) => ipcRenderer.invoke("notch:open", target),
@@ -131,11 +132,10 @@ contextBridge.exposeInMainWorld("bloks", {
   updateLater: () => ipcRenderer.invoke("update:later"),
   updateNotInstalledSeen: () => ipcRenderer.invoke("update:not-installed-seen"),
   relaunch: () => ipcRenderer.invoke("app:relaunch"),
-  // a Bloks on another computer (electron/remote.mjs)
-  remoteStatus: () => ipcRenderer.invoke("remote:status"),
-  remoteConnect: (link) => ipcRenderer.invoke("remote:connect", link),
-  remoteDisconnect: () => ipcRenderer.invoke("remote:disconnect"),
-  onRemoteState: subscription("remote:state"),
+  // your own servers elsewhere, listed as workspaces (electron/remote.mjs),
+  // and whether this computer runs any workspaces of its own
+  remoteConnect: (link, name) => ipcRenderer.invoke("remote:connect", link, name),
+  workspaceLocal: (on) => ipcRenderer.invoke("workspaces:local", on),
   onUpdateState: subscription("update:state"),
   shortcutApply: (accelerator) => ipcRenderer.invoke("shortcut:apply", accelerator),
   quickHide: () => ipcRenderer.invoke("quick:hide"),

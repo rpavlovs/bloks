@@ -13,6 +13,8 @@ import { namer } from "./names";
 import { ownerOrNull } from "./yourName";
 import { openWorkspaceDialog } from "@/lib/workspaces";
 import { formatDate, t, type MessageKey } from "./i18n.ts";
+import { onThisComputer } from "./thisComputer.ts";
+import type { DeviceKind } from "../../server/this-machine.ts";
 
 export type WorkspaceRole = "admin" | "member";
 export type Role = WorkspaceRole | "owner";
@@ -42,10 +44,13 @@ export interface Member {
   role: WorkspaceRole;
   joinedAt: number;
   invitedBy: string;
-  device: "iphone" | "mac" | "browser" | null;
+  device: DeviceKind | null;
   devices: number;
   lastActive: number | null;
   soloAgents: number;
+  /** The identity they sign in with at the server's web door, as the
+   * provider calls them, when they have one. */
+  signIn?: string | null;
   spend?: { month: string; usd: number; aiPercent: number | null };
   limits?: MemberLimit;
 }
@@ -55,6 +60,9 @@ export interface Invite {
   publicId: string;
   code: string;
   link: string;
+  /** The same invite at the server's own address, for a browser, when
+   * its web door is on. */
+  webLink?: string;
   name: string | null;
   role: WorkspaceRole;
   createdAt: number;
@@ -69,11 +77,11 @@ export interface JoinRequest {
   name: string;
   forName: string | null;
   role: WorkspaceRole;
-  device: "iphone" | "mac" | "browser";
+  device: DeviceKind;
   at: number;
   password: "correct" | "none";
   phrase: string | null;
-  via: "relay" | "lan";
+  via: "relay" | "lan" | "web";
   expiresAt: number;
 }
 
@@ -94,6 +102,20 @@ export interface MembersData {
   /** People are in, and the owner is not on Team: they are paused. */
   paused?: boolean;
   online: { available: boolean; why?: string };
+  /** Where a browser opens this server, when its web door is on. */
+  web?: string | null;
+}
+
+/** An agent a member made for themselves, as the owner and admins see
+ * it: its name and maker, never what was said to it. */
+export interface MemberAgentRow {
+  id: string;
+  name: string;
+  color: string;
+  shape: string | null;
+  madeBy: { id: string; name: string };
+  createdAt: number;
+  conversations: number;
 }
 
 export interface AgentAccessRow {
@@ -134,6 +156,8 @@ export const membersApi = {
     api("/api/workspace/identity", { method: "PUT", body: JSON.stringify(body) }),
   access: (): Promise<{ agents: AgentAccessRow[]; rooms: Array<{ id: string; name: string; audience: "everyone" | "some"; members: string[] }> }> =>
     api("/api/workspace/access"),
+  memberAgents: (): Promise<{ agents: MemberAgentRow[] }> => api("/api/workspace/member-agents"),
+  deleteMemberAgent: (botId: string) => api(`/api/workspace/member-agents/${botId}`, { method: "DELETE" }),
   setAgentAccess: (botId: string, body: { mode: "everyone" | "only" | "except"; people?: string[]; admins?: boolean }) =>
     api(`/api/workspace/agents/${botId}/access`, { method: "PATCH", body: JSON.stringify(body) }),
 };
@@ -191,7 +215,7 @@ export type JoinAnswer =
 
 async function post<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-  const parsed = await res.json().catch(() => ({ ok: false, code: "offline", error: t("members.macDidNotAnswer") }));
+  const parsed = await res.json().catch(() => ({ ok: false, code: "offline", error: t("members.macDidNotAnswer", { computer: onThisComputer() }) }));
   return parsed as T;
 }
 

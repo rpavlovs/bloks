@@ -2,7 +2,7 @@
 // the same shapes the main process uses.
 import type { Mark } from "./workspace-marks.mjs";
 
-export type WorkspaceKind = "personal" | "business" | "custom" | "joined" | "hosted";
+export type WorkspaceKind = "personal" | "business" | "custom" | "joined" | "hosted" | "remote";
 export type NotifyLevel = "all" | "needs-me" | "nothing";
 
 export interface WorkspaceEntry {
@@ -21,7 +21,7 @@ export interface WorkspaceEntry {
   accent: string | null;
   members: number | null;
   createdAt: number;
-  host?: { name: string; relayUrl: string; lan?: string };
+  host?: { name: string; relayUrl: string; lan?: string; direct?: string };
   role?: "member" | "admin";
   /** A joined workspace's mark as you chose it, seen only here. */
   ownMark?: Mark | null;
@@ -32,7 +32,7 @@ export interface WorkspaceEntry {
 export interface Registry {
   version: number;
   current: string;
-  prefs: { theme: "light" | "dark" | "system" | null; sameAccent: boolean; accent: string | null; ownerName?: string | null; notch?: boolean; language?: string | null };
+  prefs: { theme: "light" | "dark" | "system" | null; sameAccent: boolean; accent: string | null; ownerName?: string | null; notch?: boolean; tray?: boolean; language?: string | null; local?: boolean };
   workspaces: WorkspaceEntry[];
 }
 
@@ -69,6 +69,18 @@ export function addHosted(
   host?: { host?: string; relayUrl?: string },
   options?: { now?: number; random?: () => number; id?: string },
 ): { registry: Registry; entry: WorkspaceEntry; replaced: boolean };
+export function isLocalKind(kind: unknown): boolean;
+export function runsLocal(registry: Registry): boolean;
+export function shownWorkspaces(registry: Registry): WorkspaceEntry[];
+export function fallbackWorkspace(registry: Registry, except?: string | null): WorkspaceEntry | null;
+export function freeName(registry: Registry, wanted: unknown, self?: string | null): string;
+export function addRemote(
+  registry: Registry,
+  input?: { name?: string; host?: string; relayUrl?: string; direct?: string; same?: string | null },
+  options?: { now?: number; random?: () => number; id?: string },
+): { registry: Registry; entry: WorkspaceEntry; replaced: boolean };
+export function localOffRefusal(registry: Registry): string | null;
+export function setLocal(registry: Registry, on: unknown): Registry;
 export function updateWorkspace(
   registry: Registry,
   id: string,
@@ -93,6 +105,7 @@ export function accentOf(registry: Registry, id: string | null): string | null;
 export function chooseAccent(registry: Registry, id: string | null, accent: unknown): Registry;
 export function setSameAccent(registry: Registry, id: string | null, on: boolean, showing?: unknown): { registry: Registry; accent: string | null };
 export function setNotch(registry: Registry, on: unknown): Registry;
+export function setTray(registry: Registry, on: unknown): Registry;
 export const LANGUAGE_CODES: readonly string[];
 export function setLanguage(registry: Registry, language: unknown): Registry;
 export function rerollMark(registry: Registry, id: string, options?: { random?: () => number }): Registry;
@@ -133,6 +146,7 @@ export function snapshot(
   available: true;
   current: string;
   ownerName: string | null;
+  local: boolean;
   workspaces: Array<{
     id: string;
     kind: WorkspaceKind;
@@ -151,5 +165,7 @@ export function snapshot(
     host?: string;
     role?: "member" | "admin";
     lanOnly?: boolean;
+    remote?: boolean;
+    direct?: string;
   }>;
 };

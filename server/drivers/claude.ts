@@ -30,6 +30,7 @@ import { DATA_DIR } from "../config.ts";
 import { lineSplitter } from "../ndjson.ts";
 import { apiRefusal, isRefusal, outReason } from "../failover.ts";
 import { claudePlanUsage } from "../plan-usage.ts";
+import { MAIN_ACCOUNT } from "../engine-accounts.ts";
 import { callSignature } from "../repeats.ts";
 import { SessionCosts } from "./session-costs.ts";
 import { readClaudeCommands, classifyClaudeCommands, type ClaudeCommandRow } from "../agent-commands.ts";
@@ -73,6 +74,7 @@ import type {
 import { newEventId, newId } from "../contracts.ts";
 import type { Effort } from "../effort.ts";
 import { appendNative } from "./native.ts";
+import { installCommand } from "../engine-commands.ts";
 import { describeEarlyExit, describeSpawnError } from "./spawn-error.ts";
 import { DEFAULT_STALL_MINUTES, STOP_GRACE_MS, describeStall, isStalled, type OpenCall } from "./stall.ts";
 import { OWN_GROUP } from "../no-console.ts";
@@ -283,7 +285,7 @@ export function isLimitNotice(text: unknown): text is string {
  */
 export function turnEnvironment(
   base: NodeJS.ProcessEnv,
-  turn: Pick<SendTurnInput, "env" | "shared" | "person">,
+  turn: Pick<SendTurnInput, "env" | "shared" | "person" | "account" | "deniedDirs">,
 ): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {
     ...base,
@@ -296,6 +298,10 @@ export function turnEnvironment(
     env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
     env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   }
+  // A member's private conversation keeps its memory where Bloks puts it,
+  // at their own desk. Claude Code's own memory is kept per folder, and a
+  // folder the owner chose for the agent is one everybody's turns share.
+  if (turn.deniedDirs?.length) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   if (turn.person) env.ENABLE_CLAUDEAI_MCP_SERVERS = "false";
   // A subscription login gets billed as pay-as-you-go if a key leaks
   // through, and the two CLAUDECODE markers would make the child think
@@ -307,6 +313,29 @@ export function turnEnvironment(
   // that waits on its background work knows the agent has finished
   // answering what that work found (server/background-work.ts).
   env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS = "1";
+  // Another of the person's accounts (server/engine-accounts.ts): the CLI
+  // reads its sign-in from that account's own config folder. Set last, so
+  // nothing in the turn's own environment can point it elsewhere, and a
+  // token this machine's environment carries for the main sign-in is not
+  // used in its place, which would run the turn on the account it left.
+  if (turn.account) {
+    env.CLAUDE_CONFIG_DIR = turn.account.dir;
+    delete env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+  }
+  return env;
+}
+
+/** The environment Claude Code's own commands about a sign-in run in:
+ * this machine's, pointed at an added account's folder, with nothing that
+ * would answer for another account instead. */
+function accountEnvironment(dir: string): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env, CLAUDE_CONFIG_DIR: dir };
+  delete env.ANTHROPIC_API_KEY;
+  delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
   return env;
 }
 
@@ -351,8 +380,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
 
     // What the plan signed in here has left, as the CLI last said, for
     // the composer's card (server/plan-usage.ts). The limits belong to
-    // the account, so one for the instance, whichever turn said it.
-    let plan: PlanUsage | null = null;
+    // the account, so one per account, whichever turn on it said it: the
+    // main sign-in's under MAIN_ACCOUNT, an added account's under its id.
+    const plans = new Map<string, PlanUsage>();
 
     interface RunningTurn {
       turnId: string;
@@ -360,6 +390,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       cleanup: () => Promise<boolean>;
       /** More words for this turn, or false when it can no longer take them. */
       steer: (text: string, onDispatch?: () => void) => boolean;
+      steerPrepared: (text: string, options: { onDispatch: () => void; onAcceptedLate?: () => void }) => Promise<"accepted" | "refused" | "uncertain">;
       broker?: AskBroker;
     }
     /** At most one turn per thread. A second send while one is live is a
@@ -386,6 +417,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const turnId = newId();
       // A health refresh cannot change the protocol of an already running CLI.
       const attributed = attributedCompletionSupported;
+      // The version probe describes the local CLI, not one spawned by a
+      // workplace. Until its capability is known, leave preparation inputs
+      // for the next turn; ordinary steering keeps its existing behavior.
+      const attributedPreparation = attributed && !turn.place;
       const inputs = attributed ? new ClaudeInputs() : null;
       let sealed = false;
       let closingBroker = false;
@@ -489,6 +524,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // one value per flag, so a folder name with a comma or a space in
         // it cannot split a rule in two
         for (const rule of personClaudeDenials(DATA_DIR)) argv.push("--disallowedTools", rule);
+      }
+      // a member's private conversation: the agent's own folder and other
+      // people's are not this turn's to read, asked or not
+      for (const dir of turn.place ? [] : (turn.deniedDirs ?? [])) {
+        for (const rule of personClaudeDenials(dir)) argv.push("--disallowedTools", rule);
       }
       // extra editable folders, chiefly the agent's own workspace: memory
       // updates must not stall on approval cards when cwd points elsewhere.
@@ -735,6 +775,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       let held: any = null;
       /** Whether stdin still takes words for this turn. */
       let inputOpen = true;
+      // These callbacks are keyed by the input UUID, never result.uuid.
+      // A process exit or timer ends the wait without calling it delivered.
+      const confirmations = new Map<string, { accepted: () => void; ended: () => void }>();
       /** Words were written after the prompt, so a result may not be the last. */
       let steered = false;
       /** Whether any assistant frame carried usage this turn. */
@@ -772,6 +815,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (waitTimer) clearInterval(waitTimer);
         waiting = null;
         if (completionTimer) clearTimeout(completionTimer);
+        for (const waiting of confirmations.values()) waiting.ended();
+        confirmations.clear();
         closingBroker = true;
         try { broker.close(); } finally { closingBroker = false; }
         closeInput();
@@ -1019,6 +1064,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           accountChild(frame);
           return;
         }
+        const acceptedIds: string[] = frame.type === "command_lifecycle" && ["started", "completed"].includes(frame.state) && typeof frame.command_uuid === "string"
+          ? [frame.command_uuid]
+          : frame.type === "system" && frame.subtype === "status" && frame.status === "requesting" && Array.isArray(frame.user_message_uuids)
+            ? frame.user_message_uuids.filter((id: unknown): id is string => typeof id === "string")
+            : [];
+        for (const id of acceptedIds) {
+          const wait = confirmations.get(id);
+          if (wait) { confirmations.delete(id); wait.accepted(); }
+        }
         noteBackground(frame);
         if (inputs && frame.type === "command_lifecycle") {
           if (inputs.terminal(frame)) checkCompletion();
@@ -1197,7 +1251,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               resetsAt = Math.floor(at > 1e12 ? at / 1000 : at);
             }
             // and how much of each window is used, which it says every turn
-            plan = claudePlanUsage(info, plan);
+            const planKey = turn.account?.id ?? MAIN_ACCOUNT;
+            const heard = claudePlanUsage(info, plans.get(planKey) ?? null);
+            if (heard) plans.set(planKey, heard);
             break;
           }
 
@@ -1293,7 +1349,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           message: describeSpawnError(error, {
             name: "Claude Code",
             command: config.cli,
-            install: "curl -fsSL https://claude.ai/install.sh | bash",
+            install: installCommand("claudeAgent"),
             signIn: "run `claude` once to sign in",
           }),
         });
@@ -1399,13 +1455,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         const result = inputs?.selectedResult ?? held;
         if (result) settle(result, true); else finish(false, "interrupted");
       };
-      const say = (text: string, onDispatch?: () => void): boolean => {
+      const say = (text: string, onDispatch?: () => void, onId?: (id: string | null) => void): boolean => {
         // Over stdin, never argv: a pasted document would blow past
         // ARG_MAX, and argv is readable by every process on the machine.
         if (sealed || !inputOpen || child.stdin.destroyed || !child.stdin.writable) return false;
         const id = inputs ? newId() : null;
         const message = { type: "user", message: { role: "user", content: text }, ...(id ? { uuid: id } : {}) };
         if (id) inputs!.register(id);
+        onId?.(id);
         // Words for a turn waiting on its background work: the turn ends
         // once these are answered too, and what it waits on is asked again.
         if (waiting) {
@@ -1443,7 +1500,39 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         } catch (error) { steered = previous; throw error; }
       };
 
-      running.set(threadId, { turnId, abort, steer, broker, cleanup: () => {
+      const steerPrepared: RunningTurn["steerPrepared"] = async (text, options) => {
+        if (sealed || stopping || exited || !inputOpen || !personReady) return "refused";
+        return new Promise((resolve) => {
+          let done = false;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const settle = (outcome: "accepted" | "refused" | "uncertain") => {
+            if (done) return;
+            done = true;
+            if (timer) clearTimeout(timer);
+            resolve(outcome);
+          };
+          let id: string | null = null, dispatched = false;
+          try {
+            const sent = say(text, () => { options.onDispatch(); dispatched = true; steered = true; }, (value) => {
+              id = value;
+              if (!value) return;
+              confirmations.set(value, {
+                accepted: () => { if (done) options.onAcceptedLate?.(); else settle("accepted"); },
+                ended: () => settle("uncertain"),
+              });
+            });
+            if (!sent) return settle("refused");
+            if (!id) return settle("uncertain");
+            timer = setTimeout(() => settle("uncertain"), 30_000);
+            timer.unref?.();
+          } catch {
+            if (id) confirmations.delete(id);
+            settle(dispatched ? "uncertain" : "refused");
+          }
+        });
+      };
+
+      running.set(threadId, { turnId, abort, steer, steerPrepared, broker, cleanup: () => {
         // Disposal's instance-wide helper may have forgotten this leader
         // after its exit. Its resistant owned helpers still need escalation.
         if (!owner.confirmed) signalGroup(child, "SIGKILL");
@@ -1456,6 +1545,37 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const initialize = { type: "control_request", request_id: initializeId, request: { subtype: "initialize" } };
       child.stdin.write(JSON.stringify(initialize) + "\n");
       appendNative(threadId, { dir: "out", source: "claude.sdk.message", msg: initialize });
+      const sendInitial = (baseWords: string) => {
+        // Older or unknown CLIs cannot identify accepted inputs. Keep their
+        // existing running-turn steering, and leave preparation additions
+        // for the normal next-turn queue instead of guessing delivery.
+        if (!attributedPreparation) turn.preparation?.unavailable();
+        const prepared = attributedPreparation ? turn.preparation?.freeze().commit() : undefined;
+        let inputId: string | null = null;
+        try {
+          const sent = say(prepared?.text ? `${baseWords}\n\n${prepared.text}` : baseWords, undefined, (id) => {
+            inputId = id;
+            if (!id || !prepared?.text) return;
+            let ended = false;
+            const timer = setTimeout(() => {
+              ended = true;
+              prepared.settle("uncertain");
+            }, 30_000);
+            timer.unref?.();
+            confirmations.set(id, {
+              accepted: () => { clearTimeout(timer); prepared.settle("accepted"); if (!ended) turn.preparation?.ready(turnId); },
+              ended: () => { clearTimeout(timer); if (!ended) prepared.settle("uncertain"); },
+            });
+          });
+          if (!sent) { prepared?.settle("refused"); turn.preparation?.unavailable(); return false; }
+          if (attributedPreparation && !prepared?.text) turn.preparation?.ready(turnId);
+          else if (prepared?.text && !inputId) prepared.settle("uncertain");
+          return true;
+        } catch (error) {
+          prepared?.settle("uncertain");
+          throw error;
+        }
+      };
       if (turn.person) {
         void (async () => {
           const end = Date.now() + 20_000;
@@ -1477,7 +1597,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             if (sealed || stopping) return;
             personReady = true;
-            if (!say(turn.text)) inputFailed();
+            if (!sendInitial(turn.text)) inputFailed();
           } catch (error) {
             if (sealed) return;
             sealed = true;
@@ -1485,7 +1605,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             finish(false, "person_guard");
           }
         })();
-      } else if (!say(words)) inputFailed();
+      } else if (!sendInitial(words)) inputFailed();
 
       return { turnId };
     };
@@ -1531,7 +1651,30 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       enabled: input.enabled,
       models: MODELS,
       snapshot,
-      planUsage: () => plan,
+      planUsage: (account = MAIN_ACCOUNT) => plans.get(account) ?? null,
+
+      // `claude auth status` answers in JSON, and exits 1 when signed out,
+      // so stdout is read before the error, as snapshot does above.
+      accountStatus: (dir: string) =>
+        new Promise((resolve) => {
+          execFile(config.cli, ["auth", "status"], { timeout: 8_000, windowsHide: true, env: accountEnvironment(dir) }, (_error, stdout) => {
+            try {
+              const said = JSON.parse(stdout) as { loggedIn?: unknown; email?: unknown };
+              if (typeof said.loggedIn === "boolean") {
+                return resolve({ signedIn: said.loggedIn, email: typeof said.email === "string" ? said.email.slice(0, 200) : null });
+              }
+            } catch {
+              /* not JSON: an older CLI, or one that died before printing */
+            }
+            resolve({ signedIn: null });
+          });
+        }),
+
+      accountSignOut: (dir: string) =>
+        new Promise<void>((resolve) => {
+          const child = execFile(config.cli, ["auth", "logout"], { timeout: 10_000, windowsHide: true, env: accountEnvironment(dir) }, () => resolve());
+          child.stdin?.end();
+        }),
 
       adapter: {
         provider: DRIVER_KIND,
@@ -1539,6 +1682,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         sendTurn,
 
         steerTurn: async (threadId, text, options) => running.get(threadId)?.steer(text, options?.onDispatch) ?? false,
+
+        steerPrepared: async (threadId, expectedTurnId, text, options) => {
+          const active = running.get(threadId);
+          return active && active.turnId === expectedTurnId ? active.steerPrepared(text, options) : "refused";
+        },
 
         interruptTurn: async (threadId) => running.get(threadId)?.abort(),
 

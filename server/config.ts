@@ -20,6 +20,7 @@ import type { InstanceConfigMap } from "./contracts.ts";
 import { usableSecrets } from "./env-names.ts";
 import { CUSTOM_SPEC, PROVIDER_SPECS, specFor } from "./providers.ts";
 import { CREDITS_KIND, CREDITS_SPEC, creditsCompatUrl, creditsEnvToken } from "./credits.ts";
+import { ENV_MODEL_ENDPOINT_ID, cloudOff, envModelEndpoint } from "./self-host.ts";
 
 /** One connected engine: the credential, plus an override for people
  * pointing at a proxy or a self-hosted endpoint. */
@@ -84,6 +85,13 @@ export interface AppConfig {
     /** A Chatterbox server on this computer or the local network. Not a
      * secret, and no key: it is the person's own machine. */
     chatterboxUrl?: string;
+    /** A Whisper server on this computer or the local network, for
+     * turning speech into text with no key and no account. */
+    whisperUrl?: string;
+    /** Who turns speech into text for calls, meeting notes and voice
+     * messages: "auto", "whisper", "elevenlabs", "openai" or "mac"
+     * (server/speech.ts hearer). Unset is automatic. */
+    hearing?: string;
     /** The user's explicit yes to using a key discovered in the
      * environment or Codex's auth file for voice billing. */
     useDiscoveredOpenAI?: boolean;
@@ -536,6 +544,8 @@ const BUILT_IN_CLI_INSTANCES: InstanceConfigMap = {
   codex: { driver: "codex" },
   gemini_cli: { driver: "geminiCli" },
   opencode: { driver: "opencode" },
+  commandcode: { driver: "commandcode" },
+  devin: { driver: "devin" },
   grok_cli: { driver: "grokCli" },
   cursor: { driver: "cursor" },
   cline: { driver: "cline" },
@@ -556,7 +566,10 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   // probes.
   for (const [id, entry] of Object.entries(BUILT_IN_CLI_INSTANCES)) {
     if (Object.values(map).some((e) => e.driver === entry.driver)) continue;
-    map[id] = { ...entry };
+    // A person's instance may already have the new engine's default id.
+    let freeId = id;
+    for (let suffix = 2; Object.hasOwn(map, freeId); suffix++) freeId = `${id}_${suffix}`;
+    map[freeId] = { ...entry };
   }
   // A connected provider that is not already spelled out in `instances`
   // gets the obvious one: instance id = driver kind.
@@ -582,6 +595,19 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
       displayName: endpoint.name,
       config: { url: endpoint.url, ...(endpoint.tools === true ? { tools: true } : {}), ...(endpoint.vision === true ? { vision: true } : {}) },
       environment: { [envVarFor(CUSTOM_SPEC.kind)]: cred.key },
+    };
+  }
+  // A model server named where Bloks runs (server/self-host.ts), the same
+  // engine as a custom host, from the environment each start rather than
+  // from this file.
+  const fromEnv = envModelEndpoint();
+  const envId = customInstanceId(ENV_MODEL_ENDPOINT_ID);
+  if (fromEnv && !map[envId]) {
+    map[envId] = {
+      driver: CUSTOM_SPEC.kind,
+      displayName: fromEnv.name,
+      config: { url: fromEnv.url, ...(fromEnv.tools ? { tools: true } : {}), ...(fromEnv.vision ? { vision: true } : {}) },
+      environment: { [envVarFor(CUSTOM_SPEC.kind)]: fromEnv.key },
     };
   }
   // The Bloks engine, while a Cloud licence is active or this host was
@@ -633,5 +659,8 @@ export function activeCustomKey(endpoint: CustomEndpoint): CustomKey | undefined
  * relay's space tokens are how this machine knows one was activated), or
  * a credits token this host was started with. */
 export function creditsOffered(cfg: AppConfig): boolean {
+  // a service of bloks.dev's, so never with Bloks Cloud off where this
+  // runs (server/self-host.ts)
+  if (cloudOff()) return false;
   return Boolean(creditsEnvToken()) || Boolean(cfg.relay?.enabled && cfg.relay.agentToken);
 }
