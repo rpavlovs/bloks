@@ -81,6 +81,10 @@ export interface OptionCardData {
    * card stays in the conversation, where one only hidden read as a
    * question that was never asked. */
   closed?: string;
+  /** The agent that asked withdrew the question, the person having
+   * settled it some other way. `closed` says so in English; the app says
+   * it in the reader's language. */
+  withdrawn?: boolean;
   /** Present when an agent proposed an app watcher (server/app-watch.ts):
    * what it would watch and who would act where, for the person to start
    * or not. Answered through the watcher's own routes, never as a reply. */
@@ -105,6 +109,10 @@ export interface OptionCardData {
    * (server/settings-proposals.ts): answered through its own route, never
    * as a reply, and applied only on the person's Change. */
   settingsProposal?: import("./settings-proposals.ts").ProposalCard;
+  /** Present when an agent asked to add a new skill to the library and
+   * use it (server/skill-requests.ts): answered through its own route,
+   * and added only on the person's Add. */
+  skillRequest?: import("./skill-requests.ts").SkillRequestCard;
   /** Present when a lead has proposed hiring a team (server/teams.ts). */
   team?: {
     room: string;
@@ -167,7 +175,9 @@ export interface Message {
   afterAgent?: { peerId: string; peerName: string };
   /** Set on a room message that was said in the room's linked chat
    * channel, so the bridge does not say it there a second time. */
-  via?: "slack" | "discord" | "whatsapp" | "signal" | "watcher" | "email" | "webhook" | "routine" | "goal" | "intent" | "incident";
+  via?: "slack" | "discord" | "whatsapp" | "signal" | "watcher" | "email" | "webhook" | "routine" | "goal" | "intent" | "incident" | "service";
+  /** Created only by strict trusted-host wake ingress. Never from client input. */
+  serviceWake?: import("./service-wakes.ts").ServiceWake;
   /** Posted by a standing intent (server/intents.ts): a note in its own
    * words, or the line saying it brought an agent in. Never matched by
    * an intent, its own or another's. */
@@ -308,6 +318,15 @@ export interface Message {
    * that turn, the turn was stopped for it, or it waited (server/delivery.ts).
    * Absent on a message that started a turn of its own. */
   delivery?: import("./delivery.ts").Delivery;
+  /** One preparation-bound input. The message remains the authority for
+   * its words and sender; this records only its delivery state and source. */
+  preparation?: {
+    attempt: string;
+    state: "pending" | "dispatching" | "joined" | "next" | "uncertain" | "not-sent";
+    /** Dismissed from waiting, while its unknown input remains excluded from replay. */
+    dismissed?: boolean;
+    source?: { chatId: number; senderId: number; messageId: number; topicId?: number; generation: string };
+  };
   /** Who a room's Auto sent a message that named nobody to, and why, or
    * that the lead took it instead (server/room-route.ts). On the
    * person's own message, and drawn as the quiet line above the reply. */
@@ -437,6 +456,12 @@ export interface TaskRecord {
    * see moveTaskCwd). null means "the default", a cloud run, or the
    * workspace. */
   cwd?: string | null;
+  /** A member's private conversation that works, by default, at that
+   * member's own desk with the agent (server/workspace.ts personDeskDir).
+   * One made before desks existed had its session in the agent's own
+   * workspace, and starts a new one at the desk once, the first turn
+   * after; this marks that done. */
+  desk?: true;
   /** Where this lane's session lives when its agent works elsewhere:
    * the place and its folder (laneWhere in server/workplace.ts). Absent
    * is this computer. A session there is not one here, so a lane whose
@@ -479,6 +504,13 @@ export interface TaskRecord {
   /** Per-engine conversation cursors, one set per lane so parallel
    * lanes never share a session. */
   resumeCursors: Record<string, unknown>;
+  /** The account each engine's session in this lane was made on, by
+   * instance id, for an engine with more than one account
+   * (server/engine-accounts.ts). Absent is the engine's own sign-in, which
+   * is every session from before there were accounts. A session lives in
+   * its account's folder, so a lane whose account changes starts a new
+   * one (moveTaskAccount). Never shipped to clients. */
+  sessionAccounts?: Record<string, string>;
   /** A person used a separate session. The next owner turn receives the
    * bounded conversation so it learns that exchange without resuming it. */
   telegramExchangePending?: boolean;
@@ -786,6 +818,8 @@ const DEFAULT_GREETING = "I'm ready. Tell me what you need and I'll get to work.
 export class Store {
   bots: BotRecord[] = [];
   private messages = new Map<string, Message[]>();
+  /** A lane's Telegram preparation sources, built once when first needed. */
+  private preparationSources = new Map<string, Set<string>>();
   private defaultSelection: () => ModelSelection;
   /** Told about every message as it is written. Messages arrive through
    * forty-odd doors, and something that cares about all of them (who the
@@ -852,6 +886,26 @@ export class Store {
     return list!;
   }
 
+  private preparationSourceKey(message: Message): string | undefined {
+    const source = message.preparation?.source;
+    if (!source) return undefined;
+    const requester = message.telegramPerson?.requester ?? message.telegramGroup?.requester ??
+      (message.telegramDelegate ? `delegate:${message.telegramDelegate.requester}` : "owner");
+    return JSON.stringify([requester, source.generation, source.chatId, source.senderId, source.messageId, source.topicId ?? null]);
+  }
+
+  hasPreparationSource(threadId: string, source: NonNullable<NonNullable<Message["preparation"]>["source"]>, requester: string): boolean {
+    let keys = this.preparationSources.get(threadId);
+    if (!keys) {
+      keys = new Set(this.messagesFor(threadId).flatMap((message) => {
+        const key = this.preparationSourceKey(message);
+        return key ? [key] : [];
+      }));
+      this.preparationSources.set(threadId, keys);
+    }
+    return keys.has(JSON.stringify([requester, source.generation, source.chatId, source.senderId, source.messageId, source.topicId ?? null]));
+  }
+
   /** Transcripts changed by a row that could wait (save, `soon`). */
   private waiting = new Set<string>();
   private waitingWrite: ReturnType<typeof setTimeout> | null = null;
@@ -872,8 +926,8 @@ export class Store {
    * take-back reports a failed one, a Telegram reply is marked sending
    * before it goes).
    */
-  private save(threadId: string, list: Message[], soon = false) {
-    if (soon) {
+  private save(threadId: string, list: Message[], soon = false, durable = false) {
+    if (soon && !durable) {
       this.waiting.add(threadId);
       unwritten.add(this);
       if (!this.waitingWrite) {
@@ -882,7 +936,9 @@ export class Store {
       }
       return;
     }
-    writeWhole(messagesFile(threadId), JSON.stringify(list, null, 2));
+    const text = JSON.stringify(list, null, 2);
+    if (durable) writeFileAtomic(messagesFile(threadId), text);
+    else writeWhole(messagesFile(threadId), text);
     // written whole, so whatever was waiting in it is written too
     this.waiting.delete(threadId);
   }
@@ -907,12 +963,15 @@ export class Store {
   appendMessage(
     threadId: string,
     message: Omit<Message, "id" | "at"> & { at?: number },
-    { soon = false }: { soon?: boolean } = {},
+    { soon = false, durable = false }: { soon?: boolean; durable?: boolean } = {},
   ): Message {
     const full: Message = { id: newId(), at: Date.now(), ...message };
     const list = this.messagesFor(threadId);
     list.push(full);
-    this.save(threadId, list, soon);
+    try { this.save(threadId, list, soon, durable); }
+    catch (error) { list.pop(); throw error; }
+    const key = this.preparationSourceKey(full);
+    if (key) this.preparationSources.get(threadId)?.add(key);
     this.onAppend?.(threadId, full);
     return full;
   }
@@ -948,7 +1007,7 @@ export class Store {
     return patched ? { message: patched, added: !had } : null;
   }
 
-  patchMessage(threadId: string, messageId: string, patch: Partial<Message>, { soon = false }: { soon?: boolean } = {}): Message | null {
+  patchMessage(threadId: string, messageId: string, patch: Partial<Message>, { soon = false, durable = false }: { soon?: boolean; durable?: boolean } = {}): Message | null {
     const list = this.messagesFor(threadId);
     const idx = list.findIndex((m) => m.id === messageId);
     if (idx === -1) return null;
@@ -957,9 +1016,11 @@ export class Store {
     // But a patch that says `card: undefined` means it, which is how a
     // message taken back stops being answerable. `??` could not tell the
     // two apart, so it kept the card on every deletion.
-    const card = "card" in patch ? patch.card : list[idx].card;
-    list[idx] = { ...list[idx], ...patch, card };
-    this.save(threadId, list, soon);
+    const before = list[idx];
+    const card = "card" in patch ? patch.card : before.card;
+    list[idx] = { ...before, ...patch, card };
+    try { this.save(threadId, list, soon, durable); }
+    catch (error) { if (durable) list[idx] = before; throw error; }
     this.onRewrite?.(threadId, [list[idx]]);
     return list[idx];
   }
@@ -972,8 +1033,9 @@ export class Store {
    * is the order the agent heard things in (GitHub 170). Ids stay as
    * they are, so a reply, an edit or a deletion still finds the message.
    */
-  moveToEnd(threadId: string, messageIds: readonly string[], patch: (m: Message) => Partial<Message>): Message[] {
+  moveToEnd(threadId: string, messageIds: readonly string[], patch: (m: Message) => Partial<Message>, { durable = false }: { durable?: boolean } = {}): Message[] {
     const list = this.messagesFor(threadId);
+    const before = durable ? [...list] : [];
     const moved: Message[] = [];
     for (const id of messageIds) {
       const idx = list.findIndex((m) => m.id === id);
@@ -983,23 +1045,26 @@ export class Store {
     }
     if (!moved.length) return [];
     list.push(...moved);
-    this.save(threadId, list);
+    try { this.save(threadId, list, false, durable); }
+    catch (error) { if (durable) list.splice(0, list.length, ...before); throw error; }
     this.onRewrite?.(threadId, moved);
     return moved;
   }
 
   /** Several request markers change together, without moving their
    * transcript positions. A crash cannot leave half a burst claimed. */
-  patchMessages(threadId: string, messageIds: readonly string[], patch: (m: Message) => Partial<Message>): Message[] {
+  patchMessages(threadId: string, messageIds: readonly string[], patch: (m: Message) => Partial<Message>, { durable = false }: { durable?: boolean } = {}): Message[] {
     const ids = new Set(messageIds);
     const changed: Message[] = [];
     const list = this.messagesFor(threadId);
+    const before = durable ? [...list] : [];
     for (let i = 0; i < list.length; i++) if (ids.has(list[i].id)) {
       list[i] = { ...list[i], ...patch(list[i]) };
       changed.push(list[i]);
     }
     if (changed.length) {
-      this.save(threadId, list);
+      try { this.save(threadId, list, false, durable); }
+      catch (error) { if (durable) list.splice(0, list.length, ...before); throw error; }
       this.onRewrite?.(threadId, changed);
     }
     return changed;
@@ -1225,8 +1290,17 @@ export class Store {
       createdAt: Date.now(),
       imported: input.imported,
     };
-    const list: Message[] = input.messages.map((message) => ({ ...message, id: newId() }));
+    const list: Message[] = input.messages.map(({ serviceWake, ...message }) => ({
+      ...message,
+      // An import is historical text, never a local-service admission or
+      // authority to recover one. A copied waiting row must not become
+      // an ordinary personal queue item after its provenance is removed.
+      ...(serviceWake || message.via === "service" ? { queued: undefined, queuedAt: undefined, waitsFor: undefined, waitsUntil: undefined } : {}),
+      ...(message.via === "service" ? { via: undefined } : {}),
+      id: newId(),
+    }));
     this.messages.set(task.id, list);
+    this.preparationSources.delete(task.id);
     this.save(task.id, list);
     bot.tasks.push(task);
     if (input.activate) {
@@ -1295,7 +1369,7 @@ export class Store {
     if (!bot) return null;
     const found = bot.tasks.find((t) => t.personId === personId);
     if (found) return found;
-    const task: TaskRecord = { id: newId(), title: "Private", resumeCursors: {}, createdAt: Date.now(), personId };
+    const task: TaskRecord = { id: newId(), title: "Private", resumeCursors: {}, createdAt: Date.now(), personId, desk: true };
     bot.tasks.push(task);
     this.saveBots();
     return task;
@@ -1370,6 +1444,7 @@ export class Store {
 
   private dropTranscript(taskId: string) {
     this.messages.delete(taskId);
+    this.preparationSources.delete(taskId);
     this.waiting.delete(taskId);
     try {
       unlinkSync(messagesFile(taskId));
@@ -1490,6 +1565,14 @@ export class Store {
     this.saveBots();
   }
 
+  /** A member's private conversation now works at their own desk. */
+  markDesk(threadId: string) {
+    const found = this.taskByThread(threadId);
+    if (!found || found.task.desk) return;
+    found.task.desk = true;
+    this.saveBots();
+  }
+
   /** The lane's agent works somewhere else now (or here again): the
    * session it had lives where it was, so it starts a new one where the
    * agent is, as moveTaskCwd does for a folder. */
@@ -1503,6 +1586,38 @@ export class Store {
     delete found.task.reading;
     delete found.task.pendingCompaction;
     this.saveBots();
+  }
+
+  /**
+   * The account this lane's turns on an engine run on now
+   * (server/engine-accounts.ts). The engine keeps a session in the
+   * folder of the account that made it, so a session from another
+   * account cannot be resumed: its cursor goes, and, marked as served by
+   * no engine in particular, the next turn is told the conversation so
+   * far, as after a move to another folder. Only that engine's session
+   * goes; another engine's, in its own folder, is untouched. True when a
+   * session was left behind, which the chat then says.
+   */
+  moveTaskAccount(threadId: string, instanceId: string, accountId: string, main: string): boolean {
+    const found = this.taskByThread(threadId);
+    if (!found) return false;
+    const task = found.task;
+    const was = task.sessionAccounts?.[instanceId] ?? main;
+    if (was === accountId) return false;
+    const accounts = { ...task.sessionAccounts };
+    if (accountId === main) delete accounts[instanceId];
+    else accounts[instanceId] = accountId;
+    if (Object.keys(accounts).length) task.sessionAccounts = accounts;
+    else delete task.sessionAccounts;
+    const left = typeof task.resumeCursors[instanceId] === "string";
+    if (left) {
+      delete task.resumeCursors[instanceId];
+      task.lastInstanceId = "";
+      if (task.reading?.instanceId === instanceId) delete task.reading;
+      if (task.pendingCompaction?.instanceId === instanceId) delete task.pendingCompaction;
+    }
+    this.saveBots();
+    return left;
   }
 
   /** A new engine session on the lane's next turn, without the old one's

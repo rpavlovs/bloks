@@ -36,8 +36,10 @@ import type {
 import { newEventId, newId } from "../contracts.ts";
 import { knownEfforts, type Effort } from "../effort.ts";
 import { codexPlanUsage } from "../plan-usage.ts";
+import { MAIN_ACCOUNT } from "../engine-accounts.ts";
 import { callSignature } from "../repeats.ts";
 import { appendNative } from "./native.ts";
+import { installCommand } from "../engine-commands.ts";
 import { describeEarlyExit, describeSpawnError } from "./spawn-error.ts";
 import { within } from "./deadline.ts";
 import { OWN_GROUP } from "../no-console.ts";
@@ -49,6 +51,15 @@ import { checkCodexReplyEndpoint, makeCodexReplyFolder } from "../person-turn.ts
 import { isConnectionEnvName } from "../connections.ts";
 
 const DRIVER_KIND = "codex";
+
+/** The environment Codex's own commands about a sign-in run in: this
+ * machine's, pointed at an added account's home, with no key that would
+ * answer for it instead. */
+function accountEnvironment(dir: string): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env, CODEX_HOME: dir };
+  delete env.OPENAI_API_KEY;
+  return env;
+}
 const NATIVE_SOURCE = "codex.app-server";
 
 /** What the picker shows until the CLI says what it serves. The installed
@@ -656,7 +667,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       turnId: string;
       abort: () => void;
       /** More words for this turn; false when Codex would not take them. */
-      steer: (text: string, options?: { skillNames?: string[]; onAccepted?: (turnId: string) => void; onDispatch?: () => void }) => Promise<boolean>;
+      steer: (text: string, options?: { skillNames?: string[]; onAccepted?: (turnId: string) => void; onDispatch?: () => void; strictRefusal?: boolean }) => Promise<boolean>;
       asks: Map<string, Answer>;
     }
     const running = new Map<string, RunningTurn>();
@@ -696,8 +707,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     };
     // What the plan signed in here has left, as Codex last said, for the
     // composer's card (server/plan-usage.ts). The limits belong to the
-    // account, so one for the instance, whichever turn heard it.
-    let plan: PlanUsage | null = null;
+    // account, so one per account, whichever turn on it heard it: the main
+    // sign-in's under MAIN_ACCOUNT, an added account's under its id.
+    const plans = new Map<string, PlanUsage>();
 
     const emit = (event: RuntimeEvent) => {
       for (const listener of [...listeners]) listener(event);
@@ -739,6 +751,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // The CLI holds its own ChatGPT login. An inherited API key would
       // silently move the user onto pay-as-you-go billing.
       delete env.OPENAI_API_KEY;
+      // Another of the person's accounts (server/engine-accounts.ts): Codex
+      // reads its sign-in from that account's own home. Set after the
+      // turn's environment, so nothing in it can point Codex elsewhere.
+      if (turn.account) env.CODEX_HOME = turn.account.dir;
       // This turn's credential, kept out of everything written down: the
       // native copy (appendNative takes it out), and any error that quotes
       // back the thread config carrying it (shellConfig). The agent's MCP
@@ -1268,7 +1284,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
 
           case "account/rateLimits/updated": {
             // about the account, not this thread, so nothing is elsewhere
-            plan = codexPlanUsage(params.rateLimits) ?? plan;
+            const heard = codexPlanUsage(params.rateLimits);
+            if (heard) plans.set(turn.account?.id ?? MAIN_ACCOUNT, heard);
             break;
           }
 
@@ -1337,7 +1354,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           message: describeSpawnError(error, {
             name: "Codex",
             command: config.cli,
-            install: "npm i -g --prefix ~/.local @openai/codex",
+            install: installCommand("codex"),
             signIn: "run `codex login`",
           }),
         });
@@ -1355,22 +1372,27 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         finish(false, "exit_before_result");
       });
 
-      const selectedSkills = async (names?: string[]): Promise<CodexSkill[]> => {
-        if (!names?.length) return [];
+      const skillCatalog = async (): Promise<CodexSkill[]> => {
         try {
           const cwd = turn.cwd ?? homedir();
-          const listed = readCodexSkills(await within(rpc.request("skills/list", { cwds: [cwd], forceReload: true }), "listing skills", "Codex", PROBE_TIMEOUT_MS), cwd) ?? [];
-          return [...new Set(names)].filter((name) => !skillNamesSent.has(name)).flatMap((name) => listed.find((skill) => skill.name === name) ?? []).slice(0, Math.max(0, MAX_CODEX_SKILL_ITEMS - skillNamesSent.size));
+          return readCodexSkills(await within(rpc.request("skills/list", { cwds: [cwd], forceReload: true }), "listing skills", "Codex", PROBE_TIMEOUT_MS), cwd) ?? [];
         } catch {
           // The unchanged dollar words remain Codex's own fallback.
           return [];
         }
       };
+      const chooseSkills = (names: string[], listed: CodexSkill[]) =>
+        [...new Set(names)].filter((name) => !skillNamesSent.has(name)).flatMap((name) => listed.find((skill) => skill.name === name) ?? []).slice(0, Math.max(0, MAX_CODEX_SKILL_ITEMS - skillNamesSent.size));
+      const selectedSkills = async (names?: string[]): Promise<CodexSkill[]> =>
+        names?.length ? chooseSkills(names, await skillCatalog()) : [];
+      const steerRefused = (error: unknown) => error instanceof RpcResponseError && error.code === -32600 &&
+        (error.message === "no active turn to steer" || error.message === "cannot steer a compact turn" ||
+          error.message === "cannot steer a review turn" || /^expected active turn id `[^`]+` but found `[^`]+`$/.test(error.message));
       // Codex checks expectedTurnId against the turn it is running and
       // refuses the call if that turn has ended, so a refusal means the
       // words were not taken and can go to the next turn instead.
       const canSteer = () => Boolean(!finished && !compacting && codexThread && codexTurn && ![...compactionStarts.keys()].some((key) => requestedCompaction === null || !key.startsWith(`${requestedCompaction}\0`)));
-      const steer = async (text: string, options?: { skillNames?: string[]; onAccepted?: (turnId: string) => void; onDispatch?: () => void }) => {
+      const steer = async (text: string, options?: { skillNames?: string[]; onAccepted?: (turnId: string) => void; onDispatch?: () => void; strictRefusal?: boolean }) => {
         // during a compaction the turn running is the compaction's
         if (!canSteer()) return false;
         const skills = await selectedSkills(options?.skillNames);
@@ -1385,12 +1407,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           return true;
         } catch (error) {
           for (const skill of skills) skillNamesSent.delete(skill.name);
-          // An error reply is Codex answering no: the turn it names has
-          // ended, so the words were not taken and wait for the next one,
-          // reserved report or not. Anything else (the pipe closing, the
-          // turn torn down while we waited) leaves it unknown whether the
-          // words arrived, and a reserved report must not go twice.
-          if (options?.onDispatch && !(error instanceof RpcResponseError)) throw error;
+          // A preparation input falls back only on the protocol's named
+          // not-submitted errors. An internal error after dispatch leaves
+          // its outcome unknown. Preserve the existing reserved-report path.
+          if (options?.onDispatch && (!(error instanceof RpcResponseError) || (options.strictRefusal && !steerRefused(error)))) throw error;
           return false;
         }
       };
@@ -1703,9 +1723,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           turnSent = true;
           // A cursor that did not lead back to its thread is a new thread
           // after all, and is told the story rather than only the words.
-          const words = cursor && !carriedOn && turn.handoff ? turn.handoff : turn.text;
-          const skills = await selectedSkills(turn.skillNames);
+          const frozen = turn.preparation?.freeze();
+          const listed = turn.skillNames?.length || frozen?.hasInputs ? await skillCatalog() : [];
           if (finished) return;
+          const prepared = frozen?.commit();
+          const baseWords = cursor && !carriedOn && turn.handoff ? turn.handoff : turn.text;
+          const words = prepared?.text ? `${baseWords}\n\n${prepared.text}` : baseWords;
+          const skills = chooseSkills([...(turn.skillNames ?? []), ...(prepared?.skillNames ?? [])], listed);
           for (const skill of skills) skillNamesSent.add(skill.name);
           const turnParams: Record<string, unknown> = {
             threadId: codexThread,
@@ -1719,15 +1743,28 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           if (turn.effort) turnParams.effort = turn.effort;
           let begun: any;
           try {
-            begun = await within(rpc.request("turn/start", turnParams), "starting the turn", "Codex");
+            try {
+              begun = await within(rpc.request("turn/start", turnParams), "starting the turn", "Codex");
+            } catch (error) {
+              // Only an explicit rejection proves that the first attempt
+              // did not take the words before retrying without effort.
+              if (!(error instanceof RpcResponseError) || finished || stopping || !turn.effort || !/effort|unknown field/i.test(String((error as Error)?.message ?? ""))) throw error;
+              delete turnParams.effort;
+              begun = await within(rpc.request("turn/start", turnParams), "starting the turn", "Codex");
+            }
+            const id = begun?.turn?.id;
+            if (typeof id === "string" && id && (!codexTurn || codexTurn === id)) {
+              codexTurn = id;
+              prepared?.settle("accepted");
+              turn.preparation?.ready(turnId);
+            } else {
+              prepared?.settle("uncertain");
+              turn.preparation?.unavailable();
+            }
           } catch (error) {
-            // An older app-server refusing the field costs the preference,
-            // not the message. Other failures must not submit the words twice.
-            if (finished || stopping || !turn.effort || !/effort|unknown field/i.test(String((error as Error)?.message ?? ""))) throw error;
-            delete turnParams.effort;
-            begun = await within(rpc.request("turn/start", turnParams), "starting the turn", "Codex");
+            prepared?.settle(error instanceof RpcResponseError && error.code === -32602 ? "refused" : "uncertain");
+            throw error;
           }
-          if (typeof begun?.turn?.id === "string") codexTurn ??= begun.turn.id;
         } catch (error) {
           if (finished || stopping) return;
           // Fast refused before the words went in: the message is unsent,
@@ -1778,7 +1815,25 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       snapshot,
       catalogReady,
       skills,
-      planUsage: () => plan,
+      planUsage: (account = MAIN_ACCOUNT) => plans.get(account) ?? null,
+
+      // `codex login status` answers with its exit code, as in snapshot.
+      // A key in this machine's environment says nothing about an added
+      // account: turns never send it (OPENAI_API_KEY is taken out above).
+      accountStatus: (dir: string) =>
+        new Promise((resolve) => {
+          execFile(config.cli, ["login", "status"], { timeout: 8_000, windowsHide: true, env: accountEnvironment(dir) }, (error, stdout, stderr) => {
+            if (!error) return resolve({ signedIn: true });
+            if (/not logged in|logged out/i.test(`${stdout}\n${stderr}`)) return resolve({ signedIn: false });
+            resolve({ signedIn: existsSync(join(dir, "auth.json")) ? null : false });
+          });
+        }),
+
+      accountSignOut: (dir: string) =>
+        new Promise<void>((resolve) => {
+          const child = execFile(config.cli, ["logout"], { timeout: 10_000, windowsHide: true, env: accountEnvironment(dir) }, () => resolve());
+          child.stdin?.end();
+        }),
 
       adapter: {
         provider: DRIVER_KIND,
@@ -1786,6 +1841,23 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         sendTurn,
 
         steerTurn: async (threadId, text, options) => (await running.get(threadId)?.steer(text, options)) ?? false,
+
+        steerPrepared: async (threadId, expectedTurnId, text, options) => {
+          const active = running.get(threadId);
+          if (!active || active.turnId !== expectedTurnId) return "refused";
+          let dispatched = false, matched = false;
+          try {
+            const took = await active.steer(text, {
+              ...(options.skillNames?.length ? { skillNames: options.skillNames } : {}),
+              strictRefusal: true,
+              onDispatch: () => { options.onDispatch(); dispatched = true; },
+              onAccepted: (id) => { matched = id === expectedTurnId; },
+            });
+            return took ? matched ? "accepted" : "uncertain" : "refused";
+          } catch {
+            return dispatched ? "uncertain" : "refused";
+          }
+        },
 
         interruptTurn: async (threadId) => running.get(threadId)?.abort(),
 
@@ -1823,6 +1895,23 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             throw new Error("no such pending request");
           }
           answer(decision.behavior, decision.message);
+        },
+
+        // The agent taking back a question it asked without waiting, the
+        // person having settled it some other way. Only such a question,
+        // in the conversation that asked it: it is settled as withdrawn,
+        // with no answer, and the agent is told nothing.
+        withdrawAsk: (threadId, requestId) => {
+          const asked = asyncAsks.get(requestId);
+          if (!asked || asked.threadId !== threadId) return false;
+          asyncAsks.delete(requestId);
+          appendNative(threadId, {
+            dir: "out",
+            source: "bloks.approval",
+            msg: { stage: "resolved", requestId, method: "request_user_input_async", threadId, turnId: asked.turnId, behavior: "withdrawn", source: "agent" },
+          });
+          emit({ ...envelope(threadId, asked.turnId), type: "request.resolved", requestId, behavior: "withdrawn", source: "agent" });
+          return true;
         },
 
         hasSession: (threadId) => running.has(threadId),

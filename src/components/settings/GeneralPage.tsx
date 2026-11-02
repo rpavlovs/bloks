@@ -1,5 +1,6 @@
-// Settings, General: what you are called, how Bloks looks, and the one
-// shortcut that reaches it from anywhere.
+// Settings, General: what you are called, how Bloks looks, what its
+// window's close button does on Windows, and the one shortcut that
+// reaches it from anywhere.
 //
 // The person's own page, so it holds only what is theirs: their name,
 // the theme and the language (which follow them into every workspace),
@@ -22,6 +23,7 @@ import { SettingRow, SettingsGroup } from "../SettingsLayout";
 import { YourName } from "./YourName";
 import { LANGUAGES, isLanguage, t, type MessageKey } from "@/lib/i18n";
 import { chooseLanguage, systemLanguage, useLanguageChoice } from "@/lib/language";
+import { WebSignOutRow } from "../web/WebSignOut";
 
 const THEME_OPTIONS: Array<{ value: Theme; label: MessageKey; icon: React.ReactNode }> = [
   { value: "light", label: "generalPage.themeLight", icon: <Sun size={14} /> },
@@ -166,6 +168,8 @@ export function GeneralPage() {
     <>
       <SettingsGroup title={t("generalPage.you")}>
         <YourName />
+        {/* in a browser at a server's own address: who it is signed in as */}
+        <WebSignOutRow />
       </SettingsGroup>
       <SettingsGroup title={t("generalPage.appearance")}>
         <SettingRow
@@ -242,6 +246,24 @@ export function GeneralPage() {
           />
         )}
       </SettingsGroup>
+      {/* What the close button does, a choice only Windows has: the app
+          says whether there is one. A Mac keeps running with its window
+          closed anyway. */}
+      {window.bloks?.prefsTray && workspaces.available && typeof workspaces.tray === "boolean" && (
+        <SettingsGroup title={t("generalPage.window")}>
+          <SettingRow
+            label={t("generalPage.minimizeToTheSystemTray")}
+            description={t("generalPage.theCloseButtonHidesThe")}
+            control={
+              <Switch
+                aria-label={t("generalPage.minimizeToTheSystemTray")}
+                checked={workspaces.tray}
+                onCheckedChange={(on) => void window.bloks?.prefsTray?.(on)}
+              />
+            }
+          />
+        </SettingsGroup>
+      )}
       {window.bloks && (
         <SettingsGroup title={t("generalPage.shortcut")}>
           <QuickAskShortcut />

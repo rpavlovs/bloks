@@ -1,3 +1,4 @@
+import { dismissedPreparation } from "./preparation-state.ts";
 // Agents' runs, written out as data to train a model on.
 //
 // A person who has spent months with their agents has something a model
@@ -285,6 +286,8 @@ export function storedSecrets(cfg: Record<string, any>): string[] {
     cfg.home?.token,
     ...Object.values(isObject(cfg.providers) ? cfg.providers : {}).map((p: any) => p?.key),
     ...(Array.isArray(cfg.custom) ? cfg.custom : []).flatMap((endpoint: any) => (Array.isArray(endpoint?.keys) ? endpoint.keys.map((k: any) => k?.key) : [])),
+    // a model server's key given where Bloks runs, never in the file
+    process.env.BLOKS_MODEL_KEY?.trim(),
     ...Object.values(isObject(cfg.secrets) ? cfg.secrets : {}),
     ...(Array.isArray(cfg.connections) ? cfg.connections : []).map((c: any) => c?.token),
     cfg.credits?.licence,
@@ -357,7 +360,7 @@ export function diskSource(dataDir: string, home: string = homedir()): ExportSou
 export type Completeness = "complete" | "partial" | "missing" | "none";
 
 const ENGINE_NAMES = new Map<string, string>([...PROVIDER_SPECS, CREDITS_SPEC, ...CLI_PROVIDERS].map((spec) => [spec.kind, spec.name]));
-const ACP_KINDS = new Set(["opencode", "grokCli", "cursor", "cline", "geminiCli", "pi"]);
+const ACP_KINDS = new Set(["opencode", "commandcode", "devin", "grokCli", "cursor", "cline", "geminiCli", "pi"]);
 
 export function engineName(kind: string): string {
   return ENGINE_NAMES.get(kind) ?? kind;
@@ -794,7 +797,7 @@ const OWNER_EMOJI_DOWN = /^\u{1F44E}[\u{1F3FB}-\u{1F3FF}]?$/u;
 const OTHERS_VIA = new Set(["email", "whatsapp", "slack", "discord"]);
 
 /** Said to the agent and part of the conversation. */
-const said = (m: Message) => m.role === "user" && m.kind === "text" && !m.queued && !m.unsent;
+const said = (m: Message) => m.role === "user" && m.kind === "text" && !m.queued && !m.unsent && !dismissedPreparation(m);
 /** The owner's own words, typed here or from their own Telegram or Signal. */
 const ownWords = (m: Message) => said(m) && !m.agent && !m.via && !othersWords(m);
 function othersWords(m: Message): boolean {

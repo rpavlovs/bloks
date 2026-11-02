@@ -9,7 +9,7 @@
 // It reads its credential from the environment, which is where the turn
 // put it. Nothing is stored, nothing is cached, and there is no login: a
 // credential that outlives its turn would be a credential worth stealing.
-import { createReadStream, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
@@ -328,6 +328,25 @@ const COMMANDS = {
       return request("POST", `/api/bots/${encodeURIComponent(args[0])}/take-back`);
     },
   },
+  questions: {
+    use: "questions",
+    about: "the questions you asked without waiting that nobody has answered yet, with the id `unask` takes",
+    run: async () => {
+      const me = await request("GET", "/api/agent/whoami");
+      return (await request("GET", `/api/bots/${me.botId ?? me.id}/questions`)).questions;
+    },
+  },
+  unask: {
+    use: "unask <question-id>",
+    about:
+      "withdraw a question you asked without waiting, once the person has settled it some other way. Its card closes saying you withdrew it; no answer is given for them and no turn starts. " +
+      "An answer they gave first stands. Approvals and questions you waited on stay theirs to answer",
+    run: async (args) => {
+      if (args.length !== 1 || !args[0]) throw new Error("unask needs one question id, from `questions`");
+      const me = await request("GET", "/api/agent/whoami");
+      return request("DELETE", `/api/bots/${me.botId ?? me.id}/questions/${encodeURIComponent(args[0])}`);
+    },
+  },
   recall: {
     use: "recall <words…> | recall --id <message-id>",
     about: "look something up in your own past conversations: a decision, a name, a preference",
@@ -348,7 +367,9 @@ const COMMANDS = {
     use: 'watch --folder <path> | --page <url> | --feed <url> | --check "<command>" | --arrive <place> | --leave <place> --do "<what to do when it changes>" [--name <name>] [--every <minutes>] [--mentions <text>] [--radius <metres>] [--once] [--until <date and time>] [--thread <conversation>] [--rehearse]',
     about:
       "act when a folder, a web page or a feed changes, when a cheap check you wrote finds something, or when the person arrives at or leaves a place: " +
-      "--check runs a command every --every minutes without waking you; exit 0 means act (what it prints is passed on), exit 1 means nothing to do. " +
+      "--check runs a command every --every minutes without waking you. Its first run is a baseline and never acts; after that it acts only on a new finding, " +
+      "an exit 0 whose output differs from the last run's or that follows an exit 1 (what it prints is passed on). Exit 1 means nothing to do, and the same output again is not news, " +
+      "so a command that always exits 0 the same way (such as true) never acts. A watcher is not a timer: to be woken every so often, file a check-in with routine --every. " +
       "Unless you may run commands without asking, the person approves the command before it runs. " +
       '--arrive and --leave take a place as their iPhone names it ("Toronto", "Shinjuku, Tokyo") or as latitude,longitude with --radius in metres (500 unless said); ' +
       "it acts when their phone next says where they are, needs location sharing on there, and a place by coordinates needs Exact position on. " +
@@ -609,6 +630,42 @@ const COMMANDS = {
       return request("POST", `/api/bots/${me.botId ?? me.id}/notes`, { text });
     },
   },
+  todo: {
+    use: 'todo "<what the person has to do>" --key <name> [--detail "<why, in a line or two>"]',
+    about:
+      "put something the person has to do themselves on their list: one line of what to do, as they would write it (\"Replace the failing disk in the NAS\"), and a key that is your name for the thing. " +
+      "Their list waits for them in the morning brief and is counted there, and only they see it. Say it again with the same --key every time you report the same thing: it stays one line, with your newest words. " +
+      "Only what needs them to act; what is only for their information, or already recovered, stays in your answer. The answer says whether it was added, updated, reopened after they marked it done, or is one they dismissed",
+    run: async (args) => {
+      const flags = parseFlags(args);
+      const title = positional(args).join(" ").trim();
+      if (!title) throw new Error('todo needs what the person has to do, like todo "Renew the TLS certificate" --key tls-cert');
+      const me = await request("GET", "/api/agent/whoami");
+      return request("POST", `/api/bots/${me.botId ?? me.id}/todos`, {
+        title,
+        ...(flags.key && flags.key !== "true" ? { key: flags.key } : {}),
+        ...(flags.detail && flags.detail !== "true" ? { detail: flags.detail } : {}),
+      });
+    },
+  },
+  todos: {
+    use: "todos",
+    about: "what you put on the person's list, by key, and where each stands: open, done (they did it), dismissed (not for them) or cleared (by you)",
+    run: async () => {
+      const me = await request("GET", "/api/agent/whoami");
+      const { todos } = await request("GET", `/api/bots/${me.botId ?? me.id}/todos`);
+      return (todos ?? []).map((t) => ({ ...t, firstAt: localStamp(new Date(t.firstAt)), at: localStamp(new Date(t.at)), ...(t.closedAt ? { closedAt: localStamp(new Date(t.closedAt)) } : {}) }));
+    },
+  },
+  untodo: {
+    use: "untodo <key>",
+    about: "clear something you put on the person's list once it no longer needs doing: it was fixed, or it went away. Said again later, it is a new line",
+    run: async (args) => {
+      if (!args[0]) throw new Error("untodo needs the key you gave it, from `todos`");
+      const me = await request("GET", "/api/agent/whoami");
+      return request("DELETE", `/api/bots/${me.botId ?? me.id}/todos/${encodeURIComponent(args[0].toLowerCase())}`);
+    },
+  },
   "message-person": {
     use: 'message-person "<their name>" "<the message>"',
     about:
@@ -738,7 +795,7 @@ const COMMANDS = {
     about:
       "add a teammate to the workspace, optionally filed into a sidebar section, and pinned there " +
       "(--pin puts it after the pins already there; --at puts it at that place among them, 1 at the top). " +
-      "--effort is how hard it thinks: low, medium, high, xhigh or max, where the engine it starts on has that level; " +
+      "--effort is how hard it thinks: off, low, medium, high, xhigh or max, where the engine it starts on has that level; " +
       "left out, it starts on the workspace's default",
     run: (args) => {
       const flags = parseFlags(args);
@@ -838,6 +895,7 @@ const COMMANDS = {
     about:
       "file a routine for yourself: at a --time on --days (0 is Sunday, 6 is Saturday), once on --date to come back to something later, " +
       "or a check-in --every 15m to 24h, optionally --between two times. Leave out --days and it runs every day. " +
+      "A check-in is how you are woken every so often; a watcher acts only when what it watches changes. " +
       "A check-in's turn may answer QUIET when nothing needs the person, and then they are not told; --quiet lets a --time routine do the same. " +
       "The prompt can be up to 4,000 characters. " +
       "--in-brief sends what it reports to the person's morning brief, as a card there, instead of a notification of its own; use it for something they asked you to track every day. " +
@@ -1026,6 +1084,17 @@ const COMMANDS = {
       return request("POST", `/api/bots/${me.botId}/tasks/${me.taskId}/fresh`);
     },
   },
+  quiet: {
+    use: "quiet",
+    about:
+      "finish the turn you are in quietly, when nothing in it needs the person: it then ends without a message or a notification. " +
+      "Run it before writing any text, then end your turn. Bloks checks the turn and says whether it accepted: " +
+      "a refusal means answer substantively, never QUIET. If it fails without an answer, run it again; it is safe to repeat",
+    run: async () => {
+      const me = await request("GET", "/api/agent/whoami");
+      return request("POST", `/api/bots/${me.botId}/tasks/${me.taskId}/quiet`);
+    },
+  },
   summary: {
     use: "summary [--clear]",
     about:
@@ -1105,16 +1174,27 @@ const COMMANDS = {
   },
   skill: {
     use:
-      'skill <id> [--version <n>] | skill history <id> | skill diff <id> [--from <n>] [--to <n>] | skill revise <id> --from <version> --why "..." [--file <path>]',
+      'skill <id> [--version <n>] [--file <path> [--save <path>]] | skill history <id> | skill diff <id> [--from <n>] [--to <n>] | skill revise <id> --from <version> --why "..." [--file <path>] | ' +
+      'skill create [--from <folder> | --file <SKILL.md>] [--name "<name>"] [--description "<when to use it>"] [--id <id>] [--why "..."] [--no-attach] | skill request <request-id>',
     about:
-      "read one skill in full, with the version it is at (--version reads an earlier one). " +
+      "read one skill in full, with the version it is at (--version reads an earlier one) and the names of its supporting files; --file reads one of those, and --save writes it where you can run or use it. " +
       "history: who changed it, when and why, and how often each version was used. diff: what changed between two versions, by default the last change. " +
       "revise: propose new text for the skill, written against the version you read (--from), with one line on why. The text comes from --file, or from stdin. " +
-      "It waits for the person to keep, edit or dismiss, and is refused if the skill changed since you read it: read it again and write against the new version. A built-in skill is version 0",
+      "It waits for the person to keep, edit or dismiss, and is refused if the skill changed since you read it: read it again and write against the new version. A built-in skill is version 0. " +
+      "create: ask to add a new skill to the library and to use it yourself, when the person asks for one. --from takes a folder with a SKILL.md and its supporting files (references, scripts), " +
+      "--file a single SKILL.md, or pipe the instructions in. The person answers one card in the conversation that adds it and gives it to you; --no-attach only adds it. " +
+      "The answer has the skill's id and a status: waiting, added, declined or failed. An id already in the library is never written over: revise that skill, or choose another --id. " +
+      "Sending the same skill again finds the same card or the skill already added. request: wait for the answer to one you asked for",
     run: async (args) => {
       const flags = parseFlags(args);
       const [first, second] = positional(args);
       const at = (id) => `/api/skills/${encodeURIComponent(id)}`;
+      // a skill could be called "create", so the word is a subcommand only
+      // with the flags that say what to create
+      if (first === "create" && !second && ["from", "file", "name", "description", "id"].some((key) => flags[key] !== undefined)) {
+        return request("POST", "/api/agent/skills", await skillToCreate(flags));
+      }
+      if (first === "request" && second) return request("GET", `/api/agent/skills/${encodeURIComponent(second)}`);
       // a skill could be called "history", so the word is a subcommand
       // only when an id follows it
       if (first === "history" && second) return request("GET", `${at(second)}/history`);
@@ -1136,16 +1216,83 @@ const COMMANDS = {
         return request("POST", `${at(second)}/revisions`, { from: Number(flags.from), why: flags.why, body: text });
       }
       if (!first) throw new Error("skill needs an id, from `skills`");
+      if (flags.file !== undefined) {
+        if (flags.file === "true") throw new Error("--file needs the path of one of the skill's files, as `skill <id>` lists them");
+        const read = await request("GET", `${at(first)}/files?path=${encodeURIComponent(flags.file)}`);
+        if (flags.save === undefined) return read;
+        if (flags.save === "true") throw new Error("--save needs a path to write the file to");
+        const to = resolve(flags.save);
+        // a script stays runnable once saved
+        writeFileSync(to, read.text, { mode: read.text.startsWith("#!") ? 0o755 : 0o644 });
+        return { skill: read.skill, path: read.path, saved: to, bytes: Buffer.byteLength(read.text) };
+      }
       if (flags.version !== undefined && !/^\d+$/.test(flags.version)) throw new Error("--version is a number, as `skill history <id>` lists them");
       return request("GET", `${at(first)}${flags.version !== undefined ? `?version=${flags.version}` : ""}`);
     },
   },
 };
 
+/** Folders a skill's own files are never in: made by tools, not written. */
+const NOT_SKILL_FILES = new Set(["node_modules", "__pycache__", ".git", ".venv", "venv", "dist", "build"]);
+
+/**
+ * A new skill as `skill create` sends it: a SKILL.md and the files beside
+ * it, read as the agent, or the instructions alone from --file or stdin,
+ * with what the flags say on top. The workspace judges all of it again;
+ * this only reads, and says early what it cannot send.
+ */
+async function skillToCreate(flags) {
+  const body = {};
+  if (flags.from && flags.from !== "true") {
+    if (flags.file) throw new Error("create takes --from a folder or --file a SKILL.md, not both");
+    let root;
+    try {
+      root = realpathSync(resolve(flags.from));
+    } catch {
+      throw new Error(`there is no folder at ${resolve(flags.from)}`);
+    }
+    if (!statSync(root).isDirectory()) throw new Error("--from is a folder with a SKILL.md in it; for a single file use --file");
+    const files = [];
+    let entry = null;
+    const walk = (dir, prefix, depth) => {
+      for (const item of readdirSync(dir, { withFileTypes: true })) {
+        if (item.name.startsWith(".") || NOT_SKILL_FILES.has(item.name)) continue;
+        const rel = prefix ? `${prefix}/${item.name}` : item.name;
+        const full = join(dir, item.name);
+        if (item.isDirectory()) {
+          if (depth >= 4) throw new Error(`${rel} is more than four folders deep; a skill's files sit closer to its SKILL.md`);
+          walk(full, rel, depth + 1);
+          continue;
+        }
+        if (!item.isFile()) continue;
+        if (statSync(full).size > 128 * 1024) throw new Error(`${rel} is larger than the 128 KB one file of a skill may be`);
+        const text = readFileSync(full, "utf8");
+        if (text.includes("\u0000")) throw new Error(`${rel} is not text: a skill's files are plain text, never binaries`);
+        if (!prefix && item.name.toLowerCase() === "skill.md") entry = text;
+        else files.push({ path: rel, text });
+        if (files.length > 40) throw new Error("that folder has more than the 40 files a skill keeps");
+      }
+    };
+    walk(root, "", 1);
+    if (entry === null) throw new Error(`there is no SKILL.md in ${root}: it is the skill's instructions, and the rest are its files`);
+    body.skillMd = entry;
+    body.files = files;
+  } else {
+    body.skillMd = await revisionText(flags.file, "create needs the skill: --from a folder with a SKILL.md in it, --file a SKILL.md, or its instructions piped in");
+  }
+  for (const key of ["name", "description", "id", "why"]) {
+    if (flags[key] === undefined) continue;
+    if (flags[key] === "true") throw new Error(`--${key} needs a value`);
+    body[key] = flags[key];
+  }
+  if (flags["no-attach"] !== undefined) body.attach = false;
+  return body;
+}
+
 /** The new text of a skill: a file the agent names, read as the agent,
  * or what was piped in. Never a terminal waiting for typing, which would
  * hang the turn. */
-async function revisionText(file) {
+async function revisionText(file, missing = "revise needs the new text: pass --file <path>, or pipe it in") {
   if (file && file !== "true" && file !== "-") {
     const at = resolve(file);
     let real;
@@ -1161,13 +1308,13 @@ async function revisionText(file) {
     if (stat.size > 100_000) throw new Error("that file is too large to be a skill");
     return readFileSync(real, "utf8");
   }
-  if (process.stdin.isTTY) throw new Error("revise needs the new text: pass --file <path>, or pipe it in");
+  if (process.stdin.isTTY) throw new Error(missing);
   let text = "";
   for await (const chunk of process.stdin) {
     text += chunk;
     if (text.length > 100_000) throw new Error("that is too much text to be a skill");
   }
-  if (!text.trim()) throw new Error("revise needs the new text: pass --file <path>, or pipe it in");
+  if (!text.trim()) throw new Error(missing);
   return text;
 }
 

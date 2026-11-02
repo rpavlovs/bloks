@@ -39,6 +39,7 @@ import { basename } from "node:path";
 
 import { CLI_DRIVERS } from "./agent-cli.ts";
 import { ACP_SPECS } from "./drivers/acp.ts";
+import { installCommand } from "./engine-commands.ts";
 
 // ── the shape of a place ───────────────────────────────────────────────
 
@@ -366,6 +367,8 @@ const NEVER_SHIPPED = new Set([
   "GEMINI_API_KEY",
   "GOOGLE_API_KEY",
   "XAI_API_KEY",
+  "COMMAND_CODE_API_KEY",
+  "WINDSURF_API_KEY",
   "BLOKS_COMPOSIO_KEY",
   "BLOKS_COMPOSIO_URL",
   "BLOKS_BOX_TOKEN",
@@ -802,6 +805,8 @@ const SIGN_IN_COMMANDS: Record<string, string> = {
   geminiCli: "gemini",
   grokCli: "grok login",
   opencode: "opencode auth login",
+  commandcode: "command-code login",
+  devin: "devin auth login",
   pi: "pi",
   antigravity: "agy",
 };
@@ -826,10 +831,9 @@ export function signInThereCommand(place: Workplace, driverKind: string, command
  * same installers the app runs here (server/engine-setup.ts), each as a
  * single command a person can read. */
 export function installFor(driverKind: string): string | undefined {
-  if (driverKind === "claudeAgent") return "curl -fsSL https://claude.ai/install.sh | bash";
-  if (driverKind === "codex") return "npm i -g --prefix ~/.local @openai/codex";
-  if (driverKind === "antigravity") return "curl -fsSL https://antigravity.google/cli/install.sh | bash";
-  return ACP_SPECS.find((s) => s.kind === driverKind)?.install;
+  // the other side is reached with sh, so its line is the POSIX one
+  // whatever this computer is
+  return installCommand(driverKind, "linux") ?? ACP_SPECS.find((s) => s.kind === driverKind)?.install;
 }
 
 /** The install command for this engine, run there. */
