@@ -154,7 +154,7 @@ export const SETTINGS_PAGE_INDEX = [] = [
     label: "settingsPages.engines.label",
     description: "settingsPages.engines.description",
     keywords:
-      "engines models providers claude codex gemini grok cursor cline openai api key cli sign in bloks ai endpoints pause speed path",
+      "engines models providers claude codex gemini grok cursor cline commandcode command code devin openai api key cli sign in bloks ai endpoints pause speed path",
     keywordsKey: "settingsPages.engines.keywords",
     rows: [
       "settingsPages.engines.row.yourEngines",
@@ -227,13 +227,15 @@ export const SETTINGS_PAGE_INDEX = [] = [
     group: "agents",
     label: "settingsPages.voices.label",
     description: "settingsPages.voices.description",
-    keywords: "speech elevenlabs openai fish audio xai grok chatterbox local tts call audio",
+    keywords: "speech elevenlabs openai fish audio xai grok chatterbox local tts call audio hearing transcription whisper speech to text meeting microphone",
     keywordsKey: "settingsPages.voices.keywords",
     rows: [
       "settingsPages.voices.row.elevenlabsApiKey",
       "settingsPages.voices.row.openaiApiKey",
       "settingsPages.voices.row.fishAudioApiKey",
       "settingsPages.voices.row.xaiApiKey",
+      "settingsPages.voices.row.hearing",
+      "settingsPages.voices.row.whisperServer",
       "settingsPages.voices.row.chatterboxServer",
     ],
   },

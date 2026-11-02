@@ -32,14 +32,22 @@ day, with no key and nothing about you, to estimate what unpriced turns
 cost; and with a Bloks key, bloks.dev is asked, with that key, about your
 plan. Everything else on the wire is the engines (Claude Code, Codex and
 the rest), the voice vendors whose keys you save (the text being read
-aloud, to ElevenLabs, OpenAI, Fish Audio or xAI), and whatever connectors
+aloud, to ElevenLabs, OpenAI, Fish Audio or xAI; and what you say on a
+call or in meeting notes, as sound, a stretch at a time, to whichever
+of ElevenLabs or OpenAI hears for you, unless a Whisper server of your
+own or the Mac's on-device recognizer does), and whatever connectors
 you configure, talking to their own services (with an app watcher on,
 that includes a WebSocket to the realtime service Composio delivers
 events through), and Bloks Cloud when you turn it on, which carries
 sealed traffic it cannot read. A Chatterbox server for voices must be on
 this computer or its local network (a loopback, private or link-local
 address, or a local name): Bloks refuses an address on the internet,
-since every reply read aloud is sent there as text with no key. On a Mac
+since every reply read aloud is sent there as text with no key. A
+Whisper server for hearing has the same rule, for the same reason: what
+you say goes there as sound with no key. Recorded speech is held in
+memory for the one request that turns it into text and is never written
+to disk or logged; the page sends it to the workspace and never holds a
+vendor key, and an agent's token cannot use that route. On a Mac
 with phone access on, the desktop app
 also says on the local network where each listening workspace is (see
 Phones and other devices).
@@ -51,14 +59,44 @@ phone access for that workspace. But loopback alone is not a boundary. A browser
 happily send cross-origin requests to it from any page you visit, and a
 CORS "simple" request skips preflight entirely. So every request is
 checked: the `Origin` must be absent or loopback, and the `Host` must
-name the loopback interface, which defeats DNS rebinding. See
+name the loopback interface, which defeats DNS rebinding. A request
+that carries a proxy's forwarding header (`Forwarded`,
+`X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP` and the like) is
+never taken as local either, even from loopback: a reverse proxy or
+tunnel on the same machine connects from there for somebody on the
+internet, and NGINX by default rewrites `Host` to `127.0.0.1`. See
 `server/http-guard.ts`.
+
+**A local service's wake is labelled, not trusted as you.** A program on
+this computer can wake one agent in one exact private conversation
+(`POST /api/bots/:id/wakes`, `server/service-wakes.ts`). Only a direct
+loopback request with a loopback Host and no Origin or Authorization
+header is accepted, never a browser page, a phone, the relay or an
+agent's credential: no more than any local program could already do
+through the owner's API. Its words are kept as a local service's, which
+nobody can edit, and the agent is told they are that service's request,
+never your own words or your approval.
 
 **Secrets sit in a plaintext file.** Each workspace's `config.json`
 (`~/.bloks/config.json` for Personal) holds any API keys you paste,
 written `0600` inside a `0700` directory. That keeps
 other user accounts out, but it is not encrypted at rest. Moving these
 into the macOS Keychain is the top open item.
+
+**An engine's added accounts sign in on this computer, into folders of
+their own.** A second Claude Code or Codex account is signed in with the
+engine's own login, in Terminal, into a folder under the workspace's data
+folder (`engine-accounts/`, `0700`). The engine writes its credential
+there or in the macOS Keychain; Bloks never reads, copies, logs or sends
+it, and only points a turn's CLI at the folder. Only the person's setup
+(settings, instructions, skills, plugins) is linked in from the main
+sign-in's folder, never its credential or its sessions. The folders are
+left out of backups and workspace moves, and are never used for a turn
+that works in a container or on another machine. Only a window on this
+computer can add, sign in or remove an account; the owner's paired
+devices can see them and choose the one in use; an agent's token and a
+member get nothing. Removing one runs the engine's own sign-out, then
+deletes the folder.
 
 **Which program runs as an engine is the person's choice, on this
 computer.** An engine's CLI can be started from a path other than PATH's
@@ -89,6 +127,12 @@ Don't route around it. Engines reach Bloks over protocols that can carry
 a permission request (Claude Code and Codex natively, Gemini CLI over
 the Agent Client Protocol) precisely so this gate exists; a headless
 "approve everything" mode is not used.
+The one card an agent's credential may close is its own question asked
+without waiting (Codex's async question), which nothing is held on:
+`bloks unask` withdraws it, from that agent's own turn, with nothing
+answered for you. Approvals, questions it waits on, workflow gates and
+another agent's questions are refused, and an answer you gave first
+stands.
 
 **Scripts are the owner, and ask like the owner.** `bloks-server run`,
 `team apply` and `chat` ([docs/SCRIPTING.md](docs/SCRIPTING.md)) speak
@@ -111,6 +155,22 @@ conversation is on that list only as saying its first message, to the
 agent itself or one it may already message, and is refused wherever that
 message would be. An empty conversation, and which one you have open,
 stay yours.
+
+**An agent adds to your list, and only you close it.** A routine's report
+that finds something you have to do yourself goes on your list
+(`server/todos.ts`) through `bloks todo`, which is only on the agent's
+own full credential: never a member's or a member's own agent's, never
+a turn a Telegram person or an unlisted mail started, never a shared
+room's. An agent reads, refreshes and clears only lines it put there,
+by its own keys (`/api/bots/:me/todos`); the list as you see it and
+marking a line done or dismissed are yours (`/api/todos` is on the
+agents' never list, and a member's credential never reaches it). A line
+is plain text, a title and a detail with lengths capped, shown with the
+agent's name and a link to the conversation it came from; it runs
+nothing and opens nothing but that conversation. What an agent read can
+still steer what it writes there, as it can steer its answer, so treat
+a line as the agent's words. The morning notification says only how
+many things wait, never what they are.
 
 **An agent can point at a setting, and propose a few, never change one.**
 `bloks where` reads the app's own Settings index and `bloks open` puts a
@@ -195,7 +255,10 @@ instead (see People in your workspaces).
 
 - **A code exists only when you ask for one.** Phone access is off until
   somebody turns it on at the computer, and the workspace listens on the
-  network only after Bloks restarts with it on. A six digit code and its
+  network only after Bloks restarts with it on. It listens on IPv4 and
+  IPv6, and takes IPv6 connections only from local addresses (unique
+  local, such as Tailscale's, and link-local): a global IPv6 address,
+  often the open internet with nothing in front of it, is refused. A six digit code and its
   QR are made when somebody presses Pair a phone, and the routes that
   make or cancel one answer only on this computer and on your own paired
   devices, which are the only way in to a workspace on a server with no
@@ -207,6 +270,19 @@ instead (see People in your workspaces).
   phone access off and removing every device answer only on the computer,
   since from a device they would cut that device off too. The one other
   way a pairing is made is for a phone you already paired, below.
+- **A server reached your own way.** A `bloks-server` listens on
+  loopback and is reached through Bloks Cloud unless its owner says
+  otherwise where it runs (`server/self-host.ts`, docs/SELF_HOSTING.md):
+  `BLOKS_LISTEN=0.0.0.0` to listen beyond loopback (in a container,
+  behind its published port), `BLOKS_PUBLIC_URL` for the address of
+  their reverse proxy, tunnel or VPN that devices pair at, and
+  `BLOKS_CLOUD=off` to send nothing to Bloks Cloud or bloks.dev. None of
+  them can be set from a device, and none widens what a request gets:
+  anything that is not the server's own loopback needs a paired device's
+  token, and without one reaches `/api/health` and the pairing claim
+  alone. Its codes are the ones above, made only at the server or on a
+  device of yours, and handed out with the address in a link that
+  `bloks-server pair` prints at the server.
 - **Finding the computer again.** On a Mac, while phone access is on and
   the workspace listens on the network, the desktop app announces it on
   the local network as `_bloks._tcp` (`server/announce.ts`): the
@@ -229,6 +305,16 @@ instead (see People in your workspaces).
   may have five in ten minutes. The computer shows a notification each
   time one is made, whatever its notification settings, naming the phone
   and the workspace it asked from.
+- **A terminal from a device.** A terminal is a shell with the account
+  Bloks runs as, so on a computer running the desktop app it opens only
+  in that computer's own window, never from a paired device. A machine
+  nobody sits at is the exception, and only for its owner's own paired
+  devices (`server/deployment.ts`): a managed hosting machine always,
+  and a `bloks-server` of your own only when `BLOKS_OWNER_TERMINAL=1` is
+  set where it runs, which no device can switch on. Never a member's
+  device, a device nobody paired, or an agent's credential. A refused
+  device is told why. Through Bloks Cloud its live output is sealed for
+  the one device that follows it.
 - **Pictures of a screen.** While an agent works, its browser or cloud
   computer is pictured for the window and your phone, and a person can
   click, type, scroll and press keys in them from the chat or the phone;
@@ -345,9 +431,30 @@ behind it are built to be narrow.
 - **Their spending is capped by you.** Per member: a monthly limit on
   what your API keys cost, a share of Bloks AI, how many solo agents they
   may make and which engines those use.
+- **Their own agents are deleted, never read.** You and your admins see
+  the agents members made for themselves by name and maker
+  (`/api/workspace/member-agents`), and may delete one. Nothing of what
+  was said to it crosses that route either way: deleting it deletes its
+  conversations unread, and the record names who deleted it and whose
+  it was.
 - **Private means private.** A member's one to one with an agent is
   theirs. You can turn on reading members' private conversations for the
-  workspace, and every member is told which way it is set.
+  workspace, and every member is told which way it is set. Past the
+  transcript too: the agent keeps a memory of that member's own there and
+  works in a folder of theirs, what it looks back on is only what that
+  member could already read, and your own conversations, search and
+  recall never reach a member's private words (only reading them, when
+  you turn it on). On Claude Code a member's private turn may not read
+  or change any agent's own folder or anybody else's, even with a yes.
+- **Each member's apps and keys are theirs.** A member's own Composio
+  key and keys are kept apart from yours and from each other's
+  (`people/<id>/own.json`, 0600), are never shown back to anybody, and
+  are used only by a turn that member asked for in their own private
+  conversation or solo agent: never a team conversation, a room, your
+  turns or another member's. Who asked is the turn's own record, never a
+  name in the words. Removing a member removes them. In that turn a
+  request for a key or an app asks the member, never you, so nothing
+  lands in your keys or signs in under your account.
 - **A room's Auto reads the room as data.** In a room set to Auto, a
   message that names nobody is shown to a small model, with the members'
   names, roles and briefs and the last few lines, so it can pick who
@@ -367,6 +474,48 @@ Who sees what is decided in one file, `server/access.ts`, as plain
 functions a test can walk. Workspaces never share a folder, so an agent
 in one cannot read another's memory, and the safety floor keeps agents
 out of every workspace's folder, not only their own's.
+
+## A server opened in a browser, with your identity provider
+
+`bloks-server` can also answer browsers at an address of your own
+(`BLOKS_WEB_URL`), signed in with an OpenID Connect provider you run or
+use (`server/web-door.ts`, `server/oidc.ts`). It is off unless set, and
+it is a listener of its own, so the loopback port keeps every rule
+above.
+
+- **Nothing through it is the computer itself.** A reverse proxy on the
+  same machine connects from loopback with whatever Host it sends, so
+  connections through the web door are marked, and `isLoopbackPeer`
+  refuses them (`server/http-guard.ts`). An agent's credential, the
+  loopback-only routes, pairing and the terminal are out of reach there.
+- **One credential, one place.** A session cookie, HttpOnly,
+  SameSite=Strict, Secure with the `__Host-` prefix on https, is the only
+  thing the door reads; an Authorization header is dropped, so a paired
+  device's token does nothing there and a session does nothing anywhere
+  else. A request that changes anything must carry the door's own
+  Origin. Only the cookie's sha256 is kept (`web-sign-in.json`, 0600).
+- **The sign in is the standard one, checked fully.** The authorization
+  code flow with PKCE (S256), a state that must come back once to the
+  browser that started it, and a nonce. The ID token is believed only
+  when its signature checks out against the provider's published keys
+  (never the client secret, never `none`), and its issuer, audience,
+  expiry, not-before, issued-at and nonce are right. The verifier and
+  the client secret never reach the browser.
+- **Who somebody is, checked on every request.** The owner is whoever
+  `BLOKS_OIDC_OWNER` names, read again each time; a member is an
+  identity linked to a person who is still in the workspace. Removing a
+  member, or changing who the owner is, ends their sessions at once.
+  The allow lists gate every sign in but the owner's, and making members
+  on first sign in requires one, so a provider that knows everybody
+  (Google) cannot make everybody a member.
+- **An invite still needs you.** Signing in to use an invite makes the
+  same request any device makes, bound to that browser's session, and
+  it waits for you and the same four words. Until then the session
+  reaches nothing but its own request.
+- **Whoever controls the provider controls the door.** That is what
+  single sign-on means: an account that can become yours at the
+  provider, or join the allowed groups, can sign in. Use `sub` or a
+  verified address as the person claim, not a name people can change.
 
 ## Agents that work somewhere else
 
@@ -453,7 +602,19 @@ Bloks therefore:
   read versions and ask for a change against the version it read; it
   cannot edit, restore, install, or keep a suggestion, and a change
   written against a version that has since moved on is refused rather
-  than allowed to undo the newer one.
+  than allowed to undo the newer one,
+- lets an agent ask for a new skill (`bloks skill create`) only as a
+  request: the whole skill, files included, waits on a card in the
+  conversation that shows all of it, and nothing is in the library until
+  the person presses Add, through a route an agent's credential cannot
+  reach and a member is refused. Whatever the agent says the person
+  asked for, its words are an input, so the press is the approval. A
+  request never writes over a skill already there, built-in or the
+  person's, and Add is refused if the id was taken while the card waited,
+- keeps a skill's supporting files as plain text in a folder of the
+  skill's own, read only on demand and never put in a prompt, with names
+  judged as words and the file opened inside that folder, so a crafted
+  name or a planted link reaches nothing else.
 
 Teams and skills from the Catalogue, a link or a file go through the same
 gate, and a few more:
@@ -571,4 +732,11 @@ from source. See [docs/RELEASING.md](docs/RELEASING.md).
   beyond what the provider CLI enforces, unless you set it to work in a
   container (see Agents that work somewhere else). That includes agents
   a member of your workspace talks to: give a team agent only the folder
-  and the tools you would let those people near.
+  and the tools you would let those people near. A member's private turn
+  on an engine with a shell can, with their own yes, run a command that
+  reads what your account can, other members' files on this computer
+  included, which the file rules do not stop. Where members should be
+  kept apart from each other as well as from you, give their agents an
+  API engine or Bloks AI, whose only tools are Bloks' own, or a
+  container. And whoever runs the computer can read everything kept on
+  it; every member is told so when they join.

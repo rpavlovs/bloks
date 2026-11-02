@@ -7,9 +7,11 @@
 // Kept apart from the component so the wording and the remembering can
 // be tested without a DOM.
 //
-// The title is the server's own words; what this adds around it is in
-// the reader's language.
+// Plan window identity is localized when the server reports it; other
+// titles remain in the server's own words.
 import { formatLocale, t } from "./i18n.ts";
+import { reportedPlanWindow } from "../../server/plan-window.ts";
+import { planWindowLabel, resetPhrase } from "./contextCard.ts";
 
 /** How much a notice asks for: worth knowing, near a limit, at one. */
 export type UsageLevel = "info" | "warn" | "stop";
@@ -25,6 +27,8 @@ export interface UsageNotice {
   usedPercent: number;
   /** Epoch milliseconds, when known. */
   resetsAt: number | null;
+  /** Present only for a plan window on a newer server. */
+  planWindow?: { id: string; minutes: number | null };
   /** "spend" for a spending limit on the person's own key, whose month
    * tops up rather than a window resetting. */
   kind?: "spend";
@@ -61,6 +65,39 @@ export function noticeSource(notice: Pick<UsageNotice, "source" | "kind">, engin
   return notice.kind === "spend" ? t("libUsageNotice.spendingLimit", { name }) : t("libUsageNotice.planUsage", { name });
 }
 
+/** Treat optional metadata from an older or malformed server as absent. */
+function reportedWindow(notice: Pick<UsageNotice, "planWindow" | "kind"> & Partial<Pick<UsageNotice, "source">>): ReturnType<typeof reportedPlanWindow> {
+  if (notice.kind === "spend" || notice.source === "bloks-ai") return null;
+  return reportedPlanWindow(notice.planWindow);
+}
+
+/** The old title remains the fallback for other notices and older servers. */
+export function noticeTitle(notice: UsageNotice, now: number): string {
+  if (notice.kind === "spend" || notice.source === "bloks-ai") return notice.title;
+  const window = reportedWindow(notice);
+  if (!window) return notice.title;
+  const status = notice.level === "stop" ? t("contextCard.limitReached") : t("libUsageNotice.approachingLimit");
+  const title = t("libUsageNotice.windowTitle", { window: planWindowLabel(window), status });
+  return notice.resetsAt !== null && Number.isFinite(new Date(notice.resetsAt).getTime()) && notice.resetsAt <= now
+    ? t("libUsageNotice.lastReported", { title }) : title;
+}
+
+/** Whether the line under this notice is a plan countdown, which changes
+ * every minute. Every other line changes only when what it reports does. */
+export function noticeCountsDown(notice: Pick<UsageNotice, "kind" | "planWindow" | "resetsAt"> & Partial<Pick<UsageNotice, "source">>): boolean {
+  return reportedWindow(notice) !== null && notice.resetsAt !== null && Number.isFinite(new Date(notice.resetsAt).getTime());
+}
+
+/** When a reported plan window starts again, said the way the Usage card
+ * says it (resetPhrase): the hours and minutes left while it is under a
+ * day, rounded up so it never reads as sooner than it is, and the day and
+ * time after that. A reset already past says so, and that the status is
+ * not known, rather than that the limit is lifted. */
+export function planResetLine(resetsAt: number | null, now: number, format: { locale?: string; timeZone?: string } = {}): string | null {
+  if (resetsAt === null || !Number.isFinite(new Date(now).getTime()) || !Number.isFinite(new Date(resetsAt).getTime())) return null;
+  return resetsAt <= now ? t("libUsageNotice.resetPassed") : resetPhrase(resetsAt, now, format);
+}
+
 /** A day as a count, for telling today from tomorrow in one time zone. */
 function dayNumber(at: number, timeZone?: string): number {
   // read as numbers, never shown, so the locale here is fixed
@@ -91,11 +128,14 @@ export function resetLine(resetsAt: number | null, now: number, format: { locale
 }
 
 /** Reported usage and reset/top-up timing; never invent an unavailable value. */
-export function noticeLine(notice: Pick<UsageNotice, "kind" | "usedPercent" | "resetsAt">, now: number, format: { locale?: string; timeZone?: string } = {}): string {
+export function noticeLine(notice: Pick<UsageNotice, "kind" | "usedPercent" | "resetsAt" | "planWindow"> & Partial<Pick<UsageNotice, "source">>, now: number, format: { locale?: string; timeZone?: string } = {}): string {
   const used = Number.isFinite(notice.usedPercent) && notice.usedPercent >= 0 && notice.usedPercent <= 100
     ? t("libUsageNotice.percentUsed", { percent: Math.round(notice.usedPercent) })
     : t("libUsageNotice.usageUnknown");
-  if (notice.kind !== "spend") return t("libUsageNotice.line", { used, when: resetLine(notice.resetsAt, now, format) ?? t("libUsageNotice.resetUnknown") });
+  if (notice.kind !== "spend") {
+    const when = reportedWindow(notice) ? planResetLine(notice.resetsAt, now, format) : resetLine(notice.resetsAt, now, format);
+    return t("libUsageNotice.line", { used, when: when ?? t("libUsageNotice.resetUnknown") });
+  }
   if (notice.resetsAt === null || !Number.isFinite(notice.resetsAt) || notice.resetsAt <= now || !Number.isFinite(new Date(notice.resetsAt).getTime())) {
     return t("libUsageNotice.line", { used, when: t("libUsageNotice.topUpUnknown") });
   }
