@@ -76,7 +76,6 @@ const isElectron = navigator.userAgent.includes("Electron");
 const ENGINES: Array<{
   kind: string;
   name: string;
-  command?: string;
   /** Connected by pasting a key in Settings, not by installing a CLI. */
   byKey?: boolean;
   /** What the card says once it is ready, and before. Keys, read where
@@ -87,51 +86,68 @@ const ENGINES: Array<{
   {
     kind: "claudeAgent",
     name: "Claude Code",
-    command: "curl -fsSL https://claude.ai/install.sh | bash",
     have: "onboarding.engine.claudeAgent.have",
     want: "onboarding.engine.claudeAgent.want",
   },
   {
     kind: "codex",
     name: "Codex",
-    command: "npm i -g --prefix ~/.local @openai/codex",
     have: "onboarding.engine.codex.have",
     want: "onboarding.engine.codex.want",
   },
   {
     kind: "cursor",
     name: "Cursor",
-    command: "curl https://cursor.com/install -fsS | bash",
     have: "onboarding.engine.cursor.have",
     want: "onboarding.engine.cursor.want",
   },
   {
     kind: "pi",
     name: "Pi",
-    command: "npm i -g --prefix ~/.local --ignore-scripts @earendil-works/pi-coding-agent pi-acp",
     have: "onboarding.engine.pi.have",
     want: "onboarding.engine.pi.want",
   },
   {
     kind: "antigravity",
     name: "Antigravity",
-    command: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
     have: "onboarding.engine.antigravity.have",
     want: "onboarding.engine.antigravity.want",
   },
   {
     kind: "grokCli",
     name: "Grok CLI",
-    command: "curl -fsSL https://x.ai/cli/install.sh | bash",
     have: "onboarding.engine.grokCli.have",
     want: "onboarding.engine.grokCli.want",
   },
   {
     kind: "cline",
     name: "Cline",
-    command: "npm i -g --prefix ~/.local cline",
     have: "onboarding.engine.cline.have",
     want: "onboarding.engine.cline.want",
+  },
+  {
+    kind: "geminiCli",
+    name: "Gemini CLI",
+    have: "onboarding.engine.geminiCli.have",
+    want: "onboarding.engine.geminiCli.want",
+  },
+  {
+    kind: "opencode",
+    name: "OpenCode",
+    have: "onboarding.engine.opencode.have",
+    want: "onboarding.engine.opencode.want",
+  },
+  {
+    kind: "commandcode",
+    name: "Command Code",
+    have: "onboarding.engine.commandcode.have",
+    want: "onboarding.engine.commandcode.want",
+  },
+  {
+    kind: "devin",
+    name: "Devin",
+    have: "onboarding.engine.devin.have",
+    want: "onboarding.engine.devin.want",
   },
   {
     kind: "kimi",
@@ -935,6 +951,9 @@ function EngineCard({
   onChanged: () => void;
   large?: boolean;
 }) {
+  // the line to copy when this window cannot press Install, for the
+  // computer Bloks runs on: PowerShell's on Windows (GitHub 438)
+  const install = useStore().state.providers.find((p) => p.kind === engine.kind)?.install;
   const lit = state === "ready";
   const detail =
     state === "checking"
@@ -982,7 +1001,7 @@ function EngineCard({
             name={engine.name}
             installed={state === "signed-out"}
             signedOut={state === "signed-out"}
-            fallback={engine.command}
+            fallback={install}
             onChanged={onChanged}
           />
         </div>

@@ -67,7 +67,10 @@ async function telegramStub(t: TestContext) {
         }
         return reply({ id: Number(token.split(":")[0]), is_bot: true, username: "PlanningBot" });
       }
-      if (["sendMessage", "sendRichMessage", "sendPhoto", "sendDocument"].includes(method)) return reply({ message_id: ++state.messageId });
+      if (["sendMessage", "sendRichMessage", "sendPhoto", "sendDocument"].includes(method)) {
+        const id = ++state.messageId;
+        return reply({ message_id: id });
+      }
       if (method === "deleteMessage") {
         const finish = () => { state.deleted.push({ id: body.message_id, at: Date.now() }); reply(true); };
         if (state.holdDelete) return void state.deleteReleases.push(finish);
@@ -105,8 +108,8 @@ async function telegramStub(t: TestContext) {
 }
 
 /** An engine that speaks Codex's app-server protocol and does what the
- * words of its turn say: ask for approval, ask a question, save files, or
- * work slowly through a few commands. */
+ * words of its turn say: ask for approval, ask a question, waiting on it or
+ * not, save files, or work slowly through a few commands. */
 function fakeCodex(root: string): string {
   const cli = join(root, "fake-codex.mjs");
   writeFileSync(cli, `#!${process.execPath}
@@ -140,8 +143,15 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
   if (m.method === "initialize") return reply();
   if (m.method === "initialized") return;
   if (m.method === "model/list") return reply({ data: [{ id: "gpt-6.1-sol", model: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", isDefault: true, hidden: false }] });
-  if (m.method === "skills/list") return reply({ data: [{ cwd: m.params.cwds[0], skills: [], errors: [] }] });
-  if (m.method === "thread/start" || m.method === "thread/resume") { thread = m.params.threadId ?? "native-" + process.pid; return reply({ thread: { id: thread }, model: "gpt-6.1-sol" }); }
+  if (m.method === "skills/list") {
+    if (existsSync(root + "/hold-skill")) { writeFileSync(root + "/skill-held", "1"); while (!existsSync(root + "/release-skill")) await nap(20); }
+    return reply({ data: [{ cwd: m.params.cwds[0], skills: [], errors: [] }] });
+  }
+  if (m.method === "thread/start" || m.method === "thread/resume") {
+    thread = m.params.threadId ?? "native-" + process.pid;
+    if (existsSync(root + "/hold-thread")) { writeFileSync(root + "/thread-held", "1"); while (!existsSync(root + "/release-thread")) await nap(20); }
+    return reply({ thread: { id: thread }, model: "gpt-6.1-sol" });
+  }
   if (m.method === "turn/interrupt") { out({ method: "turn/completed", params: { threadId: thread, turn: { id: turn, status: "interrupted" } } }); return reply(); }
   if (["turn/start","turn/steer"].includes(m.method)) log({ method:m.method, params:m.params });
   const rapid = m.method === "turn/steer" && JSON.stringify(m.params.input).match(/RAPID_(?:INPUT|EMPTY|REFUSE)/)?.[0];
@@ -157,7 +167,7 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
     return;
   }
   if (m.method === "turn/steer") { if (!existsSync(root + "/scope-force-queue")) return reply({turnId:turn}); }
-  if (m.method === "turn/steer" && existsSync(root + "/scope-force-queue")) return out({ id: m.id, error: { code: -32000, message: "fixture cannot steer" } });
+  if (m.method === "turn/steer" && existsSync(root + "/scope-force-queue")) return out({ id: m.id, error: { code: -32600, message: "no active turn to steer" } });
   if (m.method === "turn/steer") return reply({ turnId: turn });
   if (m.method !== "turn/start") return reply();
   turn = "work-" + process.pid; reply({ turn: { id: turn } });
@@ -272,6 +282,11 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       statuses.push(response.status);
     }
     return finish("GUARDS " + JSON.stringify(statuses));
+  }
+  // request_user_input_async: the question, and the turn carries on
+  if (text.includes("ASYNC_ASK")) {
+    out({ method: "item/completed", params: { threadId: thread, turnId: turn, item: { type: "agentMessage", id: "q-colour", phase: "final_answer", delivery: "async", text: "Which colour?", questions: [{ title: "Which colour?", options: ["Red", "Blue"] }] } } });
+    return finish("Carried on.");
   }
   if (text.includes("APPROVE")) {
     const result = await ask(900, "item/commandExecution/requestApproval", { itemId: "cmd-1", command: "rm -rf build" });

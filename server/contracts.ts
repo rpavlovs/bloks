@@ -210,6 +210,27 @@ export type RuntimeEventListener = (event: RuntimeEvent) => void;
 
 // ── running a turn ─────────────────────────────────────────────────────
 
+/** Frozen membership for additions to one initial input. The words are
+ * re-read and authorized by commit at the physical input boundary. */
+export interface FrozenPreparation {
+  hasInputs: boolean;
+  skillNames: string[];
+  commit(): {
+    text: string;
+    skillNames: string[];
+    images: import("./attachments.ts").TurnImage[];
+    settle(outcome: "accepted" | "refused" | "uncertain"): void;
+  };
+}
+
+export interface TurnPreparation {
+  freeze(): FrozenPreparation;
+  ready(turnId: string): void;
+  /** The initial input has been dispatched and this adapter cannot steer. */
+  withoutSteering?(): void;
+  unavailable(): void;
+}
+
 export interface SendTurnInput {
   /** The owner or an admin started this turn in a team conversation or a
    * room, so the agent may message one person privately on their behalf
@@ -220,6 +241,9 @@ export interface SendTurnInput {
   codexSpeed?: import("./codex-speed.ts").CodexSpeedChoice;
   threadId: ThreadId;
   text: string;
+  /** Internal callbacks for personal words admitted while this turn is
+   * being prepared. Never supplied by a client. */
+  preparation?: TurnPreparation;
   /** The pictures `text` attaches, read back as bytes, for an engine that
    * takes pictures rather than paths (capabilities.images). The words
    * still name each one. Set only for such an engine. */
@@ -316,6 +340,12 @@ export interface SendTurnInput {
    * harness grants its own workspace (memory lives there) so an agent
    * with a custom working folder can still keep notes. */
   extraDirs?: string[];
+  /** Folders this turn's file tools may not read or change, even with a
+   * yes: in a member's private conversation, the agent's own workspace
+   * and every other person's folder (GitHub 431). A driver whose engine
+   * takes such rules (Claude Code) passes them on; a shell the person
+   * approves is not held by them, which the documentation says. */
+  deniedDirs?: string[];
   /** Extra environment for the process this turn runs in, where there is
    * one. This is how a turn's own credential reaches the agent: a driver
    * that runs a CLI merges it into the child's environment, and a driver
@@ -357,6 +387,15 @@ export interface SendTurnInput {
   compactOnly?: boolean;
   /** Names found only in this segment's personal messages, before notes. */
   skillNames?: string[];
+  /**
+   * One of the engine's added accounts, for an engine that takes them
+   * (server/engine-accounts.ts): the CLI is pointed at `dir`, the
+   * account's own config folder, the way the engine's documentation says
+   * to, and whatever the engine reports about its plan is kept under
+   * `id`. Absent is the engine's own sign-in, as it always was. Never set
+   * on a turn that works elsewhere: the folder is on this computer.
+   */
+  account?: { id: string; dir: string };
   /**
    * Set when the agent works somewhere else: in a Docker container or on
    * another machine over SSH (server/workplace-run.ts). A driver that
@@ -444,12 +483,25 @@ export interface ProviderAdapter {
    * the physical write. Errors after that attempt must propagate, not fall back.
    */
   steerTurn?(threadId: ThreadId, text: string, options?: { skillNames?: string[]; onAccepted?: (turnId: string) => void; onDispatch?: () => void }): Promise<boolean>;
+  /** Preparation-bound steering distinguishes refusal from an outcome
+   * that may have reached the engine but has no matching receipt. */
+  steerPrepared?(threadId: ThreadId, expectedTurnId: TurnId, text: string, options: { skillNames?: string[]; onDispatch: () => void; onAcceptedLate?: () => void }): Promise<"accepted" | "refused" | "uncertain">;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
   respondToRequest(
     threadId: ThreadId,
     requestId: string,
     decision: { behavior: "allow" | "deny" | "answer"; message?: string },
   ): Promise<void>;
+  /**
+   * The agent takes back a question it asked without waiting (`async` on
+   * its request.opened), the person having settled it some other way. It
+   * resolves as `withdrawn` by the `agent`, with no answer. True when this
+   * engine held that question for that conversation and has let it go;
+   * false, with nothing changed, for anything else. Only an engine whose
+   * questions can go unanswered has it: nothing waits on such a question,
+   * so a blocking question or an approval can never be withdrawn.
+   */
+  withdrawAsk?(threadId: ThreadId, requestId: string): boolean;
   hasSession(threadId: ThreadId): boolean;
   stopAll(): Promise<void>;
   onEvent(listener: RuntimeEventListener): () => void;
@@ -512,6 +564,9 @@ export interface UsageNotice {
   usedPercent: number;
   /** Epoch milliseconds, when known. */
   resetsAt: number | null;
+  /** Reported plan window, when this is a plan notice. Older clients
+   * can continue to use the title. */
+  planWindow?: Pick<PlanWindow, "id" | "minutes">;
   /** "spend" for a spending limit on the person's own key, whose month
    * starts again rather than a window resetting. Absent for the rest; a
    * client that does not know it says "Resets" for every notice. */
@@ -575,8 +630,18 @@ export interface ProviderInstance {
   /** The latest the engine said about its plan's limits, kept in memory
    * on the instance and null until it says anything. Optional: only an
    * engine signed in to a subscription has limits to report. For the
-   * person to read; never part of a prompt. */
-  planUsage?(): PlanUsage | null;
+   * person to read; never part of a prompt. `account` is an added
+   * account's id (SendTurnInput.account); absent is the own sign-in. */
+  planUsage?(account?: string): PlanUsage | null;
+  /** Whether the engine is signed in with the config folder `dir`, an
+   * added account's (server/engine-accounts.ts), as its own CLI says,
+   * with the address it is signed in as when it says one. Null when the
+   * CLI did not answer. Only an engine that takes accounts has it. */
+  accountStatus?(dir: string): Promise<{ signedIn: boolean | null; email?: string | null }>;
+  /** The engine's own sign-out for an added account's folder, run before
+   * the folder is deleted, so a sign-in the engine keeps elsewhere (the
+   * macOS Keychain) goes with it. Best effort. */
+  accountSignOut?(dir: string): Promise<void>;
   dispose(): Promise<void>;
 }
 

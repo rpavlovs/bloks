@@ -27,6 +27,7 @@ import { api, useStore, type Message, type TeamPlan } from "@/state/store";
 import { AgentAvatar, BlokAvatar } from "@/components/Avatar";
 import { AppWatchCard } from "@/components/AppWatch";
 import { OpenPlaceCard, SettingsProposalCard } from "@/components/AgentGuideCards";
+import { SkillRequestCard } from "@/components/SkillRequestCard";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -107,6 +108,7 @@ export function OptionCard({
   if (card.appWatch) return <AppWatchCard plan={card.appWatch} answered={card.answered} />;
   if (card.open) return <OpenPlaceCard plan={card.open} agentName={agent?.name ?? t("optionCard.yourAgent")} />;
   if (card.settingsProposal) return <SettingsProposalCard plan={card.settingsProposal} messageId={message.id} />;
+  if (card.skillRequest) return <SkillRequestCard plan={card.skillRequest} messageId={message.id} />;
 
   if (card.team) {
     return (
@@ -823,7 +825,7 @@ function QuestionCard({
     <AnimatePresence mode="wait" initial={false}>
       {card.answered ? (
         <motion.div key="settled" {...enter} className="w-full max-w-[560px]">
-          <SettledQuestion card={card} at={at} question={question} hint={hint} forWhom={forWhom} />
+          <SettledQuestion card={card} at={at} question={question} hint={hint} forWhom={forWhom} name={name} />
         </motion.div>
       ) : (
         // Above the composer it takes the composer's width, edge to edge,
@@ -970,18 +972,24 @@ function SettledQuestion({
   question,
   hint,
   forWhom,
+  name,
 }: {
   card: OptionCardData;
   at: number;
   question: string;
   hint?: string;
   forWhom?: string;
+  name: string;
 }) {
   const closed = Boolean(card.cutOff || card.closed) || card.answered === CLOSED_UNANSWERED;
   // A live engine question settles on the server as "answer", the kind
   // of reply rather than its words, so there is nothing more to show.
   const said = closed || card.answered === "answer" ? undefined : card.answered;
-  const why = card.cutOff ? t("optionCard.closedWhenBloksStopped") : card.closed;
+  const why = card.cutOff
+    ? t("optionCard.closedWhenBloksStopped")
+    : card.withdrawn
+      ? t("optionCard.withdrawnBy", { agent: name })
+      : card.closed;
   return (
     <SettledLine
       icon={closed ? <Minus size={12} /> : <Check size={12} className="text-brand-ink" />}
@@ -992,7 +1000,7 @@ function SettledQuestion({
         <>
           {(closed || !said) && (
             <span className="shrink-0 font-medium text-foreground/80">
-              {closed ? t("optionCard.notAnswered") : card.answeredBy ? t("optionCard.answeredBy", { name: card.answeredBy }) : t("optionCard.answered")}
+              {card.withdrawn ? t("optionCard.withdrawn") : closed ? t("optionCard.notAnswered") : card.answeredBy ? t("optionCard.answeredBy", { name: card.answeredBy }) : t("optionCard.answered")}
             </span>
           )}
           <span className="min-w-0 truncate">{question}</span>
@@ -1005,20 +1013,24 @@ function SettledQuestion({
       }
     >
       <p className="text-pretty text-body font-medium text-foreground [overflow-wrap:anywhere]">{question}</p>
-      {hint && <p className="text-small text-muted-foreground">{hint}</p>}
-      {forWhom && <p className="text-small text-muted-foreground">{t("optionCard.askedFor", { who: forWhom })}</p>}
+      {/* Every line here wraps anywhere: an agent's words can hold a path,
+          a hash or a link with nothing to break at, and one that did not
+          wrap ran out past the conversation column (GitHub 415). */}
+      {hint && <p className="text-small text-muted-foreground [overflow-wrap:anywhere]">{hint}</p>}
+      {forWhom && <p className="text-small text-muted-foreground [overflow-wrap:anywhere]">{t("optionCard.askedFor", { who: forWhom })}</p>}
       {card.options.length > 0 && (
         <ul className="flex flex-col gap-0.5">
           {card.options.map((opt) => (
             <li
               key={opt}
               className={cn(
-                "flex items-center gap-2 text-small",
+                "flex items-start gap-2 text-small",
                 opt === said ? "font-medium text-foreground" : "text-muted-foreground",
               )}
             >
-              <span className={cn("size-1.5 shrink-0 rounded-full", opt === said ? "bg-brand-ink" : "bg-foreground/15")} />
-              {opt}
+              {/* on the first line's middle, however many lines follow */}
+              <span className={cn("mt-[6px] size-1.5 shrink-0 rounded-full", opt === said ? "bg-brand-ink" : "bg-foreground/15")} />
+              <span className="min-w-0 [overflow-wrap:anywhere]">{opt}</span>
             </li>
           ))}
         </ul>
@@ -1026,7 +1038,7 @@ function SettledQuestion({
       {said && !card.options.includes(said) && (
         <p className="whitespace-pre-wrap text-small text-foreground [overflow-wrap:anywhere]">“{said}”</p>
       )}
-      {why && <p className="text-small text-muted-foreground">{why}</p>}
+      {why && <p className="text-small text-muted-foreground [overflow-wrap:anywhere]">{why}</p>}
     </SettledLine>
   );
 }

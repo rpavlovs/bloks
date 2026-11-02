@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { MotionConfig, motion, useReducedMotion } from "motion/react";
 import { Loader2 } from "@/components/icons";
-import { StoreProvider, useStore } from "@/state/store";
+import { StoreProvider, api, useStore } from "@/state/store";
+import { usePresenceReport } from "@/lib/presence";
 import { Button } from "@/components/ui/button";
 import { Onboarding } from "@/components/Onboarding";
 import { WorkspaceWelcome } from "@/components/WorkspaceWelcome";
@@ -35,6 +36,8 @@ import { YourNameHost } from "@/components/YourNameDialog";
 import { TerminalWindow, terminalWindowAgent } from "@/components/terminal/TerminalWindow";
 import { MemberApp } from "@/components/member/MemberApp";
 import { detectMode, type AppMode } from "@/lib/memberMode";
+import { WebDoor } from "@/components/web/WebDoor";
+import { probeWebDoor, type WebDoorSession } from "@/lib/webDoor";
 import { openWorkspaceDialog } from "@/lib/workspaces";
 import { WakingStrip } from "@/components/WakingStrip";
 import { HostingMoveToasts } from "@/components/hosting/HostingMoveToasts";
@@ -257,9 +260,32 @@ export default function App() {
  */
 function WhichApp() {
   const [mode, setMode] = useState<AppMode | null>(null);
+  // A server's web door, in a browser (src/lib/webDoor.ts): until somebody
+  // is signed in, its page is the sign-in or the join, and nothing of the
+  // app is asked for. Undefined while a browser is still asking; the
+  // desktop app never asks.
+  const [door, setDoor] = useState<WebDoorSession | null | undefined>(() => (window.bloks ? null : undefined));
   useEffect(() => {
+    if (door !== undefined) return;
+    void probeWebDoor().then((found) => {
+      // signed in already, an invite link has nothing left to do here
+      if (found?.signedIn && window.location.pathname === "/join") window.history.replaceState(null, "", "/");
+      setDoor(found);
+    });
+  }, [door]);
+  const outside = Boolean(door && (!door.signedIn || window.location.pathname === "/join"));
+  useEffect(() => {
+    if (door === undefined || outside) return;
     void detectMode(window.bloks?.workspace?.kind).then(setMode);
-  }, []);
+  }, [door, outside]);
+  if (door && outside) {
+    return (
+      <MotionConfig reducedMotion="user">
+        <WebDoor session={door} />
+        <Toaster />
+      </MotionConfig>
+    );
+  }
   if (!mode) return <div className="h-full bg-background" />;
   if (mode.mode !== "owner") {
     return (
@@ -287,6 +313,9 @@ function OwnerApp() {
     () => (introPending() && !setupDone()) || forced,
   );
   const [setupOpen, setSetupOpen] = useState(() => !setupDone());
+  // While the person is using Bloks here, their phone stays quiet
+  // (src/lib/presence.ts). The owner's app only: a member's phone is theirs.
+  usePresenceReport((body) => api("/api/presence", { method: "POST", body: JSON.stringify(body) }));
   // Until the workspace answers, showing the dashboard would be a guess,
   // and a wrong guess flashes the whole app for a moment before the
   // welcome covers it. A workspace that has clearly never been set up
