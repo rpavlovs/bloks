@@ -357,6 +357,24 @@ export function checkOutcome(
   return { seen, what: shown || "The check passed and printed nothing.", error: null };
 }
 
+/**
+ * Whether a check's command prints nothing and ends the same way on every
+ * run, so it can never act: a check acts on a new finding, and its first
+ * run is only the baseline. An agent that wanted a wake every so often
+ * filed `true` as a check and was never woken (GitHub 424). Only the
+ * obvious no-ops, and said rather than refused: anything cleverer is the
+ * command's own business, and a person may keep one switched off.
+ * `--check` given no command reaches here as "true" from the CLI.
+ */
+export function constantCheck(command: string): boolean {
+  const bare = command.trim().replace(/\s*;$/, "");
+  return /^(?:(?:\/usr)?\/bin\/)?(?:true|false)$|^:$|^exit(?:\s+[01])?$/.test(bare);
+}
+
+/** What filing or changing a check to one of those is told. */
+export const CONSTANT_CHECK_NOTE =
+  "This check prints nothing and ends the same way on every run, so it will never act: a check acts only when it finds something new, and its first run is the baseline. To be woken every so often, file a check-in with routine --every instead.";
+
 /** Whether a check's command may run now, for an agent with these approvals. */
 export function checkAllowed(w: Pick<Watcher, "kind" | "approvedBy">, approvals: string | undefined): boolean {
   if (w.kind !== "check") return true;
@@ -403,6 +421,41 @@ export function orphanWatcherLanes(
     .slice(1)
     .filter((t) => t.title.startsWith(WATCHING) && !used.has(t.id) && !named.has(t.title) && !t.busy && !spokenIn(t.id))
     .map((t) => t.id);
+}
+
+// ── the limit ──────────────────────────────────────────────────────────
+
+/** Watchers a workspace keeps, finished ones included. */
+export const MAX_WATCHERS = 50;
+
+/**
+ * The list with room for one more watcher, or null when there is none.
+ * The limit is on what can wake an agent unattended, and a watcher that
+ * finished (acted once as asked, or reached its time) cannot until the
+ * person switches it on again. Kept, those used to fill the limit with
+ * nothing left that could run, as spent once routines did (GitHub 276).
+ * So the one that finished longest ago makes room, and the rest stay as
+ * the history of what ran. A paused watcher is the person's to switch
+ * back on and is never taken. Nor is a finished one still at work (its
+ * last look or turn not over yet, said by `atWork`), or an app watcher
+ * whose trigger is still at Composio: removing that is a call that can
+ * fail, and a watcher whose trigger could not be removed is kept so the
+ * person can try again (the DELETE route).
+ */
+export function roomForWatcher(
+  list: Watcher[],
+  atWork: (w: Watcher) => boolean,
+  max = MAX_WATCHERS,
+): Watcher[] | null {
+  let kept = list;
+  while (kept.length >= max) {
+    const oldest = kept
+      .filter((w) => w.done && !w.enabled && !w.app?.triggerId && !atWork(w))
+      .sort((a, b) => a.done!.at - b.done!.at)[0];
+    if (!oldest) return null;
+    kept = kept.filter((w) => w !== oldest);
+  }
+  return kept;
 }
 
 // ── failing ────────────────────────────────────────────────────────────

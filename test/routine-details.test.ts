@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { runElapsed, runSource } from "../src/lib/routineDetails.ts";
+import { routinePatch, runElapsed, runSource, type RoutineDraft } from "../src/lib/routineDetails.ts";
+import { startHarness } from "./helpers/server.ts";
 
 test("elapsed time uses actual timestamps, in seconds, minutes and hours", () => {
   for (const [elapsed, expected] of [
@@ -60,4 +61,90 @@ test("room navigation requires the recorded room and a retained target", () => {
   assert.equal(runSource(room, { threadId: "room-b" }, bots, [{ id: "room-a" }]), null);
   assert.equal(runSource(room, {}, bots, [{ id: "room-a" }]), null);
   assert.equal(runSource(room, { threadId: "room-a" }, bots, []), null);
+});
+
+const weekly: RoutineDraft = {
+  targetId: "agent-a", targetKind: "agent", name: "Digest", prompt: "Sum it up.",
+  time: "09:00", days: [1, 3], durationMin: 30, runsOn: "cloud", thread: "News",
+};
+
+test("an edit sends only what changed, and nothing when nothing did", () => {
+  assert.deepEqual(routinePatch(weekly, { ...weekly }), {});
+  assert.deepEqual(routinePatch(weekly, { ...weekly, days: [3, 1] }), {}, "the same days in another order");
+  assert.deepEqual(routinePatch(weekly, { ...weekly, name: "Brief", prompt: "Say it.", time: "07:30" }), {
+    name: "Brief", prompt: "Say it.", time: "07:30",
+  });
+  assert.deepEqual(routinePatch(weekly, { ...weekly, targetId: "agent-b" }), {}, "the target is never sent");
+});
+
+test("a field taken away is sent cleared, the way the server clears it", () => {
+  const { name: _name, runsOn: _runsOn, thread: _thread, ...bare } = weekly;
+  assert.deepEqual(routinePatch(weekly, bare), { name: "", runsOn: null, thread: null });
+});
+
+test("changing the kind of schedule clears the old one", () => {
+  const once: RoutineDraft = { ...weekly, days: [], repeat: "once", date: "2026-11-02" };
+  assert.deepEqual(routinePatch(once, weekly), { days: [1, 3], repeat: "weekly" });
+
+  const { time: _time, durationMin: _duration, ...rest } = weekly;
+  const checkIn: RoutineDraft = { ...rest, every: 30, activeHours: { from: "09:00", to: "18:00" } };
+  assert.deepEqual(routinePatch(checkIn, { ...weekly, quiet: true }), {
+    time: "09:00", durationMin: 30, every: null, activeHours: null, quiet: true,
+  });
+  assert.deepEqual(routinePatch(weekly, checkIn), { every: 30, activeHours: { from: "09:00", to: "18:00" } });
+  assert.deepEqual(routinePatch(checkIn, { ...checkIn, activeHours: undefined }), { activeHours: null }, "all day");
+  assert.deepEqual(routinePatch({ ...weekly, quiet: true }, weekly), { quiet: false });
+});
+
+// The cases above are what the form sends; this is what the server makes
+// of it. Each body is the edit the form would file, measured against the
+// form as it opened, and the routine that comes back keeps its id and
+// drops exactly what the person took away.
+test("each edit the form files changes the stored routine the way the form showed it", async (t) => {
+  const h = await startHarness();
+  t.after(() => h.stop());
+  const { bot } = await h.json("/api/bots", { method: "POST", body: JSON.stringify({ name: "Nova" }) });
+  const base: RoutineDraft = { ...weekly, targetId: bot.id, quiet: true };
+  const { routine } = await h.json("/api/routines", { method: "POST", body: JSON.stringify(base) });
+  const edit = async (before: RoutineDraft, after: RoutineDraft) => {
+    const res = await h.fetch(`/api/routines/${routine.id}`, { method: "PATCH", body: JSON.stringify(routinePatch(before, after)) });
+    assert.equal(res.status, 200);
+    const saved = (await res.json()).routine;
+    assert.equal(saved.id, routine.id);
+    return saved;
+  };
+
+  // a name, a computer and a conversation taken away are gone, the rest stays
+  const { name: _name, runsOn: _runsOn, thread: _thread, quiet: _quiet, ...bare } = base;
+  let saved = await edit(base, bare);
+  assert.equal(saved.name, undefined);
+  assert.equal(saved.runsOn, undefined);
+  assert.equal(saved.thread, undefined);
+  assert.equal(saved.quiet, undefined);
+  assert.equal(saved.prompt, base.prompt);
+  assert.equal(saved.summary, "Mon, Wed at 09:00");
+
+  // to a check-in and back: quiet for being one, not after
+  const { time: _time, durationMin: _duration, ...rest } = bare;
+  const checkIn: RoutineDraft = { ...rest, every: 60, activeHours: { from: "08:00", to: "12:00" } };
+  saved = await edit(bare, checkIn);
+  assert.equal(saved.every, 60);
+  assert.equal(saved.quiet, true);
+  assert.equal(saved.durationMin, undefined);
+  saved = await edit(checkIn, { ...checkIn, activeHours: undefined });
+  assert.equal(saved.activeHours, undefined, "all day");
+  saved = await edit({ ...checkIn, activeHours: undefined }, bare);
+  assert.equal(saved.every, undefined);
+  assert.equal(saved.quiet, undefined);
+  assert.equal(saved.time, "09:00");
+
+  // once, then repeating again: the date goes with the one-time schedule
+  const once: RoutineDraft = { ...bare, days: [], repeat: "once", date: "2030-01-02" };
+  saved = await edit(bare, once);
+  assert.equal(saved.repeat, "once");
+  assert.equal(saved.date, "2030-01-02");
+  saved = await edit(once, bare);
+  assert.equal(saved.repeat, undefined);
+  assert.equal(saved.date, undefined);
+  assert.deepEqual(saved.days, [1, 3]);
 });

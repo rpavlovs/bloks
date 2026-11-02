@@ -34,6 +34,7 @@ import type {
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+import { installCommand } from "../engine-commands.ts";
 import { describeEarlyExit, describeSpawnError } from "./spawn-error.ts";
 import { OWN_GROUP } from "../no-console.ts";
 import { EngineProcesses } from "./engine-processes.ts";
@@ -167,12 +168,13 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       const turnId = newId();
       const resume = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
 
+      // An agy elsewhere is not probed on this computer.
+      const viaStdin = turn.place ? true : await readsStdin();
+      const prepared = turn.preparation?.freeze().commit();
+      const words = prepared?.text ? `${turn.text}\n\n${prepared.text}` : turn.text;
       // The persona rides ahead of the message in the same prompt, since
       // headless agy offers no separate system channel.
-      const prompt = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
-      // An agy there is asked nothing here first: the one this computer
-      // has, if any, says nothing about it, and a current one reads stdin.
-      const viaStdin = turn.place ? true : await readsStdin();
+      const prompt = turn.system ? `${turn.system}\n\n${words}` : words;
 
       const argv = [
         ...(viaStdin ? ["--input-format", "stream-json"] : ["--print", prompt]),
@@ -187,22 +189,38 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       if (turn.model) argv.push("--model", turn.model);
       if (resume) argv.push("--conversation", resume);
 
-      const child = turn.place
-        ? turn.place.spawn(config.cli, argv, { env: { ...process.env, ...(turn.env ?? {}) } })
-        : spawn(config.cli, argv, {
-            cwd: turn.cwd ?? homedir(),
-            // the turn's own credential (see server/agent-cli.ts)
-            env: { ...process.env, ...(turn.env ?? {}) },
-            stdio: ["pipe", "pipe", "pipe"],
-            detached: OWN_GROUP,
-            windowsHide: true,
-          });
+      const child = (() => {
+        try {
+          return turn.place
+            ? turn.place.spawn(config.cli, argv, { env: { ...process.env, ...(turn.env ?? {}) } })
+            : spawn(config.cli, argv, {
+                cwd: turn.cwd ?? homedir(),
+                env: { ...process.env, ...(turn.env ?? {}) },
+                stdio: ["pipe", "pipe", "pipe"],
+                detached: OWN_GROUP,
+                windowsHide: true,
+              });
+        } catch (error) {
+          prepared?.settle("refused");
+          turn.preparation?.unavailable();
+          throw error;
+        }
+      })();
       engines.add(child);
       // The turn as one line, then the end of input: agy answers it and
       // exits. An older agy reads nothing here and gets the end at once.
       // A process that died at once closes its end first; its exit says why.
       child.stdin.on("error", () => {});
       child.stdin.end(viaStdin ? `${JSON.stringify({ event: "user", message: { content: prompt } })}\n` : undefined);
+      turn.preparation?.withoutSteering?.();
+      // Neither the argv launch nor a pipe write is a native receipt.
+      let preparationSettled = false;
+      const settlePreparation = (outcome: "accepted" | "refused" | "uncertain") => {
+        if (preparationSettled) return;
+        preparationSettled = true;
+        prepared?.settle(outcome);
+        turn.preparation?.unavailable();
+      };
 
       let finished = false;
       const finish = (ok: boolean, stopReason: string | null) => {
@@ -214,6 +232,11 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
 
       // agy frames as {event, conversation_id, <event-name>: payload}
       let conversationId: string | null = null;
+      // Result usage is the conversation's lifetime total, even after a
+      // resume. Only this turn's indexed requests belong in its bill.
+      const requests = new Map<number, { input: number; output: number }>();
+      let inputTokens = 0;
+      let outputTokens = 0;
       const consume = (raw: string) => {
         let frame: any;
         try {
@@ -260,16 +283,24 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                 });
               }
             } else if (payload.step_type === "agent_response" && payload.usage) {
+              const input = (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0);
+              const output = payload.usage.output_tokens || 0;
+              const before = requests.get(payload.step_index);
+              inputTokens += input - (before?.input ?? 0);
+              outputTokens += output - (before?.output ?? 0);
+              requests.set(payload.step_index, { input, output });
               emit({
                 ...envelope(threadId, turnId),
                 type: "thread.token-usage.updated",
-                input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
-                output: payload.usage.output_tokens || 0,
+                input: inputTokens,
+                output: outputTokens,
+                context: input,
               });
             }
             break;
 
           case "result": {
+            settlePreparation(payload.status === "SUCCESS" ? "accepted" : "uncertain");
             // the assistant text arrives here, whole, not streamed
             const text = typeof payload.response === "string" ? payload.response : "";
             if (text) {
@@ -286,12 +317,22 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                 text,
               });
             }
-            if (payload.usage) {
+            // Older result-only streams can measure a fresh turn, but a
+            // resumed conversation's total cannot tell what this turn spent.
+            if (!requests.size && !resume && payload.usage) {
               emit({
                 ...envelope(threadId, turnId),
                 type: "thread.token-usage.updated",
                 input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
                 output: payload.usage.output_tokens || 0,
+              });
+            }
+            if (payload.status !== "SUCCESS") {
+              emit({
+                ...envelope(threadId, turnId),
+                type: "runtime.error",
+                message: typeof payload.error === "string" && payload.error
+                  ? payload.error : `Antigravity ended with status ${payload.status ?? "unknown"}.`,
               });
             }
             finish(payload.status === "SUCCESS", payload.status ?? null);
@@ -317,13 +358,14 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       });
 
       child.on("error", (error) => {
+        settlePreparation(child.pid ? "uncertain" : "refused");
         emit({
           ...envelope(threadId, turnId),
           type: "runtime.error",
           message: describeSpawnError(error, {
             name: "Antigravity",
             command: config.cli,
-            install: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+            install: installCommand("antigravity"),
             signIn: "run `agy` once to sign in with Google",
           }),
         });
@@ -332,6 +374,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
 
       child.on("close", (code) => {
         if (finished) return;
+        settlePreparation("uncertain");
         emit({
           ...envelope(threadId, turnId),
           type: "runtime.error",

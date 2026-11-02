@@ -30,13 +30,7 @@ import { deviceKey, inviteKey, open, peek, seal, type Envelope, type RelayReques
 import { linkAskValid, sealForRequester, type OwnerLink } from "./owner-link.ts";
 import { markSeen, pairedDevices } from "./pairing.ts";
 import type { ActivityPush, PushResult } from "./live-activities.ts";
-
-/** What to call the machine this harness runs on. Bloks ships on
- * Windows and Linux too, where "the Mac" reads as a copy-paste slip
- * rather than a description. */
-function thisMachine(): string {
-  return process.platform === "darwin" ? "this Mac" : process.platform === "win32" ? "this PC" : "this computer";
-}
+import { thisMachine } from "./this-machine.ts";
 
 /** Why the line went down, in words a settings screen can show. Node's
  * fetch says only "fetch failed" and keeps the reason in its cause, and
@@ -445,6 +439,11 @@ export class RelayLink {
     // member's lock screen never says more than their app would.
     const sealed: Record<string, string> = {};
     const wantsPreview = typeof wake === "object" && wake.preview === true;
+    // Where the frame stands on the workspace's stream goes to a member's
+    // device too, on the copy member-access.ts rebuilt for them: their app
+    // orders it against an agent list by it, and a phone back on the local
+    // network resumes from it, as on the direct stream.
+    const seq = (frame as { _seq?: unknown } | null)?._seq;
     for (const d of devices) {
       if (ownersOnly && d.personId) continue;
       // a member's own conversation goes to that member's devices alone,
@@ -452,8 +451,9 @@ export class RelayLink {
       if (onlyPerson && d.personId !== onlyPerson) continue;
       // a stream one device is following is that device's alone
       if (onlyDevice && d.id !== onlyDevice) continue;
-      const shown = d.personId ? this.memberFrame(frame, d.personId) : frame;
-      if (shown === null || shown === undefined) continue;
+      const rebuilt = d.personId ? this.memberFrame(frame, d.personId) : frame;
+      if (rebuilt === null || rebuilt === undefined) continue;
+      const shown = d.personId && typeof seq === "number" ? { ...(rebuilt as object), _seq: seq } : rebuilt;
       frames.push(seal(deviceKey(d.hash, "mac-to-phone"), d.id, shown));
       if (wantsPreview) {
         const preview = this.previewOf(shown);

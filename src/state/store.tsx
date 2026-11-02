@@ -29,12 +29,13 @@ import { sendCardAnswer } from "@/lib/cardAnswer";
 import { sendMessage } from "@/lib/sendMessage";
 import { sendRoomPatch } from "@/lib/roomPatch";
 import { keepTrying } from "@/lib/retry";
-import { snapshotOrder, type SnapshotLoad } from "./snapshotOrder";
+import { serverSeq, snapshotOrder, type SnapshotLoad } from "./snapshotOrder";
 import { sendHeld, takeWake, wakeFetch, wakeGaveUp } from "@/lib/waking";
 import { placeRow, type Listed } from "@/lib/sections";
 import { askLaneFocus, dropLaneFocus } from "@/lib/drafts";
 import { followMenuKeys } from "@/lib/conversationKeys";
 import { platformOf } from "@/lib/shortcuts";
+import { noteSignedOut } from "@/lib/webDoor";
 import { maybeAutoSpeak } from "@/components/Voice";
 import {
   configFromFrame,
@@ -120,6 +121,8 @@ export async function api(path: string, init?: RequestInit): Promise<any> {
   // something about it (a name to ask for, src/components/YourNameDialog),
   // and the mark of a hosted workspace that never woke (src/lib/waking.ts)
   if (!res.ok) {
+    // signed out of a server's web door meanwhile: back to its sign-in
+    noteSignedOut(res.status, body.code);
     throw Object.assign(new Error(body.error ?? `${res.status} ${res.statusText}`), {
       status: res.status,
       code: typeof body.code === "string" ? body.code : undefined,
@@ -885,7 +888,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // on its way, which is older than it when made before it
       const applyFrame = (action: Action) => {
         rawDispatch(action);
-        listOrder.current.note(typeof frame._seq === "number" ? frame._seq : undefined, action);
+        listOrder.current.note(serverSeq(frame), action);
       };
       // the workspace's people go to their own small bus (src/lib/members.ts)
       if (typeof frame.kind === "string" && frame.kind.startsWith("workspace.")) {
@@ -977,11 +980,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         case "profile":
         case "brief":
+        case "todos":
         case "location":
         case "watchers":
         case "intents":
         case "meetings":
         case "enginePauses":
+        case "engineAccounts":
         case "routines":
         case "incidents":
         case "secrets":
@@ -1011,7 +1016,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               body: JSON.stringify({ unread: false }),
             }).catch(() => {});
           }
-          if (typeof frame._seq === "number") botSeq.current.set(bot.id, frame._seq);
+          const made = serverSeq(frame);
+          if (made !== undefined) botSeq.current.set(bot.id, made);
           applyFrame({ type: "botPatched", bot: withoutEdits(bot, editing(bot.id)) });
           break;
         }
@@ -1103,7 +1109,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         // picker needs to hear that something became usable
         // a run refused for an empty balance, or more added since
         case "credits": {
-          const { kind: _kind, _seq, ...credits } = frame;
+          const { kind: _kind, _seq, _serverSeq, ...credits } = frame;
           rawDispatch({ type: "credits", credits: credits as unknown as CreditsSummary });
           break;
         }

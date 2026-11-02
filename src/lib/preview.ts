@@ -10,6 +10,7 @@
 // conversation reads the same on both (in English; here the words are
 // the catalogue's, so they follow the language chosen).
 import type { Message } from "@/state/reducer";
+import { rowState } from "../state/reducer.ts";
 import { toolLabel } from "./tool-summary.ts";
 import { t } from "./i18n.ts";
 
@@ -122,11 +123,12 @@ export function changedLine(total: number, shared = 0): string {
 interface RowAgent {
   title?: string;
   busy?: boolean;
+  unread?: boolean;
   messages: Message[];
   olderMessages?: number;
   threadId: string;
   activeTaskId?: string;
-  tasks?: Array<{ id: string; state?: string; lastAt?: number; createdAt: number }>;
+  tasks?: Array<{ id: string; title?: string; state?: string; unread?: boolean; lastAt?: number; createdAt: number }>;
 }
 
 /** Whether an agent has said things that are not here: through Bloks
@@ -153,10 +155,14 @@ export function lastHeardAt(bot: RowAgent): number | undefined {
  * not come along is not a new one, which is what an empty transcript used
  * to say: it reads as who it is until its words arrive. */
 export function agentPreview(bot: RowAgent): string {
-  // a lane waiting on a human outranks everything: that is the row the
-  // user should open next
-  if (bot.tasks?.some((t) => t.state === "needs-you")) return t("preview.waitingForYou");
-  if (bot.busy) return t("preview.workingNow");
+  // the conversation a click on the row opens (rowState): the line says
+  // what that one is doing, as the mark beside it does
+  const { lane, state } = rowState(bot);
+  if (state === "needs-you") return t("preview.waitingForYou");
+  if (state === "working") return t("preview.workingNow");
+  // one that pinged you from behind the open one: its words are not
+  // here, its name is
+  if (lane && lane.id !== (bot.activeTaskId ?? bot.threadId)) return lane.title?.trim() || t("preview.openToSee");
   if (unseenHistory(bot)) return bot.title?.trim() || t("preview.openToSee");
   // an empty lane on an agent that has others is a fresh conversation,
   // not a fresh agent, which is what the shared wording would say
