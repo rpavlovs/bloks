@@ -364,6 +364,31 @@ describe("a fold read in several requests", { concurrency: 4 }, () => {
     });
   }
 
+  // the first message, the one the saved summary read
+  for (const change of ["taken back", "edited"] as const) {
+    test(`a message the summary read, ${change} while a request is out: the summary goes and is not brought back`, async (t) => {
+      const f = await fixture(t, plainLane(), { hold: [2] });
+      assert.equal((await f.send(NEW)).status, 202);
+      assert.ok(await waitFor(() => f.folds().length === 2), f.h.logs());
+      const path = `/api/threads/${f.threadId}/messages/${f.ids[0]}`;
+      const changed = change === "taken back"
+        ? await f.h.fetch(path, { method: "DELETE" })
+        : await f.h.fetch(path, { method: "PATCH", body: JSON.stringify({ text: "FACT-EDITED in other words." }) });
+      assert.equal(changed.status, 200);
+      assert.equal(f.stored(), undefined);
+      f.release();
+      await f.idle(1);
+      assert.equal(f.folds().length, 2, "a request went out after the summary was dropped");
+      assert.equal(f.stored(), undefined);
+      assert.equal(await f.summarised(), 0);
+      // and the turn that waited on it is told the lane as it is now
+      const told = f.turns()[0].input;
+      assert.equal(told.includes("Previous fixture summary"), false, "the turn was told the dropped summary");
+      assert.equal(has(told, "FACT-0"), false);
+      assert.match(told, LEFT_OUT);
+    });
+  }
+
   for (const which of ["first", "last"] as const) {
     test(`a stop while the ${which} request is out ends the turn before it starts, with nothing saved`, async (t) => {
       const lane = plainLane();
